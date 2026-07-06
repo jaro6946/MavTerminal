@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""pull_log.py -- pull PX4/ArduPilot .ulg flight logs off the FC over MAVLink FTP,
+no SD-card removal and no QGroundControl.
+
+Why: when a board "won't arm" / failsafes / terminates, the ONLY authoritative
+record of WHY is the onboard .ulg (vehicle_status, failsafe_flags, battery_status,
+actuator_motors ...).  MAVFTP pulls it over the same USB link mavshell uses -- a
+~500 KB log comes down in ~5 s at 921600.  Analyse the result with `ulog_diag.py`.
+
+Examples:
+    # List the sessions/logs on the card (nothing downloaded):
+    pull_log.py --list
+
+    # Pull the NEWEST log from the newest session into the current dir:
+    pull_log.py
+
+    # Pull a specific one:
+    pull_log.py --session sess112 --name log102.ulg -o /tmp
+
+Auto-detects the FC port (same VID/keyword logic as mavshell); override with -p/-b.
+Depends only on pymavlink (already in the agc_CTOL_SE3-rotopy venv).
+"""
+import argparse
+import os
+import sys
+import time
+
+from pymavlink import mavutil
+from pymavlink.mavftp import MAVFTP
+
+# ---- FC serial auto-detect (kept in sync with mavshell.py) ------------------
+FC_VIDS = {0x26AC, 0x0483, 0x1209, 0x2DAE, 0x3162}
+FC_KEYWORDS = ("px4", "pixhawk", "ardupilot", "fmu", "mro", "cube", "holybro",
+               "control zero", "controlzero")
+LOG_DIR = "/fs/microsd/log"
+
+
+def autodetect_port():
+    from serial.tools import list_ports
+    ports = list(list_ports.comports())
+    for p in ports:
+        if p.vid in FC_VIDS:
+            return p.device
+    for p in ports:
+        text = f"{p.description} {p.manufacturer}".lower()
+        if any(k in text for k in FC_KEYWORDS):
+            return p.device
+    return ports[0].device if ports else None
+
+
+def listdir(ftp, path):
+    """Return the DirectoryEntry list for a remote dir (cmd_list pumps internally)."""
+    ftp.dir_offset = 0
+    ftp.list_temp_result = []
+    ftp.list_result = []
+    ftp.cmd_list([path])
+    return list(ftp.list_result)
+
+
+def download(ftp, master, remote, local, stall_s=12.0):
+    """Download one remote file to ``local``.  cmd_get only kicks off the burst
+    read; we pump FILE_TRANSFER_PROTOCOL replies until it reports done."""
+    ftp.done = False
+    ftp.cmd_get([remote, local])
+    pump = ftp._MAVFTP__mavlink_packet          # name-mangled private helpers
+    idle = ftp._MAVFTP__idle_task
+    deadline = time.time() + stall_s
+    while not ftp.done and time.time() < deadline:
+        msg = master.recv_match(type="FILE_TRANSFER_PROTOCOL", blocking=True, timeout=1.0)
+        if msg is None:
+            idle()
+            continue
+        deadline = time.time() + stall_s
+        pump(msg)
+        idle()
+    return os.path.exists(local)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-p", "--port", default=os.environ.get("MAV_PORT") or autodetect_port())
+    ap.add_argument("-b", "--baud", type=int, default=int(os.environ.get("MAV_BAUD", "921600")))
+    ap.add_argument("-o", "--outdir", default=".", help="where to save (default: cwd)")
+    ap.add_argument("--list", action="store_true", help="list sessions/logs and exit")
+    ap.add_argument("--session", help="session dir to pull from (default: newest)")
+    ap.add_argument("--name", help="log file to pull (default: newest .ulg in the session)")
+    args = ap.parse_args()
+
+    if not args.port:
+        print("no serial port found -- pass -p or attach the FC", file=sys.stderr)
+        return 2
+
+    print(f"connecting {args.port} @ {args.baud} ...", flush=True)
+    master = mavutil.mavlink_connection(args.port, baud=args.baud)
+    if master.wait_heartbeat(timeout=15) is None:
+        print("no heartbeat -- is the FC attached (usbipd) and the sim stopped?",
+              file=sys.stderr)
+        return 1
+    print(f"heartbeat: system {master.target_system} component {master.target_component}",
+          flush=True)
+    ftp = MAVFTP(master, master.target_system, master.target_component)
+
+    sessions = [e for e in listdir(ftp, LOG_DIR) if e.is_dir]
+    if not sessions:
+        print(f"no session dirs under {LOG_DIR}", file=sys.stderr)
+        return 1
+    sessions.sort(key=lambda e: e.name)
+
+    if args.list:
+        if args.session:                    # one session -> its .ulg files (fast)
+            logs = [e for e in listdir(ftp, f"{LOG_DIR}/{args.session}")
+                    if not e.is_dir and e.name.endswith(".ulg")]
+            for e in sorted(logs, key=lambda x: x.name):
+                print(f"  {args.session}/{e.name}  {e.size_b} B")
+        else:                               # just the session names (one FTP call)
+            for s in sessions:
+                print(f"  {s.name}{'   <- newest' if s is sessions[-1] else ''}")
+            print("\n(pass --session <name> --list to see its .ulg files, "
+                  "or run with no args to pull the newest)")
+        return 0
+
+    sess = args.session or sessions[-1].name
+    logs = [e for e in listdir(ftp, f"{LOG_DIR}/{sess}")
+            if not e.is_dir and e.name.endswith(".ulg")]
+    if not logs:
+        print(f"no .ulg in {sess}", file=sys.stderr)
+        return 1
+    logs.sort(key=lambda e: e.name)
+    target = next((e for e in logs if e.name == args.name), None) if args.name else logs[-1]
+    if target is None:
+        print(f"{args.name} not found in {sess} (have: {[e.name for e in logs]})",
+              file=sys.stderr)
+        return 1
+
+    remote = f"{LOG_DIR}/{sess}/{target.name}"
+    local = os.path.join(args.outdir, f"{sess}_{target.name}")
+    print(f"downloading {remote} ({target.size_b} B) -> {local} ...", flush=True)
+    t0 = time.time()
+    ok = download(ftp, master, remote, local)
+    if not ok:
+        print("download FAILED", file=sys.stderr)
+        return 1
+    print(f"wrote {os.path.getsize(local)} B in {time.time()-t0:.1f}s: {local}", flush=True)
+    print(f"analyse it:  ulog_diag.py {local}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
