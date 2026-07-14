@@ -36,10 +36,12 @@ def get(u, name):
     return None
 
 
-def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: ulog_diag.py <log.ulg>")
-    u = ULog(sys.argv[1])
+def diagnose(path):
+    """Parse a .ulg and print why the vehicle failsafed / wouldn't fly.
+
+    Factored out of main() so the mavTerminal shell can call it directly after a
+    `log pull`, without re-shelling into this script."""
+    u = ULog(path)
 
     print("=== logged messages (the [FC] STATUSTEXT stream) ===")
     for m in u.logged_messages:
@@ -97,6 +99,12 @@ def main():
         if allv.size:
             print(f"\n=== actuator_motors === range {allv.min():.3f}..{allv.max():.3f} "
                   f"mean {allv.mean():.3f}   (0 => PX4 never commanded thrust)")
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: ulog_diag.py <log.ulg>")
+    diagnose(sys.argv[1])
 
 
 if __name__ == "__main__":

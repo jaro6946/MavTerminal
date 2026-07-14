@@ -145,10 +145,15 @@ statustext_on = True  # always print STATUSTEXT by default
 last_msgs = {}
 params = {}       # name -> latest decoded value, populated by the recv thread
 param_types = {}  # name -> MAVLink param_type (so `param set` can encode correctly)
+recv_paused = False  # when True the recv thread stops reading so a MAVFTP log
+                     # transfer can be the SOLE reader of the one FC serial port
 
 def recv_loop():
     while True:
         try:
+            if recv_paused:                # a `log` FTP transfer owns the port now
+                time.sleep(0.05)
+                continue
             msg = mav.recv_match(blocking=True, timeout=1)
             if msg and msg.get_type() != "BAD_DATA":
                 mtype = msg.get_type()
@@ -182,6 +187,9 @@ def cmd_help():
   temp                    show current sensor temperatures
   param get <NAME>        read a parameter
   param set <NAME> <VAL>  set a parameter
+  log list [session]      list onboard .ulg flight logs (newest marked)
+  log pull [sess] [name]  download newest (or named) .ulg and diagnose it
+  log diag <file.ulg>     diagnose an already-downloaded log
   tcal                    trigger thermal calibration
   heartbeat               show connection info
   arm / disarm / reboot   send commands
@@ -304,6 +312,90 @@ def cmd_tcal():
     )
     print("Command sent. Watch for [FC] messages...")
 
+def _pause_recv():
+    """Stop the background reader and wait for its in-flight recv_match to
+    return, so the caller becomes the SOLE reader of the FC serial port.
+    recv_match blocks up to 1 s, so we wait a hair longer than that."""
+    global recv_paused
+    recv_paused = True
+    time.sleep(1.15)
+
+
+def _resume_recv():
+    global recv_paused
+    recv_paused = False
+
+
+def cmd_log(args):
+    """Pull & diagnose the FC's onboard .ulg flight logs over the SAME serial
+    link this shell already owns (MAVLink FTP). Sub-commands:
+
+        log list                 list sessions on the SD card (newest marked)
+        log list <session>       list the .ulg files in one session
+        log pull                 download the NEWEST log, then diagnose it
+        log pull <session>       download the newest log in <session>, diagnose
+        log pull <session> <name.ulg>   download that exact log, diagnose
+        log diag <file.ulg>      diagnose an already-downloaded local .ulg
+
+    Downloads land in $MAV_LOG_DIR (default: cwd). This is the batch-drivable
+    equivalent of pull_log.py + ulog_diag.py, but reusing this connection so
+    there's never a second owner fighting over the one FC port."""
+    # Import lazily: listing/pulling need only pymavlink (always present), and we
+    # want `log` usable even if pyulog (the analyzer's dep) isn't installed.
+    import pull_log
+    sub = (args[0].lower() if args else "")
+    outdir = os.environ.get("MAV_LOG_DIR", ".")
+
+    if sub == "diag":
+        if len(args) < 2:
+            print("Usage: log diag <file.ulg>")
+            return
+        try:
+            from ulog_diag import diagnose
+        except ImportError as e:
+            print(f"  analyzer needs pyulog: {e}  (pip install pyulog)")
+            return
+        diagnose(args[1])
+        return
+
+    # list / pull both drive MAVFTP, which must be the only reader of the port.
+    _pause_recv()
+    try:
+        ftp = pull_log.make_ftp(mav)
+        if sub == "" or sub == "list":
+            session = args[1] if len(args) > 1 else None
+            if session:
+                logs = pull_log.list_logs(ftp, session)
+                if not logs:
+                    print(f"  no .ulg in {session}")
+                for e in logs:
+                    print(f"  {session}/{e.name}  {e.size_b} B")
+            else:
+                sessions = pull_log.list_sessions(ftp)
+                if not sessions:
+                    print("  no log sessions on the card")
+                for s in sessions:
+                    print(f"  {s.name}{'   <- newest' if s is sessions[-1] else ''}")
+                print("  (log list <session> to see its files; log pull to grab the newest)")
+        elif sub == "pull":
+            session = args[1] if len(args) > 1 else None
+            name = args[2] if len(args) > 2 else None
+            local = pull_log.pull(ftp, mav, outdir, session, name,
+                                  log=lambda m: print(f"  {m}"))
+            if local:
+                try:
+                    from ulog_diag import diagnose
+                    print()
+                    diagnose(local)
+                except ImportError as e:
+                    print(f"  downloaded ok; analyzer needs pyulog: {e}")
+        else:
+            print("Usage: log list | log list <session> | log pull [session] [name] | "
+                  "log diag <file.ulg>")
+    finally:
+        _resume_recv()
+
+
 def run_command(raw):
     """Execute a single command line. Returns True if the user asked to quit.
 
@@ -342,6 +434,8 @@ def run_command(raw):
             print("Usage: param get <NAME>  |  param set <NAME> <VALUE>")
     elif cmd == "tcal":
         cmd_tcal()
+    elif cmd == "log":
+        cmd_log(args)
     elif cmd == "heartbeat":
         print(f"System {mav.target_system}, Component {mav.target_component}")
     elif cmd == "arm":

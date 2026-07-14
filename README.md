@@ -157,7 +157,29 @@ the actual failsafe reason lives in PX4 *events* whose IDs are firmware hashes y
 offline. The ground truth is the onboard `.ulg` log — and you can pull it over the **same USB
 link**, no SD-card removal and no QGroundControl.
 
-Two standalone scripts (run with the same venv python):
+### The easy way: the built-in `log` command (one invocation, batch-friendly)
+
+The whole pull→diagnose flow is built into `mavTerminal` as a `log` command, so you don't
+juggle two scripts or two port owners — it reuses the connection the shell already holds:
+
+```bash
+mavTerminal -b 921600 -c "log pull"          # download the NEWEST log AND print the diagnosis
+mavTerminal -c "log list"                     # list sessions on the card (newest marked)
+mavTerminal -c "log list sess114"             # list that session's .ulg files
+mavTerminal -c "log pull sess112 log102.ulg"  # pull a specific log, then diagnose
+mavTerminal -c "log diag sess114_log101.ulg"  # re-diagnose an already-downloaded local .ulg
+```
+
+`log pull` is the one-shot "why won't it fly" button: a single non-interactive command that
+downloads the newest `.ulg` and prints the full `ulog_diag` breakdown. Downloads land in
+`$MAV_LOG_DIR` (default: current dir). Use `-b 921600` for the fast transfer baud (the default
+57600 works but a ~1 MB log takes minutes). Internally the shell pauses its background reader so
+the MAVFTP transfer is the sole reader of the one FC serial port.
+
+### The scripts underneath (if you want them standalone)
+
+The `log` command wraps two standalone scripts (run with the same venv python), still usable on
+their own — e.g. when the shell isn't running:
 
 | Script | Purpose |
 |---|---|

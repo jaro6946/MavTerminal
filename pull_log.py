@@ -76,6 +76,61 @@ def download(ftp, master, remote, local, stall_s=12.0):
     return os.path.exists(local)
 
 
+# ---- Reusable helpers (shared with mavshell's `log` command) -----------------
+# These take an already-open ``master`` MAVLink connection and build the MAVFTP
+# on top of it, so the mavTerminal shell can list/pull logs over the SAME serial
+# port it already owns — no second port-owner (which would collide on the one FC
+# link).  ``log`` is a print-like callback so callers can route output.
+
+def make_ftp(master):
+    return MAVFTP(master, master.target_system, master.target_component)
+
+
+def list_sessions(ftp):
+    """Return session dir entries under LOG_DIR, oldest→newest."""
+    sessions = [e for e in listdir(ftp, LOG_DIR) if e.is_dir]
+    sessions.sort(key=lambda e: e.name)
+    return sessions
+
+
+def list_logs(ftp, session):
+    """Return the .ulg file entries in one session dir, oldest→newest."""
+    logs = [e for e in listdir(ftp, f"{LOG_DIR}/{session}")
+            if not e.is_dir and e.name.endswith(".ulg")]
+    logs.sort(key=lambda e: e.name)
+    return logs
+
+
+def pull(ftp, master, outdir=".", session=None, name=None, log=print):
+    """Resolve (session, name) — defaulting to the newest — and download it.
+
+    Returns the local path on success, or None. Mirrors main()'s resolution so
+    both the CLI and the shell's `log pull` behave identically."""
+    sessions = list_sessions(ftp)
+    if not sessions:
+        log(f"no session dirs under {LOG_DIR}")
+        return None
+    sess = session or sessions[-1].name
+    logs = list_logs(ftp, sess)
+    if not logs:
+        log(f"no .ulg in {sess}")
+        return None
+    target = next((e for e in logs if e.name == name), None) if name else logs[-1]
+    if target is None:
+        log(f"{name} not found in {sess} (have: {[e.name for e in logs]})")
+        return None
+
+    remote = f"{LOG_DIR}/{sess}/{target.name}"
+    local = os.path.join(outdir, f"{sess}_{target.name}")
+    log(f"downloading {remote} ({target.size_b} B) -> {local} ...")
+    t0 = time.time()
+    if not download(ftp, master, remote, local):
+        log("download FAILED")
+        return None
+    log(f"wrote {os.path.getsize(local)} B in {time.time()-t0:.1f}s: {local}")
+    return local
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -99,49 +154,27 @@ def main():
         return 1
     print(f"heartbeat: system {master.target_system} component {master.target_component}",
           flush=True)
-    ftp = MAVFTP(master, master.target_system, master.target_component)
-
-    sessions = [e for e in listdir(ftp, LOG_DIR) if e.is_dir]
-    if not sessions:
-        print(f"no session dirs under {LOG_DIR}", file=sys.stderr)
-        return 1
-    sessions.sort(key=lambda e: e.name)
+    ftp = make_ftp(master)
 
     if args.list:
         if args.session:                    # one session -> its .ulg files (fast)
-            logs = [e for e in listdir(ftp, f"{LOG_DIR}/{args.session}")
-                    if not e.is_dir and e.name.endswith(".ulg")]
-            for e in sorted(logs, key=lambda x: x.name):
+            for e in list_logs(ftp, args.session):
                 print(f"  {args.session}/{e.name}  {e.size_b} B")
         else:                               # just the session names (one FTP call)
+            sessions = list_sessions(ftp)
+            if not sessions:
+                print(f"no session dirs under {LOG_DIR}", file=sys.stderr)
+                return 1
             for s in sessions:
                 print(f"  {s.name}{'   <- newest' if s is sessions[-1] else ''}")
             print("\n(pass --session <name> --list to see its .ulg files, "
                   "or run with no args to pull the newest)")
         return 0
 
-    sess = args.session or sessions[-1].name
-    logs = [e for e in listdir(ftp, f"{LOG_DIR}/{sess}")
-            if not e.is_dir and e.name.endswith(".ulg")]
-    if not logs:
-        print(f"no .ulg in {sess}", file=sys.stderr)
+    local = pull(ftp, master, args.outdir, args.session, args.name,
+                 log=lambda m: print(m, flush=True))
+    if local is None:
         return 1
-    logs.sort(key=lambda e: e.name)
-    target = next((e for e in logs if e.name == args.name), None) if args.name else logs[-1]
-    if target is None:
-        print(f"{args.name} not found in {sess} (have: {[e.name for e in logs]})",
-              file=sys.stderr)
-        return 1
-
-    remote = f"{LOG_DIR}/{sess}/{target.name}"
-    local = os.path.join(args.outdir, f"{sess}_{target.name}")
-    print(f"downloading {remote} ({target.size_b} B) -> {local} ...", flush=True)
-    t0 = time.time()
-    ok = download(ftp, master, remote, local)
-    if not ok:
-        print("download FAILED", file=sys.stderr)
-        return 1
-    print(f"wrote {os.path.getsize(local)} B in {time.time()-t0:.1f}s: {local}", flush=True)
     print(f"analyse it:  ulog_diag.py {local}", flush=True)
     return 0
 
