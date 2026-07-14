@@ -131,6 +131,67 @@ def pull(ftp, master, outdir=".", session=None, name=None, log=print):
     return local
 
 
+# ---- Deleting logs off the card (DESTRUCTIVE) --------------------------------
+# cmd_rm / cmd_rmdir each drive their own FTP request/reply internally (they pump
+# via process_ftp_reply), so they're the sole reader while running — the same
+# single-owner requirement as download(); the shell pauses its recv thread first.
+
+def remove_file(ftp, path):
+    """Delete one remote file. Returns True on the FC's success ack."""
+    return ftp.cmd_rm([path]).return_code == 0
+
+
+def remove_dir(ftp, path):
+    """Delete one remote directory (must already be empty). True on success."""
+    return ftp.cmd_rmdir([path]).return_code == 0
+
+
+def walk_logs(ftp, path=LOG_DIR):
+    """Depth-first walk of everything under ``path``, yielding (entry, full_path,
+    is_dir). Files are yielded before the directory that contains them, and
+    ``path`` itself is never yielded — so a caller can delete bottom-up (files,
+    then now-empty dirs) while keeping the top log directory intact. listdir()
+    materializes each level into a list before we recurse, so deleting as you
+    iterate is safe."""
+    for e in listdir(ftp, path):
+        if e.name in (".", "..", ""):
+            continue
+        child = f"{path}/{e.name}"
+        if e.is_dir:
+            yield from walk_logs(ftp, child)
+            yield e, child, True
+        else:
+            yield e, child, False
+
+
+def summarize_logs(ftp):
+    """Count what a delete-all would remove: (n_files, n_dirs, total_bytes)."""
+    n_files = n_dirs = total = 0
+    for e, _path, is_dir in walk_logs(ftp):
+        if is_dir:
+            n_dirs += 1
+        else:
+            n_files += 1
+            total += (e.size_b or 0)
+    return n_files, n_dirs, total
+
+
+def delete_all_logs(ftp, log=print):
+    """Delete every file and session dir under LOG_DIR (LOG_DIR itself is kept).
+    Returns (n_removed, n_failed)."""
+    removed = failed = 0
+    for e, path, is_dir in walk_logs(ftp):
+        ok = remove_dir(ftp, path) if is_dir else remove_file(ftp, path)
+        kind = "dir " if is_dir else ""
+        if ok:
+            removed += 1
+            log(f"removed {kind}{path}")
+        else:
+            failed += 1
+            log(f"FAILED  {kind}{path}")
+    return removed, failed
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -140,6 +201,10 @@ def main():
     ap.add_argument("--list", action="store_true", help="list sessions/logs and exit")
     ap.add_argument("--session", help="session dir to pull from (default: newest)")
     ap.add_argument("--name", help="log file to pull (default: newest .ulg in the session)")
+    ap.add_argument("--delete-all", action="store_true",
+                    help="DELETE every log off the card (dry-run unless --yes is given)")
+    ap.add_argument("--yes", action="store_true",
+                    help="confirm a destructive --delete-all (skip the dry run)")
     args = ap.parse_args()
 
     if not args.port:
@@ -170,6 +235,20 @@ def main():
             print("\n(pass --session <name> --list to see its .ulg files, "
                   "or run with no args to pull the newest)")
         return 0
+
+    if args.delete_all:
+        n_files, n_dirs, total = summarize_logs(ftp)
+        if n_files == 0 and n_dirs == 0:
+            print(f"no logs under {LOG_DIR} -- nothing to delete")
+            return 0
+        print(f"{'DELETING' if args.yes else 'would delete'} {n_files} file(s) in "
+              f"{n_dirs} session dir(s), {total/1e6:.1f} MB, under {LOG_DIR}")
+        if not args.yes:
+            print("this is DESTRUCTIVE and cannot be undone -- re-run with --yes to do it.")
+            return 0
+        removed, failed = delete_all_logs(ftp, log=lambda m: print(f"  {m}", flush=True))
+        print(f"done: removed {removed}, failed {failed}")
+        return 1 if failed else 0
 
     local = pull(ftp, master, args.outdir, args.session, args.name,
                  log=lambda m: print(m, flush=True))

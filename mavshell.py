@@ -190,6 +190,7 @@ def cmd_help():
   log list [session]      list onboard .ulg flight logs (newest marked)
   log pull [sess] [name]  download newest (or named) .ulg and diagnose it
   log diag <file.ulg>     diagnose an already-downloaded log
+  log delete [yes]        DELETE all logs off the card (dry-run without 'yes')
   tcal                    trigger thermal calibration
   heartbeat               show connection info
   arm / disarm / reboot   send commands
@@ -336,6 +337,8 @@ def cmd_log(args):
         log pull <session>       download the newest log in <session>, diagnose
         log pull <session> <name.ulg>   download that exact log, diagnose
         log diag <file.ulg>      diagnose an already-downloaded local .ulg
+        log delete               DRY-RUN: show what deleting all logs would remove
+        log delete yes           DESTRUCTIVE: delete EVERY log off the SD card
 
     Downloads land in $MAV_LOG_DIR (default: cwd). This is the batch-drivable
     equivalent of pull_log.py + ulog_diag.py, but reusing this connection so
@@ -389,9 +392,27 @@ def cmd_log(args):
                     diagnose(local)
                 except ImportError as e:
                     print(f"  downloaded ok; analyzer needs pyulog: {e}")
+        elif sub in ("delete", "rm", "clear"):
+            # DESTRUCTIVE: wipe every log off the card. Gated so a bare
+            # `log delete` only reports what WOULD go — you must add an explicit
+            # `yes`/`confirm` to actually delete (safe for batch/automation).
+            confirmed = len(args) > 1 and args[1].lower() in ("yes", "confirm", "force", "-y")
+            n_files, n_dirs, total = pull_log.summarize_logs(ftp)
+            if n_files == 0 and n_dirs == 0:
+                print(f"  no logs under {pull_log.LOG_DIR} — nothing to delete")
+            elif not confirmed:
+                print(f"  would delete {n_files} file(s) in {n_dirs} session dir(s), "
+                      f"{total/1e6:.1f} MB, under {pull_log.LOG_DIR}")
+                print("  this is DESTRUCTIVE and cannot be undone.")
+                print("  re-run  log delete yes  to actually delete.")
+            else:
+                print(f"  deleting {n_files} file(s) + {n_dirs} dir(s) under "
+                      f"{pull_log.LOG_DIR} ...")
+                removed, failed = pull_log.delete_all_logs(ftp, log=lambda m: print(f"  {m}"))
+                print(f"  done: removed {removed}, failed {failed}")
         else:
             print("Usage: log list | log list <session> | log pull [session] [name] | "
-                  "log diag <file.ulg>")
+                  "log diag <file.ulg> | log delete [yes]")
     finally:
         _resume_recv()
 

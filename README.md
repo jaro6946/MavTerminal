@@ -168,7 +168,17 @@ mavTerminal -c "log list"                     # list sessions on the card (newes
 mavTerminal -c "log list sess114"             # list that session's .ulg files
 mavTerminal -c "log pull sess112 log102.ulg"  # pull a specific log, then diagnose
 mavTerminal -c "log diag sess114_log101.ulg"  # re-diagnose an already-downloaded local .ulg
+
+mavTerminal -c "log delete"                   # DRY-RUN: how many logs / MB would be wiped
+mavTerminal -b 921600 -c "log delete yes"     # DESTRUCTIVE: erase EVERY log off the SD card
 ```
+
+`log delete` is **confirmation-gated**: a bare `log delete` only *reports* what would go (file
+count + total MB) and does nothing; you must add the explicit `yes` (`log delete yes`) to
+actually erase. It removes every file and empties every session dir under `/fs/microsd/log`
+(the log dir itself is kept), so the card is clean for the next flight. The deletion cannot be
+undone — pull anything you still want first. (Standalone equivalent:
+`mavPy pull_log.py --delete-all` for the dry run, `--delete-all --yes` to commit.)
 
 `log pull` is the one-shot "why won't it fly" button: a single non-interactive command that
 downloads the newest `.ulg` and prints the full `ulog_diag` breakdown. Downloads land in
