@@ -49,6 +49,21 @@ PARAM_INT_TYPES = {
 }
 
 
+# --- Raw NSH (NuttShell) console over MAVLink --------------------------------
+# PX4 exposes its onboard NuttShell over MAVLink SERIAL_CONTROL (#126) with
+# device == SHELL: bytes we put in `data` are fed to nsh's stdin, and PX4 streams
+# the console output back in SERIAL_CONTROL messages of the same device. This is
+# exactly how QGroundControl's "MAVLink Console" works. getattr fallbacks keep it
+# working on a dialect that happens to omit a constant.
+SERIAL_CONTROL_DEV_SHELL = getattr(mavutil.mavlink, "SERIAL_CONTROL_DEV_SHELL", 10)
+# RESPOND: ask PX4 to send the output back.  EXCLUSIVE: take the shell for this
+# GCS.  MULTI: allow >1 SERIAL_CONTROL reply per request (long output).
+NSH_FLAGS = (getattr(mavutil.mavlink, "SERIAL_CONTROL_FLAG_RESPOND", 2)
+             | getattr(mavutil.mavlink, "SERIAL_CONTROL_FLAG_EXCLUSIVE", 4)
+             | getattr(mavutil.mavlink, "SERIAL_CONTROL_FLAG_MULTI", 16))
+NSH_DATA_LEN = 70   # SERIAL_CONTROL.data is a fixed 70-byte field
+
+
 def decode_param(msg):
     """Return a PARAM_VALUE's real value.
 
@@ -147,6 +162,12 @@ params = {}       # name -> latest decoded value, populated by the recv thread
 param_types = {}  # name -> MAVLink param_type (so `param set` can encode correctly)
 recv_paused = False  # when True the recv thread stops reading so a MAVFTP log
                      # transfer can be the SOLE reader of the one FC serial port
+# Raw-NSH session state (mutated in place so recv_loop needs no `global`):
+#   echo    -- while True, recv_loop writes SERIAL_CONTROL shell bytes straight
+#              to stdout (this is the live console output).
+#   last_rx -- wall-clock of the most recent shell byte, so a one-shot command
+#              can tell when PX4 has gone quiet and stop draining.
+nsh_state = {'echo': False, 'last_rx': 0.0}
 
 def recv_loop():
     while True:
@@ -165,9 +186,21 @@ def recv_loop():
                     pname = msg.param_id.rstrip('\x00')
                     params[pname] = decode_param(msg)
                     param_types[pname] = getattr(msg, "param_type", None)
+                # Raw-NSH console output: PX4 streams shell bytes back as
+                # SERIAL_CONTROL.  While an nsh session is active, write them
+                # verbatim to stdout (this IS the console) and remember when the
+                # last byte landed so a one-shot command knows when it's done.
+                elif mtype == "SERIAL_CONTROL" and nsh_state['echo']:
+                    n = min(int(getattr(msg, "count", 0)), NSH_DATA_LEN)
+                    if n:
+                        raw = bytes(bytearray(msg.data[:n]))
+                        sys.stdout.write(raw.decode("utf-8", "replace"))
+                        sys.stdout.flush()
+                        nsh_state['last_rx'] = time.time()
+                    continue  # never echo the prompt into the console stream
                 # Only redraw the "> " prompt when a human is watching; in batch
-                # mode it would just litter the captured output.
-                prompt = "> " if INTERACTIVE else ""
+                # mode (or mid-NSH session) it would just litter the output.
+                prompt = "" if (nsh_state['echo'] or not INTERACTIVE) else "> "
                 if mtype == "STATUSTEXT" and statustext_on:
                     print(f"\n[FC] {msg.text.strip()}\n{prompt}", end="", flush=True)
                 elif streaming:
@@ -191,6 +224,8 @@ def cmd_help():
   log pull [sess] [name]  download newest (or named) .ulg and diagnose it
   log diag <file.ulg>     diagnose an already-downloaded log
   log delete [yes]        DELETE all logs off the card (dry-run without 'yes')
+  nsh <command>           run one NuttShell command on the FC and print output
+  nsh                     open an interactive raw NSH shell (TTY only)
   tcal                    trigger thermal calibration
   heartbeat               show connection info
   arm / disarm / reboot   send commands
@@ -417,6 +452,89 @@ def cmd_log(args):
         _resume_recv()
 
 
+def _nsh_send(text):
+    """Feed ``text`` to the FC's NuttShell over SERIAL_CONTROL.
+
+    The data field is a fixed 70 bytes, so anything longer is split across
+    several messages (``count`` carries the valid length of each).  Always sends
+    at least one message even for empty text, so a bare send can be used to POLL
+    for output (e.g. to fetch the initial ``nsh> `` prompt)."""
+    data = text.encode("utf-8", "replace")
+    idx, first = 0, True
+    while first or idx < len(data):
+        first = False
+        chunk = data[idx:idx + NSH_DATA_LEN]
+        idx += NSH_DATA_LEN
+        payload = list(chunk) + [0] * (NSH_DATA_LEN - len(chunk))
+        # device, flags, timeout, baudrate, count, data  (no target fields in
+        # this dialect -> PX4 treats it as broadcast and accepts it).
+        mav.mav.serial_control_send(SERIAL_CONTROL_DEV_SHELL, NSH_FLAGS,
+                                    0, 0, len(chunk), payload)
+
+
+def _nsh_drain(quiet=0.35, cap=3.0, min_wait=0.5):
+    """Block while NSH output is still streaming back, so a one-shot command
+    prints its full result before we return.
+
+    Caller sets ``nsh_state['last_rx'] = 0`` right before sending.  We then wait
+    until output has arrived AND has been quiet for ``quiet`` seconds (command
+    finished), or ``min_wait`` elapsed with no output at all (silent command),
+    or the hard ``cap`` is hit (never hang a batch run).  recv_loop does the
+    actual printing; this only watches the clock."""
+    start = time.time()
+    while True:
+        el = time.time() - start
+        if el >= cap:
+            return
+        last = nsh_state['last_rx']
+        if last and (time.time() - last) >= quiet:
+            return
+        if not last and el >= min_wait:
+            return
+        time.sleep(0.03)
+
+
+def cmd_nsh(args):
+    """Raw NuttShell (NSH) console on the FC over MAVLink SERIAL_CONTROL.
+
+        nsh <command...>   run one shell command, print its output, return
+        nsh                open an interactive NSH sub-shell (TTY only)
+
+    One-shot form is batch-drivable: ``mavTerminal -c "nsh ver all"`` /
+    ``-c "nsh dmesg"`` / ``-c "nsh top once"``.  The interactive form drops you
+    into the FC's live shell (PX4 echoes its own ``nsh> `` prompt); leave it with
+    ``exit``, ``~.``, or Ctrl-C."""
+    nsh_state['echo'] = True
+    try:
+        if args:                                   # one-shot command
+            nsh_state['last_rx'] = 0.0
+            _nsh_send(" ".join(args) + "\n")
+            _nsh_drain()
+            print()                                # clean line before the prompt
+            return
+        if not INTERACTIVE:
+            print("`nsh` with no command needs an interactive terminal; "
+                  "for batch use, pass the command: nsh <command>")
+            return
+        print("Entering NSH shell. Type 'exit', '~.', or Ctrl-C to leave.\n")
+        nsh_state['last_rx'] = 0.0
+        _nsh_send("\n")                            # elicit the initial prompt
+        _nsh_drain(min_wait=0.6)
+        while True:
+            try:
+                line = input("")                  # PX4 echoes its own nsh> prompt
+            except (EOFError, KeyboardInterrupt):
+                break
+            if line.strip() in ("exit", "quit", "~."):
+                break
+            nsh_state['last_rx'] = 0.0
+            _nsh_send(line + "\n")
+            _nsh_drain()
+        print("\nLeft NSH shell.")
+    finally:
+        nsh_state['echo'] = False
+
+
 def run_command(raw):
     """Execute a single command line. Returns True if the user asked to quit.
 
@@ -457,6 +575,8 @@ def run_command(raw):
         cmd_tcal()
     elif cmd == "log":
         cmd_log(args)
+    elif cmd == "nsh":
+        cmd_nsh(args)
     elif cmd == "heartbeat":
         print(f"System {mav.target_system}, Component {mav.target_component}")
     elif cmd == "arm":

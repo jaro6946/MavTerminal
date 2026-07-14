@@ -67,6 +67,8 @@ From `help` inside the REPL (all also work in `-c` batch mode):
 | `stream on/off` | Toggle a live dump of every incoming message. |
 | `statustext on/off` | Toggle printing FC `STATUSTEXT` (`[FC] …`); **on** by default. |
 | `temp` | Show board/IMU temperatures (HIGHRES_IMU + SCALED_IMU1/2/3). |
+| `nsh <command>` | Run one **NuttShell** command on the FC and print its output (batch-friendly). |
+| `nsh` | Open an interactive raw NSH shell on the FC (TTY only; leave with `exit`/`~.`/Ctrl-C). |
 | `tcal` | Trigger PX4 thermal calibration (`MAV_CMD_PREFLIGHT_CALIBRATION` param5=3). |
 | `heartbeat` | Print connection info (system/component id). |
 | `arm` / `disarm` / `reboot` | Send arm / disarm / reboot-autopilot commands. |
@@ -103,6 +105,40 @@ From `help` inside the REPL (all also work in `-c` batch mode):
 ```
 
 Batch mode is entered automatically by `-c` **or** by piping commands on non-TTY stdin.
+
+---
+
+## Raw NSH (NuttShell) console
+
+PX4 runs on NuttX, whose shell is **NSH** — the same `nsh>` you'd get on the FC's debug UART.
+MavTerminal tunnels it over the USB MAVLink link using `SERIAL_CONTROL` (#126) with
+`device = SHELL`, exactly like QGroundControl's *MAVLink Console*: bytes you type are fed to
+nsh's stdin, and PX4 streams the console output back in `SERIAL_CONTROL` replies. No debug
+probe, no second cable.
+
+```bash
+mavTerminal -c "nsh ver all"        # firmware version / git hash / board
+mavTerminal -c "nsh dmesg"          # boot log — the real story behind a failed boot
+mavTerminal -c "nsh top once"       # one CPU/stack snapshot of every running task
+mavTerminal -c "nsh listener sensor_accel"   # dump a live uORB topic
+mavTerminal -c "nsh param show SYS_HITL"      # PX4's own param tool (note: this IS `param show`)
+```
+
+Two forms:
+
+- **One-shot** — `nsh <command>` sends the line, waits for output to go quiet (or a 3 s cap),
+  prints it, and returns. This is the batch-drivable form (`-c "nsh <command>"`), and it's the
+  one you'll use with Claude/automation.
+- **Interactive** — a bare `nsh` (only on a real terminal, not batch) drops you into the live
+  shell. PX4 echoes its own `nsh> ` prompt; leave with `exit`, `~.`, or Ctrl-C.
+
+Notes:
+- The FC serial port has **one owner** — stop the sim first (same rule as `param`/`log`).
+- NSH is a full shell on the airframe: `reboot`, `param reset`, and the like really do it.
+  Read-only introspection (`ver`, `dmesg`, `top`, `listener`, `param show`) is the safe,
+  common use. Props **off** for anything that could actuate.
+- Long output arrives as several `SERIAL_CONTROL` messages (`MULTI` flag) and is reassembled
+  for you; a command that prints nothing returns after ~0.5 s.
 
 ---
 
