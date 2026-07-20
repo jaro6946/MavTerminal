@@ -22,6 +22,7 @@ Depends only on pymavlink (already in the agc_CTOL_SE3-rotopy venv).
 """
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -86,10 +87,17 @@ def make_ftp(master):
     return MAVFTP(master, master.target_system, master.target_component)
 
 
+def natural_key(name):
+    """Sort key treating digit runs as numbers, so sess99 < sess100 < sess101
+    (plain string sort puts sess100 BEFORE sess99, mis-picking the "newest"
+    session/log at every digit-count rollover)."""
+    return [int(tok) if tok.isdigit() else tok for tok in re.split(r"(\d+)", name)]
+
+
 def list_sessions(ftp):
     """Return session dir entries under LOG_DIR, oldest→newest."""
     sessions = [e for e in listdir(ftp, LOG_DIR) if e.is_dir]
-    sessions.sort(key=lambda e: e.name)
+    sessions.sort(key=lambda e: natural_key(e.name))
     return sessions
 
 
@@ -97,15 +105,17 @@ def list_logs(ftp, session):
     """Return the .ulg file entries in one session dir, oldest→newest."""
     logs = [e for e in listdir(ftp, f"{LOG_DIR}/{session}")
             if not e.is_dir and e.name.endswith(".ulg")]
-    logs.sort(key=lambda e: e.name)
+    logs.sort(key=lambda e: natural_key(e.name))
     return logs
 
 
-def pull(ftp, master, outdir=".", session=None, name=None, log=print):
+def pull(ftp, master, outdir=".", session=None, name=None, log=print,
+         dest_name=None):
     """Resolve (session, name) — defaulting to the newest — and download it.
 
     Returns the local path on success, or None. Mirrors main()'s resolution so
-    both the CLI and the shell's `log pull` behave identically."""
+    both the CLI and the shell's `log pull` behave identically.
+    ``dest_name`` overrides the local filename (default ``<sess>_<name>``)."""
     sessions = list_sessions(ftp)
     if not sessions:
         log(f"no session dirs under {LOG_DIR}")
@@ -121,7 +131,7 @@ def pull(ftp, master, outdir=".", session=None, name=None, log=print):
         return None
 
     remote = f"{LOG_DIR}/{sess}/{target.name}"
-    local = os.path.join(outdir, f"{sess}_{target.name}")
+    local = os.path.join(outdir, dest_name or f"{sess}_{target.name}")
     log(f"downloading {remote} ({target.size_b} B) -> {local} ...")
     t0 = time.time()
     if not download(ftp, master, remote, local):
