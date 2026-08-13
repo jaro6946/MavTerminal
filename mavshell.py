@@ -15,6 +15,7 @@ Examples:
 """
 import argparse
 import os
+import shlex
 import struct
 import sys
 import threading
@@ -109,9 +110,6 @@ ap.add_argument("--settle", type=float, default=2.0,
 args = ap.parse_args()
 PORT, BAUD = args.port, args.baud
 
-if not PORT:
-    sys.exit("No flight-controller serial port found. Plug in the FC or pass --port <PORT>.")
-
 # Decide the mode up front so prints/prompts adapt. Batch mode is triggered by
 # -c commands, or by piped (non-TTY) stdin — either way we run and exit.
 batch_cmds = list(args.cmd)
@@ -119,39 +117,65 @@ if not sys.stdin.isatty() and not batch_cmds:
     batch_cmds = [ln.strip() for ln in sys.stdin if ln.strip()]
 INTERACTIVE = not batch_cmds
 
-print(f"Connecting to {PORT} @ {BAUD}...")
-try:
-    mav = mavutil.mavlink_connection(PORT, baud=BAUD)
-except Exception as e:
-    sys.exit(f"Could not open port '{PORT}': {e}\n"
-             "Check the FC is plugged in / passed through to WSL, or pass --port <PORT>.")
 
-# Send heartbeats to wake the FC before waiting for its response
-print("Sending heartbeats to wake FC...")
-for _ in range(5):
-    mav.mav.heartbeat_send(
-        mavutil.mavlink.MAV_TYPE_GCS,
-        mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-        0, 0, 0
+def _is_offline_cmd(line):
+    """True if ``line`` only reads a local .ulg and never touches the FC.
+
+    ``log diag`` / ``log graph`` analyze a file already on disk, so requiring a
+    plugged-in flight controller just to look at one would be silly. Anything
+    not on this list is assumed to need the link."""
+    parts = line.split()
+    if not parts:
+        return False
+    verb = parts[0].lower()
+    if verb in ("loggraph", "graph", "help"):
+        return True
+    return verb == "log" and len(parts) > 1 and parts[1].lower() in ("graph", "diag")
+
+
+# Skip the whole connect path when EVERY batch command is offline analysis.
+# Interactive sessions always connect — you can't know in advance what will be
+# typed, and a REPL is only useful with a live link anyway.
+OFFLINE = bool(batch_cmds) and all(_is_offline_cmd(c) for c in batch_cmds)
+
+if not OFFLINE:
+    if not PORT:
+        sys.exit("No flight-controller serial port found. "
+                 "Plug in the FC or pass --port <PORT>.")
+
+    print(f"Connecting to {PORT} @ {BAUD}...")
+    try:
+        mav = mavutil.mavlink_connection(PORT, baud=BAUD)
+    except Exception as e:
+        sys.exit(f"Could not open port '{PORT}': {e}\n"
+                 "Check the FC is plugged in / passed through to WSL, or pass --port <PORT>.")
+
+    # Send heartbeats to wake the FC before waiting for its response
+    print("Sending heartbeats to wake FC...")
+    for _ in range(5):
+        mav.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0, 0, 0
+        )
+        time.sleep(0.5)
+
+    print("Waiting for heartbeat...")
+    hb = mav.wait_heartbeat(timeout=args.heartbeat_timeout)
+    if hb is None:
+        print("No heartbeat received. Check connection and power.")
+        sys.exit(1)
+
+    print(f"Connected! System {mav.target_system}, Component {mav.target_component}")
+
+    # Request all data streams so we don't need QGC to prime the FC
+    mav.mav.request_data_stream_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_ALL,
+        10,  # 10 Hz
+        1    # start
     )
-    time.sleep(0.5)
-
-print("Waiting for heartbeat...")
-hb = mav.wait_heartbeat(timeout=args.heartbeat_timeout)
-if hb is None:
-    print("No heartbeat received. Check connection and power.")
-    sys.exit(1)
-
-print(f"Connected! System {mav.target_system}, Component {mav.target_component}")
-
-# Request all data streams so we don't need QGC to prime the FC
-mav.mav.request_data_stream_send(
-    mav.target_system, mav.target_component,
-    mavutil.mavlink.MAV_DATA_STREAM_ALL,
-    10,  # 10 Hz
-    1    # start
-)
-print("Data streams requested.")
+    print("Data streams requested.")
 if INTERACTIVE:
     print("Type 'help' for commands. Ctrl+C to exit.\n")
 
@@ -208,8 +232,9 @@ def recv_loop():
         except Exception:
             break
 
-t = threading.Thread(target=recv_loop, daemon=True)
-t.start()
+if not OFFLINE:                 # no link open, so there is nothing to read
+    t = threading.Thread(target=recv_loop, daemon=True)
+    t.start()
 
 def cmd_help():
     print("""Commands:
@@ -223,6 +248,9 @@ def cmd_help():
   log list [session]      list onboard .ulg flight logs (newest marked)
   log pull [sess] [name]  download newest (or named) .ulg and diagnose it
   log diag <file.ulg>     diagnose an already-downloaded log
+  log graph <file.ulg>    plot it: temps, sat count, dT/dt (toggleable series;
+                          wheel=zoom time, ctrl+wheel=zoom values, drag=pan)
+                          also as: logGraph <file.ulg>   [--list to just list]
   log delete [yes]        DELETE all logs off the card (dry-run without 'yes')
   nsh <command>           run one NuttShell command on the FC and print output
   nsh                     open an interactive raw NSH shell (TTY only)
@@ -396,6 +424,44 @@ def cmd_log(args):
         diagnose(args[1])
         return
 
+    if sub == "graph":
+        # Purely offline, like `diag` — handled BEFORE the MAVFTP block below,
+        # which is the only part of `log` that needs the serial port.
+        if len(args) < 2:
+            print("Usage: log graph <file.ulg> [--list] [--save out.png] "
+                  "[--smooth SEC] [--abs] [--rate-src TOPIC[i].FIELD] "
+                  "[--add TOPIC[i].FIELD]")
+            return
+        try:
+            import ulog_graph
+        except ImportError as e:
+            print(f"  grapher needs pyulog + matplotlib: {e}")
+            return
+        path, opts = args[1], args[2:]
+        if not os.path.isfile(path):
+            print(f"  no such file: {path}")
+            return
+        if "--list" in opts:
+            ulog_graph.list_channels(path)
+            return
+
+        def _opt(name, cast=str, default=None):
+            return cast(opts[opts.index(name) + 1]) if name in opts else default
+
+        try:
+            ulog_graph.graph(
+                path,
+                smooth=_opt("--smooth", float, 31.0),
+                use_abs="--abs" in opts,
+                rate_src=_opt("--rate-src"),
+                adds=[opts[i + 1] for i, o in enumerate(opts) if o == "--add"],
+                save=_opt("--save"),
+                show="--no-show" not in opts,
+            )
+        except (IndexError, ValueError) as e:
+            print(f"  bad options: {e}")
+        return
+
     # list / pull both drive MAVFTP, which must be the only reader of the port.
     _pause_recv()
     try:
@@ -447,7 +513,7 @@ def cmd_log(args):
                 print(f"  done: removed {removed}, failed {failed}")
         else:
             print("Usage: log list | log list <session> | log pull [session] [name] | "
-                  "log diag <file.ulg> | log delete [yes]")
+                  "log diag <file.ulg> | log graph <file.ulg> | log delete [yes]")
     finally:
         _resume_recv()
 
@@ -545,8 +611,22 @@ def run_command(raw):
     raw = raw.strip()
     if not raw:
         return False
-    parts = raw.split()
+    # shlex, not str.split: log paths routinely contain spaces (e.g. a
+    # "Log Analysis" folder), and a plain split would hand `log graph` half a
+    # filename. Fall back to a naive split if the quoting is unbalanced so a
+    # stray quote can't kill the REPL.
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        parts = raw.split()
+    if not parts:
+        return False
     cmd, args = parts[0].lower(), parts[1:]
+
+    # `logGraph <file>` is an alias for `log graph <file>` (run_command has
+    # already lowercased the verb, so either capitalization works).
+    if cmd in ("loggraph", "graph"):
+        cmd, args = "log", ["graph"] + args
 
     if cmd in ("quit", "exit", "q"):
         return True
@@ -595,7 +675,9 @@ def run_command(raw):
 if batch_cmds:
     # Give the just-requested data streams a moment to populate last_msgs so
     # commands like `temp` / `show` have data to report, then run and exit.
-    time.sleep(args.settle)
+    # Offline runs have no streams to wait for, so they skip straight through.
+    if not OFFLINE:
+        time.sleep(args.settle)
     for c in batch_cmds:
         print(f"> {c}")
         if run_command(c):   # honor an explicit quit/exit in the batch
