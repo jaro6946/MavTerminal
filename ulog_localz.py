@@ -42,11 +42,13 @@ import os
 
 import numpy as np
 
-from ulog_common import (C_ARMED, C_GRID, C_INK, C_MUTED, C_SURFACE, PlotCtx,
-                         Series, _clean, _get, _rescale, _style_axis, _time_min,
-                         add_mouse_navigation, armed_spans, check_panel,
-                         draw_armed, duration_min, field, has_topic, nav_hint,
-                         style_time_axis)
+from ulog_common import (C_ARMED, C_BAD, C_GRID, C_INK, C_MUTED, C_SURFACE,
+                         INST_COLORS, PlotCtx, Series, _clean, _get, _rescale,
+                         _style_axis, _time_min, add_mouse_navigation,
+                         armed_spans, check_panel, draw_armed, draw_band_rows,
+                         draw_primary_shading, duration_min, field, has_topic,
+                         inst_color, instance_key, nav_hint, primary_spans,
+                         spans_from_bool, style_time_axis)
 
 LOCALZ_TOPICS = [
     "vehicle_local_position", "estimator_local_position",
@@ -54,20 +56,13 @@ LOCALZ_TOPICS = [
 ]
 
 # --- color ------------------------------------------------------------------
-# One hue per INSTANCE, held constant across all four panels and reused for the
-# background shading.  That is the whole mechanic of this plot: the shading under
-# a stretch of trace is the same colour as the line belonging to the filter that
-# produced it, so "who was flying" needs no legend lookup.
-#
-# Deliberately NOT the altitude plot's per-SOURCE palette -- these are instances,
-# not sensors, and giving instance 0 the same blue as GPS would invite reading the
-# two plots as if the colours meant the same thing.
-INST_COLORS = ["#2a78d6",   # 0  blue
-               "#d2691e",   # 1  orange
-               "#1baf7a",   # 2  aqua
-               "#8a7fb5"]   # 3  violet
+# One hue per INSTANCE (ulog_common.INST_COLORS), held constant across all four
+# panels and reused for the background shading.  That is the whole mechanic of
+# this plot: the shading under a stretch of trace is the same colour as the line
+# belonging to the filter that produced it, so "who was flying" needs no legend
+# lookup.  The palette is shared with the accelerometer plot, which shades the
+# same way.
 C_PUB = "#20222b"           # near-black -- the PUBLISHED series, everyone's reference
-C_BAD = "#c0392b"           # red -- faults and rejections only
 
 # PX4 rejects a measurement when its normalised innovation exceeds 1.0, and the
 # selector calls an instance "warning" at the same threshold (EKF2Selector.cpp:301).
@@ -78,10 +73,6 @@ WARN_RATIO = 1.0
 LABEL_RESET_M = 1.0
 
 
-def _inst_color(i):
-    return INST_COLORS[i % len(INST_COLORS)]
-
-
 def _available_instances(ulog):
     """Which estimator_local_position multi-ids this log actually carries.
 
@@ -89,43 +80,6 @@ def _available_instances(ulog):
     off the flight controller carry only the fused `vehicle_local_position`."""
     return sorted({d.multi_id for d in ulog.data_list
                    if d.name == "estimator_local_position"})
-
-
-def primary_spans(ulog):
-    """[(t0_min, t1_min, instance), ...] -- who was primary, when.
-
-    The selector publishes at ~1 Hz AND immediately on any change
-    (EKF2Selector.cpp:811), so a value holds from its own sample until the next
-    one that differs.  Treating each sample as an instantaneous point instead
-    would leave 1 s gaps in the shading that look like the vehicle had no
-    estimator at all.
-    """
-    d = _get(ulog, "estimator_selector_status")
-    if d is None or "primary_instance" not in d.data:
-        return []
-    t = _time_min(ulog, d)
-    v = np.asarray(d.data["primary_instance"], dtype=float)
-    m = np.isfinite(t) & np.isfinite(v)
-    t, v = t[m], v[m].astype(int)
-    if t.size == 0:
-        return []
-    spans, start, cur = [], t[0], v[0]
-    for i in range(1, t.size):
-        if v[i] != cur:
-            spans.append((start, t[i], int(cur)))
-            start, cur = t[i], v[i]
-    spans.append((start, t[-1], int(cur)))
-    return spans
-
-
-def draw_primary_shading(ax, spans, alpha=0.13):
-    """The coloured background.  Returns the artists so a checkbox can hide them.
-
-    zorder 0 and no edge line: this is a background, and an edge on abutting
-    spans draws a vertical rule at every handover that reads as a data event.
-    """
-    return [ax.axvspan(a, b, color=_inst_color(inst), alpha=alpha, lw=0, zorder=0)
-            for a, b, inst in spans]
 
 
 def _reset_events(ulog):
@@ -169,7 +123,7 @@ def _series_for_instances(ulog, ctx, instances):
         d = _get(ulog, "estimator_local_position", i)
         if d is None:
             continue
-        col = _inst_color(i)
+        col = inst_color(i)
         if "z" in d.data:
             t, z = _clean(_time_min(ulog, d), d.data["z"])
             series.append(Series(f"estimator_local_position[{i}].z",
@@ -202,7 +156,7 @@ def _series_for_selector(ulog, ctx, instances):
     t = _time_min(ulog, d)
     series = []
     for i in instances or range(4):
-        col = _inst_color(i)
+        col = inst_color(i)
         key = f"combined_test_ratio[{i}]"
         if key in d.data:
             tt, y = _clean(t, d.data[key])
@@ -242,8 +196,8 @@ def _draw_band(ax, ulog, ctx, instances, spans):
                 continue
             v = np.asarray(d.data[key], dtype=float) > 0.5
             if v.any():
-                rows.append((f"EKF {i} healthy", _spans_from_bool(t, v),
-                             _inst_color(i)))
+                rows.append((f"EKF {i} healthy", spans_from_bool(t, v),
+                             inst_color(i)))
         # Faults share the red row: they are all "this went wrong", and spending
         # the palette's loudest colour on telling them apart buys nothing you
         # cannot read off the label.
@@ -253,50 +207,13 @@ def _draw_band(ax, ulog, ctx, instances, spans):
                 continue
             v = np.asarray(d.data[key], dtype=float) > 0.5
             if v.any():
-                rows.append((label, _spans_from_bool(t, v), C_BAD))
+                rows.append((label, spans_from_bool(t, v), C_BAD))
     else:
         ctx.note("no estimator_selector_status -- no instance shading is "
                  "possible (single-EKF or HITL log)")
 
-    if not rows:
-        ax.text(0.5, 0.5, "no selector or armed flags in this log",
-                transform=ax.transAxes, ha="center", va="center",
-                color=C_MUTED, fontsize=9)
-        ax.set_yticks([])
-        return
-
-    for i, (label, sp, color) in enumerate(rows):
-        y = len(rows) - 1 - i
-        for a0, b0 in sp:
-            ax.barh(y, max(b0 - a0, 1e-6), left=a0, height=0.62, color=color,
-                    alpha=0.85, lw=0, zorder=3)
-        # Labels inside the axes, in axes coordinates: as y-tick labels these
-        # names extend left into the checkbox panel and get clipped, and in data
-        # coordinates they would slide away on a time zoom.
-        ax.text(0.004, y, label, transform=ax.get_yaxis_transform(which="grid"),
-                fontsize=7, color=C_MUTED, va="center", ha="left", zorder=5,
-                bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=1.0,
-                          alpha=0.75))
-    ax.set_yticks([])
-    ax.set_ylim(-0.6, len(rows) - 0.4)
-    ax.set_ylabel("armed / health", fontsize=9, color=C_MUTED)
-    for spine in ("top", "right", "left"):
-        ax.spines[spine].set_visible(False)
-
-
-def _spans_from_bool(t, ok):
-    """[(t0, t1), ...] for each contiguous true run of `ok`."""
-    ok = np.asarray(ok, dtype=bool)
-    out, start = [], None
-    for i in range(ok.size):
-        if ok[i] and start is None:
-            start = t[i]
-        elif not ok[i] and start is not None:
-            out.append((start, t[i]))
-            start = None
-    if start is not None and t.size:
-        out.append((start, t[-1]))
-    return out
+    draw_band_rows(ax, rows, ylabel="armed / health",
+                   empty_msg="no selector or armed flags in this log")
 
 
 def _rescale_log(ax, lines, pct=99.5):
@@ -444,18 +361,7 @@ def build_local_z(ulog, ctx=None, path=""):
              f"{who}{duration_min(ulog):.1f} min   |   {shade_note}",
              color=C_MUTED, fontsize=9, ha="left")
 
-    # Per-instance colour key, drawn as figure text rather than a legend box so it
-    # costs no plot area.  The checkbox panel already carries the LINE colours;
-    # this exists to name the SHADING, which has no checkbox of its own per
-    # instance.  Right-aligned on the title row: a line of its own sits on top of
-    # panel 1, where it collides with the rotated reset labels.
-    x = left + width
-    for i in (sorted({i for _, _, i in spans}, reverse=True) if spans else []):
-        fig.text(x, 0.952, f"EKF {i}", color=_inst_color(i), fontsize=8,
-                 ha="right", fontweight="bold")
-        x -= 0.040
-    if spans:
-        fig.text(x, 0.952, "shading:", color=C_MUTED, fontsize=8, ha="right")
+    instance_key(fig, left, width, spans)
 
     off_note = ax_sel.text(0.995, 0.96, "", transform=ax_sel.transAxes,
                            ha="right", va="top", fontsize=7, color=C_BAD)

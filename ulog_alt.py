@@ -28,11 +28,12 @@ QNH = the pressure setting that makes an altimeter read elevation.
 """
 import numpy as np
 
-from ulog_common import (C_ARMED, C_INK, C_MUTED, C_SURFACE, PlotCtx, Series,
-                         _clean, _get, _rescale, _style_axis, _time_min,
+from ulog_common import (C_ARMED, C_BAD, C_INK, C_MUTED, C_SURFACE, PlotCtx,
+                         Series, _clean, _get, _rescale, _style_axis, _time_min,
                          add_mouse_navigation, armed_spans, check_panel,
-                         draw_armed, duration_min, field, gap_mask, has_topic,
-                         nav_hint, primary_ekf, resample_to, style_time_axis)
+                         draw_armed, draw_band_rows, duration_min, field,
+                         gap_mask, has_topic, nav_hint, primary_ekf,
+                         resample_to, spans_from_bool, style_time_axis)
 
 ALT_TOPICS = [
     "vehicle_global_position", "vehicle_local_position", "vehicle_gps_position",
@@ -54,7 +55,6 @@ C_BARO = "#d2691e"    # orange
 C_RNG = "#1baf7a"     # aqua
 C_HOME = "#8a7fb5"    # muted violet
 C_BIAS = "#b0348c"    # magenta -- PX4's OWN estimate of an offset, not a measurement
-C_BAD = "#c0392b"     # red     -- faults and rejections only
 
 # Where GPS altitude lives, and what it is in, depends on the firmware.  The lab's
 # older build logs vehicle_gps_position.alt as int32 MILLIMETRES; PX4 v1.18 (on the
@@ -514,21 +514,6 @@ def build_altitude(ulog, ctx=None, path=""):
 
 # --- panel 4 ----------------------------------------------------------------
 
-def _spans_from_bool(t, ok):
-    """[(t0, t1), ...] for each contiguous true run of `ok`."""
-    ok = np.asarray(ok, dtype=bool)
-    out, start = [], None
-    for i in range(ok.size):
-        if ok[i] and start is None:
-            start = t[i]
-        elif not ok[i] and start is not None:
-            out.append((start, t[i]))
-            start = None
-    if start is not None and t.size:
-        out.append((start, t[-1]))
-    return out
-
-
 def _draw_band(ax, ulog, ekf, ctx):
     """Which height source the EKF was fusing, and when each input was usable.
 
@@ -550,7 +535,7 @@ def _draw_band(ax, ulog, ekf, ctx):
                 continue
             v = np.asarray(fl.data[fname], dtype=float) > 0.5
             if v.any():
-                rows.append((label, _spans_from_bool(t, v), color))
+                rows.append((label, spans_from_bool(t, v), color))
         # Faults and rejections share the one red row set: they are all "this
         # went wrong", and separating them by hue would spend the palette's most
         # attention-grabbing color on distinctions you read from the label.
@@ -562,7 +547,7 @@ def _draw_band(ax, ulog, ekf, ctx):
                 continue
             v = np.asarray(fl.data[fname], dtype=float) > 0.5
             if v.any():
-                rows.append((label, _spans_from_bool(t, v), C_BAD))
+                rows.append((label, spans_from_bool(t, v), C_BAD))
     else:
         ctx.note("no estimator_status_flags -- cannot show which height source "
                  "was being fused")
@@ -574,40 +559,17 @@ def _draw_band(ax, ulog, ekf, ctx):
     if d is not None and "dist_bottom_valid" in d.data:
         t = _time_min(ulog, d)
         v = np.asarray(d.data["dist_bottom_valid"], dtype=float) > 0.5
-        rows.append(("dist_bottom valid", _spans_from_bool(t, v), C_RNG))
+        rows.append(("dist_bottom valid", spans_from_bool(t, v), C_RNG))
     ds = _get(ulog, "distance_sensor")
     if ds is not None and "signal_quality" in ds.data:
         t = _time_min(ulog, ds)
         v = np.asarray(ds.data["signal_quality"], dtype=float) > 0
-        rows.append(("rng signal quality > 0", _spans_from_bool(t, v), C_RNG))
+        rows.append(("rng signal quality > 0", spans_from_bool(t, v), C_RNG))
     g = _get(ulog, "vehicle_gps_position") or _get(ulog, "sensor_gps")
     if g is not None and "fix_type" in g.data:
         t = _time_min(ulog, g)
         v = np.asarray(g.data["fix_type"], dtype=float) >= MIN_FIX
-        rows.append((f"GPS fix >= {MIN_FIX}", _spans_from_bool(t, v), C_GPS))
+        rows.append((f"GPS fix >= {MIN_FIX}", spans_from_bool(t, v), C_GPS))
 
-    if not rows:
-        ax.text(0.5, 0.5, "no fusion-source or validity flags in this log",
-                transform=ax.transAxes, ha="center", va="center",
-                color=C_MUTED, fontsize=9)
-        ax.set_yticks([])
-        return
-
-    for i, (label, spans, color) in enumerate(rows):
-        y = len(rows) - 1 - i
-        for a, b in spans:
-            ax.barh(y, max(b - a, 1e-6), left=a, height=0.62, color=color,
-                    alpha=0.85, lw=0, zorder=3)
-        # Labels go INSIDE the axes, not on the y ticks: these names run to ~22
-        # characters and as tick labels they extend left into the checkbox panel
-        # and get clipped by the figure edge.  Anchored in axes coordinates they
-        # also survive a time-axis zoom, which data coordinates would not.
-        ax.text(0.004, y, label, transform=ax.get_yaxis_transform(which="grid"),
-                fontsize=7, color=C_MUTED, va="center", ha="left", zorder=5,
-                bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=1.0,
-                          alpha=0.75))
-    ax.set_yticks([])
-    ax.set_ylim(-0.6, len(rows) - 0.4)
-    ax.set_ylabel("source / validity", fontsize=9, color=C_MUTED)
-    for spine in ("top", "right", "left"):
-        ax.spines[spine].set_visible(False)
+    draw_band_rows(ax, rows, ylabel="source / validity",
+                   empty_msg="no fusion-source or validity flags in this log")

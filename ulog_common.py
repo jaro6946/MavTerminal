@@ -55,6 +55,7 @@ C_INK = "#0b0b0b"
 C_MUTED = "#6f6e6a"
 C_SURFACE = "#fcfcfb"
 C_GRID = "#e4e3df"
+C_BAD = "#c0392b"    # red -- faults and rejections only, never a normal signal
 
 # Line style per sensor family (the secondary encoding for the thermal plot's
 # warm ramp -- ~11 orange tones are not separable by hue alone).
@@ -309,6 +310,161 @@ def draw_armed(ax, spans):
             for a, b in spans]
 
 
+# --- EKF instances: one shared vocabulary -----------------------------------
+# PX4 runs one EKF per IMU (EKF2_MULTI_IMU) and an EKF2Selector arbitrates which
+# one publishes.  Several plots need to say "this stretch belonged to instance
+# 2", and they must agree on the hue or the reader learns the mapping twice.
+#
+# Deliberately NOT any plot's per-SOURCE palette -- these are instances, not
+# sensors, and giving instance 0 the same blue as GPS would invite reading two
+# plots as if the colors meant the same thing.
+INST_COLORS = ["#2a78d6",   # 0  blue
+               "#d2691e",   # 1  orange
+               "#1baf7a",   # 2  aqua
+               "#8a7fb5"]   # 3  violet
+
+
+def inst_color(i):
+    return INST_COLORS[int(i) % len(INST_COLORS)]
+
+
+def primary_spans(ulog):
+    """[(t0_min, t1_min, instance), ...] -- which EKF instance was primary, when.
+
+    The selector publishes at ~1 Hz AND immediately on any change
+    (EKF2Selector.cpp:811), so a value holds from its own sample until the next
+    one that differs.  Treating each sample as an instantaneous point instead
+    would leave 1 s gaps in the shading that look like the vehicle had no
+    estimator at all.
+    """
+    d = _get(ulog, "estimator_selector_status")
+    if d is None or "primary_instance" not in d.data:
+        return []
+    t = _time_min(ulog, d)
+    v = np.asarray(d.data["primary_instance"], dtype=float)
+    m = np.isfinite(t) & np.isfinite(v)
+    t, v = t[m], v[m].astype(int)
+    if t.size == 0:
+        return []
+    spans, start, cur = [], t[0], v[0]
+    for i in range(1, t.size):
+        if v[i] != cur:
+            spans.append((start, t[i], int(cur)))
+            start, cur = t[i], v[i]
+    spans.append((start, t[-1], int(cur)))
+    return spans
+
+
+def draw_primary_shading(ax, spans, alpha=0.13):
+    """The coloured background.  Returns the artists so a checkbox can hide them.
+
+    zorder 0 and no edge line: this is a background, and an edge on abutting
+    spans draws a vertical rule at every handover that reads as a data event.
+    """
+    return [ax.axvspan(a, b, color=inst_color(inst), alpha=alpha, lw=0, zorder=0)
+            for a, b, inst in spans]
+
+
+def instance_key(fig, left, width, spans, y=0.952, pitch=0.040):
+    """Name the SHADING colours, right-aligned on the title row.
+
+    Figure text rather than a legend box so it costs no plot area.  The checkbox
+    panel already carries the LINE colours; this exists for the shading, which
+    has no checkbox of its own per instance.  A line of its own would sit on top
+    of the first panel, where it collides with rotated event labels.
+    """
+    if not spans:
+        return
+    x = left + width
+    for i in sorted({i for _, _, i in spans}, reverse=True):
+        fig.text(x, y, f"EKF {i}", color=inst_color(i), fontsize=8,
+                 ha="right", fontweight="bold")
+        x -= pitch
+    fig.text(x, y, "shading:", color=C_MUTED, fontsize=8, ha="right")
+
+
+# --- boolean bands ----------------------------------------------------------
+
+def spans_from_bool(t, ok):
+    """[(t0, t1), ...] for each contiguous true run of `ok`."""
+    ok = np.asarray(ok, dtype=bool)
+    out, start = [], None
+    for i in range(ok.size):
+        if ok[i] and start is None:
+            start = t[i]
+        elif not ok[i] and start is not None:
+            out.append((start, t[i]))
+            start = None
+    if start is not None and t.size:
+        out.append((start, t[-1]))
+    return out
+
+
+def draw_band_rows(ax, rows, ylabel="", empty_msg="nothing to show", min_width=0.0):
+    """Render [(label, spans, color)] as stacked filled bars, top row first.
+
+    Filled bars rather than lines because every row is boolean -- a line between
+    0 and 1 implies intermediate values that do not exist.
+
+    `min_width` widens any bar narrower than it, in the axis's own x units.  A
+    fault that lasts one 30 Hz sample is a real event and a 0.0005-minute bar is
+    an invisible one; without a floor the panel would say "clean" about a log
+    that was not.  Applied per bar, so it never merges two separate events.
+    """
+    if not rows:
+        ax.text(0.5, 0.5, empty_msg, transform=ax.transAxes, ha="center",
+                va="center", color=C_MUTED, fontsize=9)
+        ax.set_yticks([])
+        return
+    # The x extent the labels have to share with the bars.  Taken from the rows
+    # themselves rather than from the axis, because draw_band_rows runs before
+    # the shared x limits are settled.
+    t_lo = min(a for _l, sp, _c in rows for a, _b in sp) if any(sp for _l, sp, _c in rows) else 0.0
+    t_hi = max(b for _l, sp, _c in rows for _a, b in sp) if any(sp for _l, sp, _c in rows) else 1.0
+    span_x = max(t_hi - t_lo, 1e-9)
+
+    for i, (label, spans, color) in enumerate(rows):
+        y = len(rows) - 1 - i
+        for a, b in spans:
+            ax.barh(y, max(b - a, min_width, 1e-6), left=a, height=0.62,
+                    color=color, alpha=0.85, lw=0, zorder=3)
+        # Labels go INSIDE the axes, not on the y ticks: these names run to ~22
+        # characters and as tick labels they extend left into the checkbox panel
+        # and get clipped by the figure edge.  Anchored in axes coordinates they
+        # also survive a time-axis zoom, which data coordinates would not.
+        #
+        # A label sits on the left unless that would bury the row's data: a SPARSE
+        # row (a fault that fired briefly) whose first event is near the start of
+        # the log would otherwise have its only bar hidden under the label's
+        # background box.  Continuous rows -- "armed", "fusing GPS" -- are
+        # deliberately excluded by the coverage test, so they keep the left
+        # alignment the other plots already read as normal.
+        covered = sum(b - a for a, b in spans) / span_x
+        # A dense row (armed, "fusing GPS") has no free side, so leave it on the
+        # left where every other plot already puts it.  A sparse row gets the
+        # emptier third: its handful of bars are the only thing on the row, and
+        # the label's background box would hide them.
+        if covered < 0.2:
+            def _in(lo, hi):
+                return sum(max(0.0, min(b, hi) - max(a, lo)) for a, b in spans)
+            third = span_x / 3.0
+            right = _in(t_hi - third, t_hi) < _in(t_lo, t_lo + third)
+        else:
+            right = False
+        ax.text(0.996 if right else 0.004, y, label,
+                transform=ax.get_yaxis_transform(which="grid"),
+                fontsize=7, color=C_MUTED, va="center",
+                ha="right" if right else "left", zorder=5,
+                bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=1.0,
+                          alpha=0.75))
+    ax.set_yticks([])
+    ax.set_ylim(-0.6, len(rows) - 0.4)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=9, color=C_MUTED)
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+
+
 # Blank rows inserted between one graph's series and the next in the checkbox
 # panel.  In row units, so it scales with whatever height the caller gave the
 # panel.
@@ -350,12 +506,49 @@ def _respace_checkbuttons(cb, breaks, gap=GROUP_GAP_ROWS):
 
     for text, y in zip(cb.labels, ys):
         text.set_position((text.get_position()[0], y))
-    try:
+
+    # The glyphs have to follow the labels, and the two matplotlib generations in
+    # play store them differently.  3.7+ keeps two scatter collections
+    # (`_frames`, `_checks`); 3.6 keeps a Rectangle plus a pair of Line2D per row
+    # (`rectangles`, `lines`).  Moving only the labels -- which is what this
+    # function did before the accel plot exposed it -- leaves 3.6's boxes at
+    # matplotlib's original uniform positions, so on a grouped panel the box and
+    # its label drift apart and `_clicked` matches the wrong row for box clicks.
+    bb = cb.ax.get_window_extent()
+    pitch_px = bb.height / total
+    if hasattr(cb, "_frames"):                      # matplotlib >= 3.7
         offsets = np.column_stack([np.full(n, 0.15), ys])
         cb._frames.set_offsets(offsets)
         cb._checks.set_offsets(offsets)
-    except AttributeError:          # matplotlib moved the private collections
-        pass
+        # Sized from the font alone by matplotlib, so a dense panel (the accel
+        # plot lists ~55 entries) overlaps its own boxes into one continuous bar.
+        # Only ever shrinks: a sparse panel keeps matplotlib's proportions.
+        for coll in (cb._frames, cb._checks):
+            sizes = coll.get_sizes()
+            want = (0.62 * pitch_px * 72.0 / cb.ax.figure.dpi) ** 2
+            if len(sizes) and want < float(np.max(sizes)):
+                coll.set_sizes([want])
+    elif hasattr(cb, "rectangles"):                 # matplotlib 3.6
+        # 3.6 builds the box as a square in AXES coordinates, which is only
+        # square on a square panel.  This one is ~2.3 x 11 inches, so the
+        # "checkbox" renders 2 px wide and 11 px tall -- a dash, not a box.
+        # Sizing in pixels and converting back fixes both that and the density.
+        # Computed once, at the figure's build size: the browser re-lays the
+        # canvas out at a different aspect, so the box drifts back off square by
+        # whatever that ratio is.  Approximately square beats a 2 px dash.
+        side = min(9.0, 0.66 * pitch_px)
+        w, h = side / bb.width, side / bb.height
+        for rect, (l1, l2), y in zip(cb.rectangles, cb.lines, ys):
+            x, y0 = 0.05, y - h / 2
+            rect.set_bounds(x, y0, w, h)
+            l1.set_data([x, x + w], [y0 + h, y0])
+            l2.set_data([x, x + w], [y0, y0 + h])
+
+    # Shrink the labels too once the rows get tighter than the type they carry.
+    pitch_pt = pitch_px * 72.0 / cb.ax.figure.dpi
+    if pitch_pt < 11.0:
+        for text in cb.labels:
+            text.set_fontsize(max(5.5, min(text.get_fontsize(), 0.72 * pitch_pt)))
 
 
 def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="series"):

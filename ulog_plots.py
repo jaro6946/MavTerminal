@@ -16,6 +16,7 @@ is the thing that would actually get slow as the registry grows.
 from dataclasses import dataclass
 from typing import Callable, List
 
+import ulog_accel
 import ulog_alt
 import ulog_graph
 import ulog_localz
@@ -64,6 +65,16 @@ PLOTS = [
         blurb="local position z and each instance's own z and ref_alt, shaded by "
               "which EKF instance the selector had primary",
         height=780,
+    ),
+    PlotSpec(
+        key="accel",
+        title="Accelerometer / calibration",
+        topics=ulog_accel.ACCEL_TOPICS,
+        build=ulog_accel.build_accel,
+        blurb="per-IMU accelerometer, the EKF's bias estimate against the exact "
+              "preflight arming threshold, the thermal-compensation offset, and "
+              "every accel fault flag -- shaded by primary EKF instance",
+        height=980,
     ),
 ]
 
