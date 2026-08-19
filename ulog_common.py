@@ -309,6 +309,55 @@ def draw_armed(ax, spans):
             for a, b in spans]
 
 
+# Blank rows inserted between one graph's series and the next in the checkbox
+# panel.  In row units, so it scales with whatever height the caller gave the
+# panel.
+GROUP_GAP_ROWS = 0.8
+
+
+def _respace_checkbuttons(cb, breaks, gap=GROUP_GAP_ROWS):
+    """Re-lay-out a CheckButtons so each graph's series sit in their own block.
+
+    matplotlib spaces rows uniformly (widgets.py: ``ys = linspace(1, 0, n+2)``),
+    so a panel listing four groups reads as one undifferentiated column of twenty
+    labels and you have to parse the text to find where one graph's series end
+    and the next begin.
+
+    There is no public API for row positions, so this moves the label Text
+    artists and BOTH scatter collections -- ``_frames`` (the boxes) and
+    ``_checks`` (the marks).  Hit-testing follows for free: ``_clicked`` resolves
+    a click against ``_frames.get_offsets()`` and the label extents, which are
+    exactly the two things moved here.
+
+    With ``gap=0`` the formula below reduces to matplotlib's own, so the only
+    thing that ever changes appearance is the deliberate spacing.
+
+    `breaks` is the set of entry indices that START a group.  Private-attribute
+    access is guarded: a matplotlib that renames them costs the spacing, not the
+    panel.
+    """
+    n = len(cb.labels)
+    if n == 0 or not breaks:
+        return
+    cum, centers = 0.5, []          # 0.5 = half-row margin above the first row
+    for i in range(n):
+        if i in breaks and i > 0:
+            cum += gap
+        centers.append(cum + 0.5)
+        cum += 1.0
+    total = cum + 0.5               # matching half-row margin below the last row
+    ys = [1.0 - c / total for c in centers]
+
+    for text, y in zip(cb.labels, ys):
+        text.set_position((text.get_position()[0], y))
+    try:
+        offsets = np.column_stack([np.full(n, 0.15), ys])
+        cb._frames.set_offsets(offsets)
+        cb._checks.set_offsets(offsets)
+    except AttributeError:          # matplotlib moved the private collections
+        pass
+
+
 def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="series"):
     """The checkbox panel that doubles as the legend.
 
@@ -323,10 +372,12 @@ def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="seri
     from matplotlib.widgets import CheckButtons
 
     entries = []          # (label, series_or_None, group_or_key)
+    breaks = set()        # entry indices that begin a new block, for the spacing
     for gname, master in groups:
         members = [s for s in series if s.group == gname]
         if not members:
             continue
+        breaks.add(len(entries))
         indent = master and len(members) > 1
         if indent:
             entries.append((master, None, gname))
@@ -334,6 +385,11 @@ def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="seri
             entries.append(("   " + s.label if indent else s.label, s, None))
     extra_art = {}
     for label, artists, state in extra:
+        # The extras (armed shading, reset markers) are one block of their own:
+        # they belong to no single graph, so separating them from the last
+        # group's series stops them reading as more of its members.
+        if not extra_art:
+            breaks.add(len(entries))
         key = f"__extra_{len(extra_art)}__"
         extra_art[key] = (artists, state)
         entries.append((label, None, key))
@@ -391,6 +447,7 @@ def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="seri
         fig.canvas.draw_idle()
 
     cb.on_clicked(on_click)
+    _respace_checkbuttons(cb, breaks)
     # A matplotlib widget whose only reference is a local gets garbage-collected
     # and silently stops responding -- keep it alive on the figure.
     fig._checkbuttons = cb
