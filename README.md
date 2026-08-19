@@ -264,6 +264,103 @@ re-emit reliably, so a gate that keys off STATUSTEXT can miss a terminated board
 
 ---
 
+## Plotting logs: `logGraph`
+
+`logGraph` opens a **log browser**: a library of the `.ulg` files on this machine on
+the left, and on the right every plot for the selected log, stacked in one
+scrolling page with their **time axes linked** (zoom one, they all move).
+
+```bash
+mavTerminal -c "logGraph"                    # browse: pick a log in the GUI
+mavTerminal -c "logGraph path/to/log.ulg"    # browse, with that log preloaded
+```
+
+These are **offline** commands — `_is_offline_cmd` skips the whole FC-connect path,
+so no flight controller needs to be plugged in.
+
+### The plots
+
+| Plot | What it answers |
+|---|---|
+| **Thermal / GPS** | Every temperature channel the log carries, satellite count and `fix_type`, and dT/dt for one channel. Armed stretches shaded. |
+| **Altitude estimation** | Why the vehicle thinks it is at that height: an AMSL overlay of GPS / barometer / rangefinder against the EKF's fused altitude, the **residual** of each source vs fused, the EKF's **innovations and test ratios**, and a band showing **which source it was actually fusing** and when each input was valid. |
+
+The altitude plot's residual panel is the one that does the work. The sources do not
+share a datum — on a real flight the barometer sits ~84 m below fused and GPS ~10 m
+below — so on one AMSL axis a 2 m drift is a line width. Subtracting the fused
+altitude removes the flight profile and lets the axis be metres. The constant offset
+is removed and **reported in the legend**, since "baro reads 84 m low" is itself a
+finding.
+
+Some things are deliberately **off by default**: rangefinder-on-AMSL (it assumes flat
+ground at `ref_alt`, which can be tens of metres from the real ground) and the
+rangefinder innovation (it reaches 130 m while baro/GPS sit under a metre). Tick them
+in the panel when you want them.
+
+### Navigation
+
+| Gesture | Effect |
+|---|---|
+| wheel | scroll the page |
+| ctrl+wheel | zoom the time axis (all plots follow) |
+| ctrl+shift+wheel | zoom the value axes |
+| drag | pan |
+| double-click | reset to the whole flight |
+
+In `--classic` mode there is no page to scroll, so the bare wheel zooms time as it
+always did.
+
+### Renaming logs
+
+All 36 HITL logs are called `FC_log.ulg` and are told apart only by their run folder,
+so the browser can rename them: **F2**, right-click, or the Rename button. It renames
+the real file on disk in its own folder, drags any `<stem>_diag.txt` sidecar along,
+**refuses to overwrite** an existing name (plain `os.rename` would silently delete it)
+and refuses a name containing a path separator.
+
+### PDF reports
+
+Tick one or more logs and press **Export PDF**, or go straight from the shell:
+
+```bash
+mavTerminal -c "logGraph --pdf report.pdf a.ulg b.ulg"
+```
+
+You get one PDF: a contents page with page numbers, then per log a **text summary**
+page (duration, armed spans, peak temperature, which height source was fused and for
+how much of the flight, the `EKF2_*` settings, and the full `ulog_diag` output
+including the real failsafe cause) followed by each plot on its own page.
+
+### Other modes
+
+```bash
+logGraph <log.ulg> --list                # just list the channels, no window
+logGraph <log.ulg> --classic             # thermal plot only, one window
+logGraph <log.ulg> --save out.png        # headless PNG of the thermal plot
+logGraph <log.ulg> --smooth 60 --abs     # tune the dT/dt series
+logGraph <log.ulg> --add battery_status.voltage_v   # plot any extra channel
+```
+
+`--pdf` and `--save` run under the Agg backend, so they work over SSH with no
+display — and `--pdf` doubles as the regression test for the whole plot stack.
+
+### Adding a plot
+
+`ulog_plots.py` is the registry. A new plot is one `PlotSpec` entry plus a module
+exposing `build(ulog, ctx, path) -> Figure | None`; the browser, the PDF exporter and
+the topic filter list all derive from it.
+
+| File | Role |
+|---|---|
+| `ulog_common.py` | Shared vocabulary: `Series`, pyulog access helpers, `sliding_slope`, armed spans, the checkbox panel, mouse navigation |
+| `ulog_plots.py` | The registry |
+| `ulog_graph.py` | The thermal plot, and the CLI front door |
+| `ulog_alt.py` | The altitude estimation plot |
+| `ulog_report.py` | PDF export |
+| `log_browser.py` | The PyQt5 browser window |
+
+---
+
 ## Thermal-calibration helpers
 
 Standalone scripts (run with the same venv python) for the PX4 thermal-cal workflow:
@@ -284,5 +381,8 @@ Standalone scripts (run with the same venv python) for the PX4 thermal-cal workf
 - Python 3 with `pymavlink` and `pyserial` (both present in the
   `agc_CTOL_SE3-rotopy` venv the alias points at). `ulog_diag.py` also needs
   `pyulog` (`pip install pyulog` — already in that venv).
+- `logGraph` additionally needs `matplotlib` and `numpy` for the plots, and
+  `PyQt5` for the browser window (all already in that venv). The headless
+  `--pdf` / `--save` / `--list` paths do not need PyQt5 or a display.
 - The FC attached to this host. Under WSL, pass it through with
   `usbipd attach --wsl --busid <id>` on the Windows side first.

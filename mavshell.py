@@ -248,9 +248,15 @@ def cmd_help():
   log list [session]      list onboard .ulg flight logs (newest marked)
   log pull [sess] [name]  download newest (or named) .ulg and diagnose it
   log diag <file.ulg>     diagnose an already-downloaded log
-  log graph <file.ulg>    plot it: temps, sat count, dT/dt (toggleable series;
-                          wheel=zoom time, ctrl+wheel=zoom values, drag=pan)
-                          also as: logGraph <file.ulg>   [--list to just list]
+  log graph [file.ulg]    open the log browser: pick a log, scroll its plots
+                          (thermal/GPS + altitude estimation), rename logs,
+                          export a PDF.  Also as: logGraph [file.ulg]
+                            --list            just list the channels
+                            --classic         one window, thermal plot only
+                            --save out.png    headless PNG of the thermal plot
+                            --pdf out.pdf     headless report (several logs ok)
+                          in a plot: wheel=scroll, ctrl+wheel=zoom time,
+                          ctrl+shift+wheel=zoom values, drag=pan, dbl-click=reset
   log delete [yes]        DELETE all logs off the card (dry-run without 'yes')
   nsh <command>           run one NuttShell command on the FC and print output
   nsh                     open an interactive raw NSH shell (TTY only)
@@ -427,22 +433,43 @@ def cmd_log(args):
     if sub == "graph":
         # Purely offline, like `diag` — handled BEFORE the MAVFTP block below,
         # which is the only part of `log` that needs the serial port.
-        if len(args) < 2:
-            print("Usage: log graph <file.ulg> [--list] [--save out.png] "
-                  "[--smooth SEC] [--abs] [--rate-src TOPIC[i].FIELD] "
-                  "[--add TOPIC[i].FIELD]")
-            return
         try:
             import ulog_graph
         except ImportError as e:
             print(f"  grapher needs pyulog + matplotlib: {e}")
             return
-        path, opts = args[1], args[2:]
-        if not os.path.isfile(path):
-            print(f"  no such file: {path}")
+
+        rest = args[1:]
+        # A bare `log graph` is no longer an error: it opens the browser, which
+        # has its own log picker.  Everything that is not a flag is a log path,
+        # so several can be given (a multi-log --pdf report is the point).
+        flags = {"--list", "--abs", "--no-show", "--classic"}
+        takes_value = {"--smooth", "--rate-src", "--add", "--save", "--pdf"}
+        paths, opts, skip = [], [], False
+        for i, a in enumerate(rest):
+            if skip:
+                skip = False
+                continue
+            if a in takes_value:
+                opts.append(a)
+                if i + 1 < len(rest):
+                    opts.append(rest[i + 1])
+                    skip = True
+            elif a in flags or a.startswith("--"):
+                opts.append(a)
+            else:
+                paths.append(a)
+
+        missing = [p for p in paths if not os.path.isfile(p)]
+        if missing:
+            for p in missing:
+                print(f"  no such file: {p}")
             return
         if "--list" in opts:
-            ulog_graph.list_channels(path)
+            if not paths:
+                print("  --list needs a log file")
+                return
+            ulog_graph.list_channels(paths[0])
             return
 
         def _opt(name, cast=str, default=None):
@@ -450,16 +477,24 @@ def cmd_log(args):
 
         try:
             ulog_graph.graph(
-                path,
+                paths[0] if paths else None,
                 smooth=_opt("--smooth", float, 31.0),
                 use_abs="--abs" in opts,
                 rate_src=_opt("--rate-src"),
                 adds=[opts[i + 1] for i, o in enumerate(opts) if o == "--add"],
                 save=_opt("--save"),
                 show="--no-show" not in opts,
+                classic="--classic" in opts,
+                pdf=_opt("--pdf"),
+                extra_paths=paths[1:],
             )
         except (IndexError, ValueError) as e:
             print(f"  bad options: {e}")
+        except SystemExit as e:
+            # ulog_graph.graph uses sys.exit for user errors ("no display").  In
+            # the REPL that would kill the whole shell mid-session.
+            if e.code:
+                print(f"  {e.code}")
         return
 
     # list / pull both drive MAVFTP, which must be the only reader of the port.
