@@ -195,6 +195,116 @@ class PlotPage(QtWidgets.QScrollArea):
             self._syncing = False
 
 
+# --- when did this flight happen --------------------------------------------
+# The file's mtime answers "when was this file last written", which for a log
+# pulled off an SD card is the DOWNLOAD time, not the flight.  Measured on
+# SquareWaypointMission_1.ulg: mtime 2026-08-19 13:00, actual flight
+# 2026-08-17 14:30 -- two days out.  Three sources, best first.
+
+GPS_TOPICS = ["vehicle_gps_position", "sensor_gps"]
+
+# A wall-clock stamp inside a file or folder name.  Covers both conventions in
+# this project's libraries: QGC downloads (`log_24_2026-7-24-13-48-16.ulg`) and
+# rotorpy run folders (`HITL_PX4_waypoint_mission_1_2026-07-20_12-32-28/`).
+# Both write LOCAL time, so it is read back as local.
+_NAME_STAMP = re.compile(
+    r"(20\d{2})[-_](\d{1,2})[-_](\d{1,2})[-_ T]+(\d{1,2})[-_:](\d{2})(?:[-_:](\d{2}))?")
+
+
+def _stamp_from_name(path):
+    """Epoch seconds from the file name, or failing that its folder's name.
+
+    The folder matters as much as the file: every HITL run writes a `FC_log.ulg`
+    and the run folder is the only thing that dates it."""
+    for part in (os.path.basename(path), os.path.basename(os.path.dirname(path))):
+        m = _NAME_STAMP.search(part)
+        if not m:
+            continue
+        y, mo, d, h, mi = (int(m.group(i)) for i in range(1, 6))
+        sec = int(m.group(6) or 0)
+        try:
+            return time.mktime((y, mo, d, h, mi, sec, 0, 0, -1))
+        except (ValueError, OverflowError):
+            continue
+    return None
+
+
+def _start_from_parsed(ulog):
+    """Epoch seconds of the log's FIRST sample, from GNSS UTC.  None if no fix.
+
+    `time_utc_usec` is absolute (microseconds since the Unix epoch) while
+    `timestamp` is microseconds since boot, so one sample carrying both pins the
+    whole log to wall clock:
+
+        start_epoch = utc[i] - (timestamp[i] - ulog.start_timestamp)
+
+    Samples before the first fix carry 0, hence the 1e15 floor (~year 2001) --
+    without it the answer is 1970 and looks like a bug in this function rather
+    than an absent fix.
+    """
+    import numpy as np
+    for d in ulog.data_list:
+        if "time_utc_usec" not in d.data:
+            continue
+        utc = np.asarray(d.data["time_utc_usec"], dtype=np.float64)
+        ts = np.asarray(d.data["timestamp"], dtype=np.float64)
+        ok = utc > 1e15
+        if not ok.any():
+            continue
+        i = int(np.argmax(ok))
+        return float(utc[i] - (ts[i] - ulog.start_timestamp)) / 1e6
+    return None
+
+
+def log_start_from_gps(path):
+    """_start_from_parsed, for a file we have not already read."""
+    return _start_from_parsed(ULog(path, message_name_filter_list=GPS_TOPICS))
+
+
+class DateScanner(QtCore.QObject):
+    """Fills in GNSS-derived log dates in the background, one log at a time.
+
+    A GPS-only parse is 0.7-1.8 s on this project's logs, because pyulog walks
+    the whole file whatever you filter -- so 40 logs is around a minute.  Doing
+    that at startup would mean an empty window for a minute to populate one
+    column, so rows open with the name/mtime fallback and are corrected here as
+    the answers arrive.
+
+    Yields to the foreground parse: the user waiting on a plot they asked for
+    outranks a column filling itself in.
+    """
+    found = QtCore.pyqtSignal(str, float, str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, paths, busy):
+        super().__init__()
+        self.paths = list(paths)
+        self._busy = busy           # callable -> True while a plot parse runs
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        for path in self.paths:
+            while self._busy() and not self._stop:
+                time.sleep(0.2)
+            if self._stop:
+                break
+            try:
+                started = log_start_from_gps(path)
+            except Exception:
+                started = None      # unreadable or truncated: leave the fallback
+            if started:
+                self.found.emit(path, started, "gps")
+            elif not self._stop:
+                # Record the miss too, so the next session does not re-parse a
+                # log that simply has no GNSS in it (every HITL log).
+                self.found.emit(path, 0.0, "none")
+        self.finished.emit()
+
+
 # --- background parse -------------------------------------------------------
 
 class ParseWorker(QtCore.QObject):
@@ -237,6 +347,8 @@ class Browser(QtWidgets.QMainWindow):
         self._worker = None
         self._current = None
         self._proc = None
+        self._scan_thread = None
+        self._scanner = None
 
         self.setWindowTitle("logGraph - ULog browser")
         self.resize(1600, 950)
@@ -265,14 +377,14 @@ class Browser(QtWidgets.QMainWindow):
         lv.addLayout(row)
 
         self.tree = QtWidgets.QTreeWidget()
-        self.tree.setHeaderLabels(["log", "duration", "size", "modified"])
+        self.tree.setHeaderLabels(["log", "duration", "size", "date", "time"])
         # The name column absorbs the slack and the rest size to their contents;
         # fixed widths truncated the "duration"/"size" headers at the default
         # pane width, and a horizontal scrollbar to read a 6-character column is
         # not a trade worth making.
         header = self.tree.header()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for col in (1, 2, 3):
+        for col in (1, 2, 3, 4):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
         self.tree.setTextElideMode(QtCore.Qt.ElideMiddle)
         self.tree.setAlternatingRowColors(True)
@@ -356,16 +468,49 @@ class Browser(QtWidgets.QMainWindow):
         Duration is not cheap -- pyulog walks the whole file to find the last
         timestamp -- and doing that for 40+ logs at startup would mean a minute
         of staring at an empty window."""
-        rec = self.state["durations"].get(os.path.abspath(path))
-        if rec and rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime):
-            return rec.get("minutes")
-        return None
+        rec = self._cached_record(path, st)
+        return rec.get("minutes") if rec else None
 
     def _remember_duration(self, path, minutes):
+        self._update_record(path, minutes=minutes)
+
+    def _update_record(self, path, **fields):
+        """Merge fields into this file's cache record, re-stamping size/mtime.
+
+        Merge rather than replace: the duration and the log date are learned at
+        different times by different code paths, and a plain assignment from
+        either one silently drops what the other found."""
         st = os.stat(path)
-        self.state["durations"][os.path.abspath(path)] = {
-            "size": st.st_size, "mtime": int(st.st_mtime), "minutes": minutes}
+        key = os.path.abspath(path)
+        rec = dict(self.state["durations"].get(key) or {})
+        if rec.get("size") != st.st_size or rec.get("mtime") != int(st.st_mtime):
+            rec = {}                # a replaced file: everything cached is stale
+        rec.update(fields)
+        rec["size"], rec["mtime"] = st.st_size, int(st.st_mtime)
+        self.state["durations"][key] = rec
         _save_state(self.state)
+
+    def _cached_record(self, path, st):
+        rec = self.state["durations"].get(os.path.abspath(path))
+        if rec and rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime):
+            return rec
+        return None
+
+    def _log_date(self, path, st):
+        """(epoch seconds, source) for the row's date/time columns.
+
+        `started` is cached as 0.0 to mean "parsed, and this log has no GNSS
+        time" -- distinct from a missing key, which means "not looked at yet".
+        Without that distinction every HITL log is re-parsed on every startup.
+        """
+        rec = self._cached_record(path, st) or {}
+        started = rec.get("started")
+        if started:
+            return started, rec.get("date_src", "gps")
+        stamp = _stamp_from_name(path)
+        if stamp:
+            return stamp, "name"
+        return st.st_mtime, "mtime"
 
     def _populate(self, extra=()):
         checked = self._checked_paths()
@@ -406,6 +551,52 @@ class Browser(QtWidgets.QMainWindow):
 
         if current:
             self._select_path(current)
+        self._start_date_scan()
+
+    # -- log dates, filled in behind the library
+    def _start_date_scan(self):
+        """(Re)start the background GNSS-date scan over rows still guessing."""
+        self._stop_date_scan()
+        todo = []
+        for it in self._iter_items():
+            path = it.data(0, QtCore.Qt.UserRole)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            rec = self._cached_record(path, st) or {}
+            if "started" not in rec:        # 0.0 counts as answered: no GNSS
+                todo.append(path)
+        if not todo:
+            return
+        self._scan_thread = QtCore.QThread(self)
+        self._scanner = DateScanner(todo, lambda: self._thread is not None)
+        self._scanner.moveToThread(self._scan_thread)
+        self._scan_thread.started.connect(self._scanner.run)
+        self._scanner.found.connect(self._on_log_date)
+        self._scanner.finished.connect(self._stop_date_scan)
+        self._scan_thread.start()
+
+    def _stop_date_scan(self):
+        if self._scanner is not None:
+            self._scanner.stop()
+        if self._scan_thread is not None:
+            self._scan_thread.quit()
+            self._scan_thread.wait()
+        self._scan_thread = None
+        self._scanner = None
+
+    @QtCore.pyqtSlot(str, float, str)
+    def _on_log_date(self, path, started, source):
+        try:
+            self._update_record(path, started=started, date_src=source)
+        except OSError:
+            return                  # the file went away mid-scan
+        if not started:
+            return                  # no GNSS in it: the row keeps its fallback
+        for it in self._iter_items():
+            if it.data(0, QtCore.Qt.UserRole) == path:
+                self._set_date_cells(it, started, source)
 
     def _scan(self, root, is_tree):
         """(display name, path) for the .ulg files under `root`.
@@ -448,8 +639,9 @@ class Browser(QtWidgets.QMainWindow):
             name,
             f"{mins:.1f} min" if mins is not None else "—",
             _fmt_size(st.st_size),
-            time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "", "",
         ])
+        self._set_date_cells(item, *self._log_date(path, st))
         item.setData(0, QtCore.Qt.UserRole, path)
         item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
         item.setCheckState(0, QtCore.Qt.Checked
@@ -457,6 +649,33 @@ class Browser(QtWidgets.QMainWindow):
                            else QtCore.Qt.Unchecked)
         item.setToolTip(0, path)
         parent.addChild(item)
+
+    # Both columns are one fact, so they are written by one function -- a date
+    # from GNSS next to a time from the file system would be a sentence nobody
+    # wrote and nobody could check.
+    DATE_SOURCE_NOTE = {
+        "gps": "flight time, from the log's own GNSS clock",
+        "name": "inferred from the file or run-folder name -- the log carries "
+                "no GNSS time yet",
+        "mtime": "file modified time -- NOT the flight; a log pulled off an SD "
+                 "card is dated when it was downloaded",
+    }
+
+    def _set_date_cells(self, item, epoch, source):
+        lt = time.localtime(epoch)
+        item.setText(3, time.strftime("%Y-%m-%d", lt))
+        item.setText(4, time.strftime("%H:%M:%S", lt))
+        # Anything but GNSS is an inference, and greying it is the difference
+        # between "this flight was on the 17th" and "this file was touched on
+        # the 19th" -- which is exactly the confusion this column replaced.
+        colour = None if source == "gps" else QtGui.QColor(C_MUTED)
+        note = self.DATE_SOURCE_NOTE.get(source, "")
+        for col in (3, 4):
+            if colour is not None:
+                item.setForeground(col, colour)
+            else:
+                item.setData(col, QtCore.Qt.ForegroundRole, None)
+            item.setToolTip(col, note)
 
     def _iter_items(self):
         for i in range(self.tree.topLevelItemCount()):
@@ -522,9 +741,18 @@ class Browser(QtWidgets.QMainWindow):
         self._log(f"  parsed in {secs:.1f}s")
         mins = duration_min(ulog)
         self._remember_duration(path, mins)
+        # The date comes free here: this parse already asked for the GPS topics
+        # (the altitude plot needs them), so re-reading the file in the scanner
+        # for a log the user just opened would be pure waste.
+        started, src = _start_from_parsed(ulog), "gps"
+        if started is None:
+            started, src = 0.0, "none"
+        self._update_record(path, started=started, date_src=src)
         for it in self._iter_items():
             if it.data(0, QtCore.Qt.UserRole) == path:
                 it.setText(1, f"{mins:.1f} min")
+                if started:
+                    self._set_date_cells(it, started, src)
 
         self.page.clear()
         self.jump.clear()
@@ -717,6 +945,7 @@ class Browser(QtWidgets.QMainWindow):
                 f"the reason.")
 
     def closeEvent(self, event):
+        self._stop_date_scan()
         self._teardown_thread()
         if self._proc is not None:
             self._proc.kill()
