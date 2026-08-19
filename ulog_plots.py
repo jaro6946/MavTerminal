@@ -18,6 +18,7 @@ from typing import Callable, List
 
 import ulog_alt
 import ulog_graph
+import ulog_localz
 from ulog_common import PlotCtx  # re-exported: callers build one and pass it on
 
 __all__ = ["PlotSpec", "PLOTS", "PlotCtx", "all_topics", "by_key"]
@@ -53,6 +54,15 @@ PLOTS = [
         build=ulog_alt.build_altitude,
         blurb="GPS / barometer / rangefinder against the EKF's fused altitude, "
               "with residuals, innovations and the fusion source",
+        height=780,
+    ),
+    PlotSpec(
+        key="localz",
+        title="Local z / EKF instance",
+        topics=ulog_localz.LOCALZ_TOPICS,
+        build=ulog_localz.build_local_z,
+        blurb="local position z and each instance's own z and ref_alt, shaded by "
+              "which EKF instance the selector had primary",
         height=780,
     ),
 ]
