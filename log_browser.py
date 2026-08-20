@@ -61,6 +61,8 @@ PLOT_HEIGHT = 470          # px per stacked plot; ~2 fit on a 1080p screen
 # exist when they were cached.
 SCAN_VERSION = 2
 
+# (The library sidebar became a dropdown; its width constants went with it.)
+
 
 # --- state ------------------------------------------------------------------
 
@@ -434,102 +436,149 @@ class Browser(QtWidgets.QMainWindow):
 
     # -- construction
     def _build_ui(self):
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.setCentralWidget(split)
+        # No splitter: the library is a dropdown on the toolbar, so the plot page
+        # owns the full window width.  These figures are ~15 inches of content
+        # laid out in figure fractions, and a 470 px sidebar was costing every
+        # panel a third of its horizontal resolution -- which is the axis the
+        # time series actually needs.
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        cv = QtWidgets.QVBoxLayout(central)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
 
-        # left: the library
-        left = QtWidgets.QWidget()
-        lv = QtWidgets.QVBoxLayout(left)
-        lv.setContentsMargins(6, 6, 6, 6)
+        bar = QtWidgets.QWidget()
+        bh = QtWidgets.QHBoxLayout(bar)
+        bh.setContentsMargins(10, 6, 10, 6)
 
-        row = QtWidgets.QHBoxLayout()
-        for label, slot in (("Add folder…", self._add_folder),
-                            ("Open file…", self._open_file),
-                            ("Refresh", lambda: self._populate())):
+        bh.addWidget(QtWidgets.QLabel("log:"))
+        self.picker = QtWidgets.QComboBox()
+        # Monospace, because the entries carry the columns the tree used to:
+        # name, duration, size, date, time, corruption.  Proportional type turns
+        # those into ragged prose.
+        self.picker.setStyleSheet("font-family: monospace;")
+        self.picker.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLength)
+        self.picker.setMinimumContentsLength(48)
+        self.picker.activated.connect(self._picked)
+        bh.addWidget(self.picker, 1)
+
+        for label, slot in (("Open file…", self._open_file),
+                            ("Add folder…", self._add_folder),
+                            ("Refresh", lambda: self._populate()),
+                            ("Rename…", self._rename_selected)):
             b = QtWidgets.QPushButton(label)
             b.clicked.connect(slot)
-            row.addWidget(b)
-        lv.addLayout(row)
+            bh.addWidget(b)
+            if label == "Rename…":
+                self.btn_rename = b
+        self.btn_pdf = QtWidgets.QPushButton("Export PDF…")
+        self.btn_pdf.clicked.connect(self._export_pdf)
+        bh.addWidget(self.btn_pdf)
 
+        self.jump = QtWidgets.QComboBox()
+        self.jump.addItem("jump to plot…")
+        self.jump.activated.connect(self._jump)
+        bh.addWidget(self.jump)
+
+        self.busy = QtWidgets.QProgressBar()
+        self.busy.setRange(0, 0)            # indeterminate
+        self.busy.setFixedWidth(120)
+        self.busy.hide()
+        bh.addWidget(self.busy)
+        cv.addWidget(bar)
+
+        self.title = QtWidgets.QLabel("no log loaded")
+        self.title.setStyleSheet(
+            f"font-size: 13px; font-weight: 600; padding: 0 10px 6px 10px;")
+        cv.addWidget(self.title)
+
+        self.page = PlotPage()
+        cv.addWidget(self.page, 1)
+
+        self.console = QtWidgets.QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumHeight(110)
+        self.console.setStyleSheet("font-family: monospace; font-size: 11px;")
+        cv.addWidget(self.console)
+
+        # The tree is still the MODEL -- it holds one row per log with the six
+        # columns, the check states and the per-cell colours, and every method
+        # that maintains them is unchanged.  It is simply never put in a layout;
+        # _rebuild_picker projects it into the dropdown.  Keeping it beats
+        # rewriting the population, scanning and rename bookkeeping against a
+        # combo box that cannot express any of it.
         self.tree = QtWidgets.QTreeWidget()
-        self.tree.setHeaderLabels(["log", "duration", "size", "date", "time",
-                                   "corrupt"])
-        # The name column absorbs the slack and the rest size to their contents;
-        # fixed widths truncated the "duration"/"size" headers at the default
-        # pane width, and a horizontal scrollbar to read a 6-character column is
-        # not a trade worth making.
-        header = self.tree.header()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for col in (1, 2, 3, 4, 5):
-            header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree.setTextElideMode(QtCore.Qt.ElideMiddle)
-        self.tree.setAlternatingRowColors(True)
-        self.tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        self.tree.customContextMenuRequested.connect(self._context_menu)
-        self.tree.itemSelectionChanged.connect(self._selection_changed)
-        self.tree.itemDoubleClicked.connect(lambda *_: self._load_selected())
-        lv.addWidget(self.tree, 1)
+        self.tree.setColumnCount(6)
 
-        # A selection change starts a 400 ms timer rather than loading at once.
-        # Arrow-keying down a list of 137 MB logs would otherwise kick off a
-        # parse per keystroke, and the last one you actually want lands behind a
-        # queue of ones you do not.
+        # A selection change starts a 400 ms timer rather than loading at once,
+        # so keyboard-scrolling the dropdown doesn't kick off a parse per
+        # keystroke and leave the one you want behind a queue.
         self._debounce = QtCore.QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(400)
         self._debounce.timeout.connect(self._load_selected)
 
-        row2 = QtWidgets.QHBoxLayout()
-        self.btn_rename = QtWidgets.QPushButton("Rename…")
-        self.btn_rename.clicked.connect(self._rename_selected)
-        self.btn_pdf = QtWidgets.QPushButton("Export PDF…")
-        self.btn_pdf.clicked.connect(self._export_pdf)
-        row2.addWidget(self.btn_rename)
-        row2.addWidget(self.btn_pdf)
-        lv.addLayout(row2)
+    # -- the dropdown, projected from the tree
+    def _row_text(self, item):
+        """One dropdown line: the name, then the columns the tree used to show."""
+        bits = [b for b in (item.text(1), item.text(2),
+                            f"{item.text(3)} {item.text(4)}".strip(),
+                            item.text(5)) if b and b != "—"]
+        name = item.text(0)
+        return f"{name}   ·   {'  ·  '.join(bits)}" if bits else name
 
-        self.check_hint = QtWidgets.QLabel("tick logs to include them in a PDF")
-        self.check_hint.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
-        lv.addWidget(self.check_hint)
+    def _rebuild_picker(self):
+        """Re-project the tree into the dropdown, preserving the selection."""
+        keep = self._picker_path()
+        self.picker.blockSignals(True)
+        self.picker.clear()
+        model = self.picker.model()
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            if not top.childCount():
+                continue
+            # Group headers stay as unselectable rows: the roots (Log Analysis /
+            # HITL run folders / current directory) are how you know which
+            # library a log came from, and a flat list of 46 entries loses that.
+            self.picker.addItem(f"── {top.text(0)} ──")
+            row = model.item(self.picker.count() - 1)
+            row.setFlags(row.flags() & ~QtCore.Qt.ItemIsEnabled)
+            for j in range(top.childCount()):
+                child = top.child(j)
+                self.picker.addItem(self._row_text(child))
+                self.picker.setItemData(self.picker.count() - 1,
+                                        child.data(0, QtCore.Qt.UserRole),
+                                        QtCore.Qt.UserRole)
+        self.picker.blockSignals(False)
+        if keep and not self._select_path(keep):
+            self.picker.setCurrentIndex(-1)
+        elif not keep:
+            self.picker.setCurrentIndex(-1)
+        # The popup is free to be wider than the closed combo, and these lines
+        # run past 90 characters.
+        self.picker.view().setMinimumWidth(
+            self.picker.fontMetrics().averageCharWidth() * 96)
 
-        # right: header + plot page + console
-        right = QtWidgets.QWidget()
-        rv = QtWidgets.QVBoxLayout(right)
-        rv.setContentsMargins(0, 0, 0, 0)
-        rv.setSpacing(0)
+    def _refresh_picker_row(self, path):
+        """Re-render one dropdown line after its tree row changed."""
+        target = os.path.abspath(path)
+        for it in self._iter_items():
+            p = it.data(0, QtCore.Qt.UserRole)
+            if not p or os.path.abspath(p) != target:
+                continue
+            for k in range(self.picker.count()):
+                q = self.picker.itemData(k, QtCore.Qt.UserRole)
+                if q and os.path.abspath(q) == target:
+                    self.picker.setItemText(k, self._row_text(it))
+                    return
 
-        head = QtWidgets.QWidget()
-        hh = QtWidgets.QHBoxLayout(head)
-        hh.setContentsMargins(10, 6, 10, 6)
-        self.title = QtWidgets.QLabel("no log loaded")
-        self.title.setStyleSheet("font-size: 14px; font-weight: 600;")
-        hh.addWidget(self.title)
-        hh.addStretch(1)
-        self.jump = QtWidgets.QComboBox()
-        self.jump.addItem("jump to plot…")
-        self.jump.activated.connect(self._jump)
-        hh.addWidget(self.jump)
-        self.busy = QtWidgets.QProgressBar()
-        self.busy.setRange(0, 0)            # indeterminate
-        self.busy.setFixedWidth(140)
-        self.busy.hide()
-        hh.addWidget(self.busy)
-        rv.addWidget(head)
+    def _picker_path(self):
+        i = self.picker.currentIndex()
+        return self.picker.itemData(i, QtCore.Qt.UserRole) if i >= 0 else None
 
-        self.page = PlotPage()
-        rv.addWidget(self.page, 1)
-
-        self.console = QtWidgets.QPlainTextEdit()
-        self.console.setReadOnly(True)
-        self.console.setMaximumHeight(120)
-        self.console.setStyleSheet("font-family: monospace; font-size: 11px;")
-        rv.addWidget(self.console)
-
-        split.addWidget(left)
-        split.addWidget(right)
-        split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 1)
-        split.setSizes([470, 1130])
+    def _picked(self, _index):
+        if self._picker_path():
+            self._debounce.start()
 
     # -- library
     def _log(self, msg):
@@ -599,7 +648,7 @@ class Browser(QtWidgets.QMainWindow):
         for label, root, is_tree in roots:
             if not os.path.isdir(root):
                 continue
-            files = self._scan(root, is_tree)
+            files = self._sorted_by_date(self._scan(root, is_tree))
             files = [f for f in files if f[1] not in seen]
             if not files:
                 continue
@@ -625,6 +674,7 @@ class Browser(QtWidgets.QMainWindow):
                 self._add_row(node, os.path.basename(p), p, checked)
             node.setExpanded(True)
 
+        self._rebuild_picker()
         if current:
             self._select_path(current)
         self._start_library_scan()
@@ -652,8 +702,20 @@ class Browser(QtWidgets.QMainWindow):
         self._scanner.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scanner.run)
         self._scanner.found.connect(self._on_scanned)
-        self._scanner.finished.connect(self._stop_library_scan)
+        self._scanner.finished.connect(self._on_scan_finished)
         self._scan_thread.start()
+
+    @QtCore.pyqtSlot()
+    def _on_scan_finished(self):
+        """Settle the order once, after the guesses have become real dates.
+
+        Re-sorting on every result would make rows jump under the pointer for
+        the whole scan.  `_populate` restarts the scan, but by now every row is
+        cached at the current SCAN_VERSION so it finds nothing to do and stops
+        immediately -- that is what keeps this from looping.
+        """
+        self._stop_library_scan()
+        self._populate()
 
     def _stop_library_scan(self):
         if self._scanner is not None:
@@ -675,6 +737,28 @@ class Browser(QtWidgets.QMainWindow):
                 st = os.stat(path)
                 self._set_date_cells(it, *self._log_date(path, st))
                 self._set_corrupt_cell(it, self._cached_record(path, st) or {})
+                self._refresh_picker_row(path)
+
+    def _sorted_by_date(self, files):
+        """Newest flight first, by the log's OWN date.
+
+        Filename order is close to useless here: three of the four libraries use
+        UUIDs or a per-session counter, and the HITL tree calls every log
+        FC_log.ulg.  Newest-first because the log you want is almost always the
+        one you just flew.
+
+        Rows sort on whatever `_log_date` can supply right now -- GNSS time if it
+        has been read, otherwise the name/mtime fallback -- so the list is in a
+        sensible order immediately.  `_on_scan_finished` re-populates once the
+        background scan has replaced the guesses with real flight times, which is
+        the only point at which the order can still change.
+        """
+        def key(entry):
+            try:
+                return -self._log_date(entry[1], os.stat(entry[1]))[0]
+            except OSError:
+                return 0.0
+        return sorted(files, key=key)
 
     def _scan(self, root, is_tree):
         """(display name, path) for the .ulg files under `root`.
@@ -801,23 +885,21 @@ class Browser(QtWidgets.QMainWindow):
                 and it.data(0, QtCore.Qt.UserRole)}
 
     def _selected_path(self):
-        items = self.tree.selectedItems()
-        return items[0].data(0, QtCore.Qt.UserRole) if items else None
+        return self._picker_path()
 
     def _select_path(self, path):
+        """Point the dropdown at `path`.  False if the library does not have it."""
         target = os.path.abspath(path)
-        for it in self._iter_items():
-            p = it.data(0, QtCore.Qt.UserRole)
+        for k in range(self.picker.count()):
+            p = self.picker.itemData(k, QtCore.Qt.UserRole)
             if p and os.path.abspath(p) == target:
-                self.tree.setCurrentItem(it)
+                self.picker.blockSignals(True)
+                self.picker.setCurrentIndex(k)
+                self.picker.blockSignals(False)
                 return True
         return False
 
     # -- loading
-    def _selection_changed(self):
-        if self._selected_path():
-            self._debounce.start()
-
     def _load_selected(self):
         self._debounce.stop()
         path = self._selected_path()
@@ -868,6 +950,7 @@ class Browser(QtWidgets.QMainWindow):
                 it.setText(1, f"{mins:.1f} min")
                 self._set_date_cells(it, *self._log_date(path, os.stat(path)))
                 self._set_corrupt_cell(it, self._cached_record(path, os.stat(path)) or {})
+                self._refresh_picker_row(path)
 
         self.page.clear()
         self.jump.clear()
@@ -928,19 +1011,10 @@ class Browser(QtWidgets.QMainWindow):
             self._populate(extra=[f])
             self._select_path(f)
 
-    def _context_menu(self, pos):
-        item = self.tree.itemAt(pos)
-        if item is None or not item.data(0, QtCore.Qt.UserRole):
-            return
-        menu = QtWidgets.QMenu(self)
-        menu.addAction("Plot", self._load_selected)
-        menu.addAction("Rename…", self._rename_selected)
-        menu.addAction("Copy path", lambda: QtWidgets.QApplication.clipboard()
-                       .setText(item.data(0, QtCore.Qt.UserRole)))
-        menu.exec_(self.tree.viewport().mapToGlobal(pos))
-
     def keyPressEvent(self, event):
-        if event.key() == QtCore.Qt.Key_F2 and self.tree.hasFocus():
+        # F2 used to be gated on the tree having focus; with the tree gone there
+        # is no ambiguity about what it renames -- it is whatever is selected.
+        if event.key() == QtCore.Qt.Key_F2:
             self._rename_selected()
             return
         super().keyPressEvent(event)
@@ -1003,16 +1077,65 @@ class Browser(QtWidgets.QMainWindow):
         self._select_path(target)
 
     # -- pdf
+    def _pick_pdf_logs(self):
+        """Choose which logs go in the report.  [] if the user cancelled.
+
+        The tree's tick boxes went with the sidebar, so multi-select moved into a
+        dialog rather than being dropped -- exporting a whole test session in one
+        PDF is the reason the export exists.  Ticks are still stored on the tree
+        rows, so a choice survives until the library is repopulated.
+        """
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Export PDF - choose logs")
+        dlg.resize(760, 520)
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.addWidget(QtWidgets.QLabel("Tick the logs to include:"))
+        lst = QtWidgets.QListWidget()
+        lst.setStyleSheet("font-family: monospace;")
+        v.addWidget(lst, 1)
+
+        current = self._selected_path()
+        checked = self._checked_paths()
+        for it in self._iter_items():
+            path = it.data(0, QtCore.Qt.UserRole)
+            if not path:
+                continue
+            row = QtWidgets.QListWidgetItem(self._row_text(it))
+            row.setData(QtCore.Qt.UserRole, path)
+            row.setFlags(row.flags() | QtCore.Qt.ItemIsUserCheckable)
+            # Default to the log on screen, so the common case -- "PDF of what I
+            # am looking at" -- is one click through this dialog.
+            on = (os.path.abspath(path) in checked or
+                  (not checked and current and
+                   os.path.abspath(path) == os.path.abspath(current)))
+            row.setCheckState(QtCore.Qt.Checked if on else QtCore.Qt.Unchecked)
+            lst.addItem(row)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        v.addWidget(btns)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return []
+
+        chosen = []
+        for i in range(lst.count()):
+            row = lst.item(i)
+            path = row.data(QtCore.Qt.UserRole)
+            on = row.checkState() == QtCore.Qt.Checked
+            for it in self._iter_items():
+                if it.data(0, QtCore.Qt.UserRole) == path:
+                    it.setCheckState(0, QtCore.Qt.Checked if on
+                                     else QtCore.Qt.Unchecked)
+            if on:
+                chosen.append(path)
+        return sorted(chosen)
+
     def _export_pdf(self):
-        paths = sorted(self._checked_paths())
+        paths = self._pick_pdf_logs()
         if not paths:
-            sel = self._selected_path()
-            if not sel:
-                QtWidgets.QMessageBox.information(
-                    self, "Export PDF",
-                    "Tick one or more logs in the list (or select one) first.")
-                return
-            paths = [sel]
+            return
 
         default = os.path.splitext(os.path.basename(paths[0]))[0]
         default += "_report.pdf" if len(paths) == 1 else f"_and_{len(paths)-1}_more.pdf"
