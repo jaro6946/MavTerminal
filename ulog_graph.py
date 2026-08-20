@@ -44,7 +44,9 @@ from ulog_common import (ARMED_TOPIC, C_ADD, C_FIX, C_INK, C_MUTED, C_RATE,
                          C_SATS, C_SURFACE, FAMILY_STYLE, PlotCtx, Series,
                          _clean, _get, _rescale, _style_axis, _time_min,
                          add_mouse_navigation, armed_spans, check_panel,
-                         draw_armed, nav_hint, parse_ref, sliding_slope,
+                         draw_armed, draw_mode_changes, duration_min,
+                         mode_changes, mode_key, nav_hint, parse_ref,
+                         sliding_slope,
                          style_time_axis)
 
 # --- what we pull out of the log -------------------------------------------
@@ -61,7 +63,8 @@ TEMP_TOPICS = [
 # the former for resolution, fall back so HITL/SITL logs still work.
 GPS_TOPICS = ["vehicle_gps_position", "sensor_gps"]
 
-THERMAL_TOPICS = TEMP_TOPICS + GPS_TOPICS + [ARMED_TOPIC]
+THERMAL_TOPICS = TEMP_TOPICS + GPS_TOPICS + [ARMED_TOPIC,
+                                             "vehicle_status"]  # mode overlay
 
 # The cleanest channel to differentiate: vehicle_imu_status publishes the driver's
 # *averaged* temperature (quantum ~1e-5 degC) whereas the raw sensor_* channels are
@@ -305,19 +308,31 @@ def build_thermal(ulog, ctx=None, path=""):
         ax_add.set_visible(any(ln.get_visible() for ln in add_lines))
         _rescale(ax_add, add_lines)
 
-    # +4 leaves room for the three group masters and the armed toggle, which are
-    # panel rows that aren't series.
-    h = min(0.86, 0.035 * (len(series) + 4) + 0.05)
+    base_extra = [("armed (shaded)", span_art, True)] if span_art else []
+    # Flight-mode overlay: a rule on every panel at each mode change, named on
+    # one of them.  Toggleable, because a log that flickers between Position and
+    # Hold 52 times (d05a88e3) is unreadable with it on and unanswerable with it
+    # off.  min_gap keeps the LABELS legible without dropping any rule.
+    mode_art, mode_codes = draw_mode_changes(
+        [ax, ax_cnt, ax_rate, ax_add], mode_changes(ulog), text_ax=ax_cnt,
+        min_gap=max(duration_min(ulog), 1.0) * 0.035)
+    extra = list(base_extra)
+    mode_art += mode_key(fig, 0.965, 0.012, mode_codes)
+    if mode_art:
+        extra.append(("mode changes", mode_art, True))
+
+    # +5 leaves room for the three group masters and the armed/mode toggles,
+    # which are panel rows that aren't series.
+    h = min(0.86, 0.035 * (len(series) + 5) + 0.05)
     check_panel(fig, [0.015, 0.89 - h, 0.19, h], series,
                 [("temp", "ALL temperatures"), ("sats", "ALL gps"),
                  ("rate", None), ("add", "ALL added")],
-                extra=[("armed (shaded)", span_art, True)] if span_art else (),
-                on_change=refresh)
+                extra=extra, on_change=refresh)
     refresh()
     # After refresh(), so "home" is the fitted view rather than the raw one.
     add_mouse_navigation(fig, [ax, ax_cnt, ax_rate, ax_add],
                          page_scroll=ctx.page_scroll)
-    fig.text(0.20, 0.02, nav_hint(ctx.page_scroll), color=C_MUTED, fontsize=8,
+    fig.text(0.20, 0.036, nav_hint(ctx.page_scroll), color=C_MUTED, fontsize=8,
              ha="left")
     return fig
 

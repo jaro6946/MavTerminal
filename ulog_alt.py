@@ -32,8 +32,10 @@ from ulog_common import (C_ARMED, C_BAD, C_INK, C_MUTED, C_SURFACE, PlotCtx,
                          Series, _clean, _get, _rescale, _style_axis, _time_min,
                          add_mouse_navigation, armed_spans, check_panel,
                          draw_armed, draw_band_rows, duration_min, field,
-                         gap_mask, has_topic, nav_hint, primary_ekf,
-                         resample_to, spans_from_bool, style_time_axis)
+                         draw_mode_changes, gap_mask, has_topic,
+                         mode_changes, mode_key, nav_hint, primary_ekf,
+                         resample_to,
+                         spans_from_bool, style_time_axis)
 
 ALT_TOPICS = [
     "vehicle_global_position", "vehicle_local_position", "vehicle_gps_position",
@@ -41,6 +43,8 @@ ALT_TOPICS = [
     "estimator_status_flags", "estimator_innovations",
     "estimator_innovation_test_ratios", "estimator_gnss_hgt_bias",
     "estimator_rng_hgt_bias", "estimator_selector_status", "actuator_armed",
+
+    "vehicle_status",          # flight-mode overlay
 ]
 
 # --- color ------------------------------------------------------------------
@@ -498,17 +502,29 @@ def build_altitude(ulog, ctx=None, path=""):
             bits.append(f"{n_r} test ratio(s) off-scale (max {max_r:.0f})")
         off_note.set_text("   ".join(bits))
 
-    h = min(0.86, 0.035 * (len(series) + 5) + 0.05)
+    base_extra = [("armed (shaded)", span_art, True)] if span_art else []
+    # Flight-mode overlay: a rule on every panel at each mode change, named on
+    # one of them.  Toggleable, because a log that flickers between Position and
+    # Hold 52 times (d05a88e3) is unreadable with it on and unanswerable with it
+    # off.  min_gap keeps the LABELS legible without dropping any rule.
+    mode_art, mode_codes = draw_mode_changes(
+        [ax_amsl, ax_res, ax_inn, ax_ratio, ax_band], mode_changes(ulog),
+        text_ax=ax_res, min_gap=max(duration_min(ulog), 1.0) * 0.035)
+    extra = list(base_extra)
+    mode_art += mode_key(fig, left + width, 0.018, mode_codes)
+    if mode_art:
+        extra.append(("mode changes", mode_art, True))
+
+    h = min(0.86, 0.035 * (len(series) + 6) + 0.05)
     check_panel(fig, [0.012, 0.89 - h, 0.155, h], series,
                 [("amsl", "ALL sources"), ("resid", "ALL residuals"),
                  ("innov", "ALL innovations"), ("ratio", "ALL test ratios")],
-                extra=[("armed (shaded)", span_art, True)] if span_art else (),
-                on_change=refresh)
+                extra=extra, on_change=refresh)
     refresh()
     add_mouse_navigation(fig, [ax_amsl, ax_res, ax_inn, ax_ratio, ax_band],
                          page_scroll=ctx.page_scroll)
-    fig.text(left, 0.03, nav_hint(ctx.page_scroll), color=C_MUTED, fontsize=8,
-             ha="left")
+    fig.text(left, 0.048, nav_hint(ctx.page_scroll), color=C_MUTED,
+             fontsize=8, ha="left")
     return fig
 
 

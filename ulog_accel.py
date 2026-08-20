@@ -49,15 +49,19 @@ from ulog_common import (C_ARMED, C_BAD, C_INK, C_MUTED, C_SURFACE, PlotCtx,
                          Series, _clean, _get, _rescale, _style_axis, _time_min,
                          add_mouse_navigation, armed_spans, check_panel,
                          draw_armed, draw_band_rows, draw_primary_shading,
-                         duration_min, has_topic, inst_color,
-                         instance_key, nav_hint, primary_ekf, primary_spans,
-                         resample_to, spans_from_bool, style_time_axis)
+                         draw_mode_changes, duration_min, has_topic,
+                         inst_color, instance_key, mode_changes, mode_key,
+                         nav_hint,
+                         primary_ekf, primary_spans, resample_to,
+                         spans_from_bool, style_time_axis)
 
 ACCEL_TOPICS = [
     "sensor_accel", "sensor_combined", "sensors_status_imu",
     "vehicle_imu_status", "estimator_sensor_bias", "estimator_status_flags",
     "estimator_selector_status", "sensor_correction", "sensor_selection",
     "actuator_armed",
+
+    "vehicle_status",          # flight-mode overlay
 ]
 
 C_PUB = "#20222b"       # near-black -- the PUBLISHED/primary series
@@ -86,9 +90,10 @@ PREFLIGHT_SIGMA = 3.0
 # sized per row and the FIGURE grows to fit it, which also keeps every trace
 # panel exactly as tall as it was regardless of how eventful the log is.
 PANEL_IN = [("acc", 2.05), ("bias", 1.95), ("corr", 1.75), ("cons", 1.75)]
-GAP_IN = 0.30          # between panels; enough for the shared tick marks
+GAP_IN = 0.48          # between panels; wide enough that a legend block can
+                       # sit beside its own graph without touching the next
 TOP_IN = 0.95          # title + subtitle + instance key
-BOTTOM_IN = 1.10       # band's x label + nav hint + margins
+BOTTOM_IN = 1.35       # band's x label + nav hint + mode key + margins
 BAND_ROW_IN = 0.52     # per fault row; a 3-lane row needs 3 readable bars AND
                        # a title, so this is ~4x the label's own height
 BAND_PAD_IN = 0.30
@@ -779,7 +784,7 @@ def build_accel(ulog, ctx=None, path=""):
         shade_note = "no selector topic -- single EKF, no shading"
     fig.text(left, 1.0 - _f(0.62), f"{who}{dur:.1f} min   |   {shade_note}",
              color=C_MUTED, fontsize=9, ha="left")
-    instance_key(fig, left, width, spans, y=y_title - _f(0.02))
+    key_x = instance_key(fig, left, width, spans, y=y_title - _f(0.02))
 
     # The at-rest calibration read, on the panel it belongs to.  Text rather than
     # a note, because it is a per-IMU number the reader wants next to the traces
@@ -846,6 +851,14 @@ def build_accel(ulog, ctx=None, path=""):
             ax_e.set_yticks([])
             ax_tw.set_yticks([])
 
+    # Flight-mode overlay: a rule on every panel at each mode change, named on
+    # ax_bias.  Toggleable, because a log that flickers between Position and
+    # Hold 52 times (d05a88e3) is unreadable with it on and unanswerable with it
+    # off.  min_gap keeps the LABELS legible without dropping any rule.
+    mode_art, mode_codes = draw_mode_changes(
+        [ax_acc, ax_bias, ax_corr, ax_cons, ax_band], mode_changes(ulog),
+        text_ax=ax_bias, min_gap=max(duration_min(ulog), 1.0) * 0.035)
+
     def refresh():
         n_acc = _rescale_clipped(ax_acc, [s.line for s in series if s.group == "acc"],
                                  keep=(G, G))
@@ -859,6 +872,11 @@ def build_accel(ulog, ctx=None, path=""):
             _rescale(a, [s.line for s in series if s.group == group])
 
     extra = []
+    # The key rides on the same toggle as the rules it names: a key to lines
+    # that are switched off is worse than no key at all.
+    mode_art += mode_key(fig, left + width, _f(0.10), mode_codes)
+    if mode_art:
+        extra.append(("mode changes", mode_art, True))
     if cal_art:
         extra.append(("accel cal changes", cal_art, True))
     if shade_art:
@@ -866,18 +884,30 @@ def build_accel(ulog, ctx=None, path=""):
     if armed_art:
         extra.append(("armed (shaded)", armed_art, False))
 
+    # The checkbox column spans exactly the plot stack, so a group's block can be
+    # anchored beside the panel it belongs to.  Answering "which legend goes with
+    # which graph" by POSITION costs nothing and never has to be read.
     cb_top = rects["acc"][0] + rects["acc"][1]
     cb_bot = rects["band"][0]
-    h = min(cb_top - cb_bot, _f(0.24) * (len(series) + 8) + _f(0.6))
-    check_panel(fig, [0.012, cb_top - h, 0.155, h], series,
+    h = cb_top - cb_bot
+
+    def _anchor(key):
+        """Panel centre, as a fraction of the checkbox axes."""
+        b, ph = rects[key]
+        return (b + ph / 2 - cb_bot) / h
+
+    check_panel(fig, [0.012, cb_bot, 0.155, h], series,
                 [("acc", "ALL accelerometer"), ("bias", "ALL bias"),
                  ("corr", "ALL thermal offset"), ("temp", "ALL temperature"),
                  ("cons", "ALL inconsistency"), ("vib", "ALL vibration")],
-                extra=extra, on_change=refresh)
+                extra=extra, on_change=refresh,
+                anchors={"acc": _anchor("acc"), "bias": _anchor("bias"),
+                         "corr": _anchor("corr"), "temp": _anchor("corr"),
+                         "cons": _anchor("cons"), "vib": _anchor("cons")})
     refresh()
     add_mouse_navigation(fig, [ax_acc, ax_bias, ax_corr, ax_temp, ax_cons,
                                ax_vib, ax_band], page_scroll=ctx.page_scroll)
-    fig.text(left, _f(0.28), nav_hint(ctx.page_scroll), color=C_MUTED,
+    fig.text(left, _f(0.32), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     fig._page_height = int(round(fig_h * PAGE_PX_PER_IN))
     return fig

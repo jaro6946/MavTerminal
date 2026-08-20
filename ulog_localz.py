@@ -46,13 +46,17 @@ from ulog_common import (C_ARMED, C_BAD, C_GRID, C_INK, C_MUTED, C_SURFACE,
                          INST_COLORS, PlotCtx, Series, _clean, _get, _rescale,
                          _style_axis, _time_min, add_mouse_navigation,
                          armed_spans, check_panel, draw_armed, draw_band_rows,
-                         draw_primary_shading, duration_min, field, has_topic,
-                         inst_color, instance_key, nav_hint, primary_spans,
-                         spans_from_bool, style_time_axis)
+                         draw_mode_changes, draw_primary_shading, duration_min,
+                         field, has_topic, inst_color, instance_key,
+                         mode_changes, mode_key, nav_hint, primary_spans,
+                         spans_from_bool,
+                         style_time_axis)
 
 LOCALZ_TOPICS = [
     "vehicle_local_position", "estimator_local_position",
     "estimator_selector_status", "actuator_armed",
+
+    "vehicle_status",          # flight-mode overlay
 ]
 
 # --- color ------------------------------------------------------------------
@@ -361,7 +365,7 @@ def build_local_z(ulog, ctx=None, path=""):
              f"{who}{duration_min(ulog):.1f} min   |   {shade_note}",
              color=C_MUTED, fontsize=9, ha="left")
 
-    instance_key(fig, left, width, spans)
+    key_x = instance_key(fig, left, width, spans)
 
     off_note = ax_sel.text(0.995, 0.96, "", transform=ax_sel.transAxes,
                            ha="right", va="top", fontsize=7, color=C_BAD)
@@ -376,6 +380,14 @@ def build_local_z(ulog, ctx=None, path=""):
         ax_sel.set_yticks([])
         ax_rel.set_yticks([])
 
+    # Flight-mode overlay: a rule on every panel at each mode change, named on
+    # ax_ref.  Toggleable, because a log that flickers between Position and
+    # Hold 52 times (d05a88e3) is unreadable with it on and unanswerable with it
+    # off.  min_gap keeps the LABELS legible without dropping any rule.
+    mode_art, mode_codes = draw_mode_changes(
+        [ax_z, ax_ref, ax_sel, ax_band], mode_changes(ulog), text_ax=ax_ref,
+        min_gap=max(duration_min(ulog), 1.0) * 0.035)
+
     def refresh():
         for group, a in (("z", ax_z), ("ref", ax_ref), ("rel", ax_rel)):
             _rescale(a, [s.line for s in series if s.group == group])
@@ -383,6 +395,9 @@ def build_local_z(ulog, ctx=None, path=""):
         off_note.set_text(f"{n} test ratio(s) off-scale (max {mx:.0f})" if n else "")
 
     extra = []
+    mode_art += mode_key(fig, left + width, 0.018, mode_codes)
+    if mode_art:
+        extra.append(("mode changes", mode_art, True))
     if reset_art:
         extra.append(("height resets (marked)", reset_art, True))
     if shade_art:
@@ -398,6 +413,6 @@ def build_local_z(ulog, ctx=None, path=""):
     refresh()
     add_mouse_navigation(fig, [ax_z, ax_ref, ax_sel, ax_rel, ax_band],
                          page_scroll=ctx.page_scroll)
-    fig.text(left, 0.03, nav_hint(ctx.page_scroll), color=C_MUTED, fontsize=8,
-             ha="left")
+    fig.text(left, 0.048, nav_hint(ctx.page_scroll), color=C_MUTED,
+             fontsize=8, ha="left")
     return fig

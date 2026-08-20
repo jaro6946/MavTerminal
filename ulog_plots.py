@@ -18,6 +18,7 @@ from typing import Callable, List
 
 import ulog_accel
 import ulog_alt
+import ulog_cpu
 import ulog_graph
 import ulog_localz
 from ulog_common import PlotCtx  # re-exported: callers build one and pass it on
@@ -77,6 +78,16 @@ PLOTS = [
         # Fallback only: build_accel sizes its own figure from the fault-row
         # count and sets fig._page_height to match.
         height=1000,
+    ),
+    PlotSpec(
+        key="cpu",
+        title="Processor load",
+        topics=ulog_cpu.CPU_TOPICS,
+        build=ulog_cpu.build_cpu,
+        blurb="CPU and RAM, plus the things that show the board struggling: EKF "
+              "time slip, IMU publish rates, SD buffer pressure and the MAVLink "
+              "rate throttle",
+        height=900,
     ),
 ]
 

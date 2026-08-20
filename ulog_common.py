@@ -374,13 +374,156 @@ def instance_key(fig, left, width, spans, y=0.952, pitch=0.040):
     of the first panel, where it collides with rotated event labels.
     """
     if not spans:
-        return
+        return left + width
     x = left + width
     for i in sorted({i for _, _, i in spans}, reverse=True):
         fig.text(x, y, f"EKF {i}", color=inst_color(i), fontsize=8,
                  ha="right", fontweight="bold")
         x -= pitch
     fig.text(x, y, "shading:", color=C_MUTED, fontsize=8, ha="right")
+    # The x it stopped at, so a second key can be chained to its left on the same
+    # row rather than fighting the subtitle for space below it.
+    return x - 0.055
+
+
+# --- flight mode -------------------------------------------------------------
+# Named the way the ground station names them, not the way the enum does:
+# "Hold" is what QGC calls AUTO_LOITER and what the pilot pressed, and a plot the
+# pilot has to translate is a plot they will misread.
+#
+# Only the codes that mean the same thing across PX4 v1.14 and v1.18 are named.
+# 6, 8 and 9 were free/unused before v1.15 and mean POSITION_SLOW /
+# ALTITUDE_CRUISE / (free) after it, so naming them would be wrong on half this
+# project's logs -- they fall through to "mode N", which is never wrong.
+NAV_STATE_NAMES = {
+    0: "Manual", 1: "Altitude", 2: "Position", 3: "Mission", 4: "Hold",
+    5: "Return", 10: "Acro", 12: "Descend", 13: "Termination", 14: "Offboard",
+    15: "Stabilized", 17: "Takeoff", 18: "Land", 19: "Follow", 20: "Precland",
+    21: "Orbit", 22: "VTOL Takeoff",
+}
+# One hue per MODE, because the name cannot always be shown.  Labels are dropped
+# whenever two changes fall close together (d05a88e3 changes mode 53 times in 15
+# minutes), and an unlabelled rule is a line you cannot identify -- which is the
+# one thing this overlay exists to prevent.  Colour identifies every rule, at
+# every zoom, and the key below names the colours once.
+#
+# Grouped by what the pilot did: assisted modes cool, auto modes warm, the
+# unusual ones (Offboard, Termination) loud.  Red is reserved for Termination,
+# so it keeps the meaning it has everywhere else in this toolkit.
+MODE_COLORS = {
+    0:  "#8d6e63",   # Manual        brown
+    1:  "#26a69a",   # Altitude      teal
+    2:  "#3f51b5",   # Position      indigo
+    3:  "#43a047",   # Mission       green
+    4:  "#fb8c00",   # Hold          orange
+    5:  "#8e24aa",   # Return        purple
+    10: "#6d4c41",   # Acro          dark brown
+    12: "#00838f",   # Descend       dark cyan
+    13: "#c0392b",   # Termination   RED
+    14: "#d81b60",   # Offboard      magenta
+    15: "#7cb342",   # Stabilized    light green
+    17: "#00acc1",   # Takeoff       cyan
+    18: "#5e35b1",   # Land          deep purple
+    19: "#546e7a",   # Follow        slate
+    20: "#3949ab",   # Precland      dark indigo
+    21: "#f4511e",   # Orbit         deep orange
+    22: "#00897b",   # VTOL Takeoff  dark teal
+}
+# For codes with no assigned hue (firmware-specific or future).  Neutral rather
+# than a recycled colour, so an unknown mode never impersonates a known one.
+C_MODE = "#6a4fa3"
+
+
+def mode_color(code):
+    return MODE_COLORS.get(int(code), C_MODE)
+
+
+def nav_state_name(code):
+    return NAV_STATE_NAMES.get(int(code), f"mode {int(code)}")
+
+
+def mode_changes(ulog):
+    """[(t_min, nav_state)] -- the first sample, then every transition.
+
+    The first sample is included deliberately: without it a log that never
+    changes mode draws nothing, and "no lines" would read as "no data" rather
+    than "one mode the whole way".
+    """
+    d = _get(ulog, "vehicle_status")
+    if d is None or "nav_state" not in d.data:
+        return []
+    t = _time_min(ulog, d)
+    v = np.asarray(d.data["nav_state"], dtype=float)
+    m = np.isfinite(t) & np.isfinite(v)
+    t, v = t[m], v[m].astype(int)
+    if t.size == 0:
+        return []
+    idx = np.concatenate([[0], np.flatnonzero(np.diff(v) != 0) + 1])
+    return [(float(t[i]), int(v[i])) for i in idx]
+
+
+def draw_mode_changes(axes, changes, text_ax=None, min_gap=0.0, label=True):
+    """A rule at every mode change on every axis, coloured by the mode it starts.
+
+    Returns (artists, codes_seen) so the caller can hang a checkbox on the
+    artists and name the colours with mode_key().
+
+    Every axis gets the RULE so a feature in any panel can be lined up against
+    the mode it happened in, but only one gets the TEXT -- repeating the name on
+    five panels is five times the ink for no extra information, and on the panels
+    with their own annotations it collides with them.
+
+    `min_gap` suppresses a label too close to the previous labelled one, in x
+    units.  Measured need: d05a88e3 changes mode 53 times in 15 minutes, mostly
+    Position -> Hold -> Offboard flicker a few seconds apart, and unfiltered
+    those labels overprint into a solid bar of text.  The rule is still drawn for
+    every change, in that mode's own colour -- which is why dropping the label
+    costs nothing but convenience.
+    """
+    artists, last_label, codes = [], None, []
+    text_ax = text_ax if text_ax is not None else (axes[0] if axes else None)
+    for t, code in changes:
+        color = mode_color(code)
+        if code not in codes:
+            codes.append(int(code))
+        for ax in axes:
+            artists.append(ax.axvline(t, color=color, lw=1.1, ls="--",
+                                      alpha=0.7, zorder=1.5))
+        if text_ax is None or not label:
+            continue
+        if last_label is not None and (t - last_label) < min_gap:
+            continue
+        last_label = t
+        artists.append(text_ax.text(
+            t, 0.985, " " + nav_state_name(code),
+            transform=text_ax.get_xaxis_transform(), rotation=90, fontsize=6.5,
+            color=color, va="top", ha="left", zorder=6,
+            bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=0.8, alpha=0.7)))
+    return artists, codes
+
+
+def mode_key(fig, x_right, y, codes, fontsize=8, pitch=0.011):
+    """Name the mode COLOURS once, right-aligned, as figure text.
+
+    Returns the artists so they toggle with the rules -- a key to lines that are
+    switched off is worse than no key.
+
+    Laid out right to left so the row ends flush at `x_right` whatever it
+    contains; `pitch` is per character, since the names differ in length and a
+    fixed column would either overlap or leave a gap.
+    """
+    if not codes:
+        return []
+    artists, x = [], x_right
+    for code in reversed(codes):
+        name = nav_state_name(code)
+        artists.append(fig.text(x, y, name, color=mode_color(code),
+                                fontsize=fontsize, ha="right",
+                                fontweight="bold"))
+        x -= (len(name) + 1.6) * pitch
+    artists.append(fig.text(x, y, "modes:", color=C_MUTED, fontsize=fontsize,
+                            ha="right"))
+    return artists
 
 
 # --- boolean bands ----------------------------------------------------------
@@ -514,7 +657,50 @@ def draw_band_rows(ax, rows, ylabel="", empty_msg="nothing to show",
 GROUP_GAP_ROWS = 0.8
 
 
-def _respace_checkbuttons(cb, breaks, gap=GROUP_GAP_ROWS):
+def _block_layout(n, breaks, gap, anchors):
+    """Row centres, in axes fraction, for every checkbox entry.
+
+    Without `anchors` this is matplotlib's uniform spacing plus a blank row
+    between groups.  With them, each group's block is slid to sit beside the
+    graph it annotates -- which is the only thing that reliably answers "which
+    legend goes with which panel" on a five-panel figure.  Blocks are placed
+    top-down and pushed apart on collision, so a group too tall for its panel
+    displaces the ones below it rather than overlapping them.
+
+    Returns (ys, total_rows) or None when the anchored layout does not fit, in
+    which case the caller falls back to the compact one.
+    """
+    starts = sorted(b for b in breaks if b < n)
+    blocks = []                     # (start, count, anchor or None)
+    for k, st in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else n
+        blocks.append((st, end - st, anchors.get(st) if anchors else None))
+    if not blocks:
+        return None
+
+    total_rows = n + gap * (len(blocks) - 1) + 1.0
+    pitch = 1.0 / total_rows
+    if anchors is None or not any(a is not None for _s, _c, a in blocks):
+        return None, total_rows
+
+    tops, prev_bottom = [], 1.0 - 0.5 * pitch
+    for _st, count, anchor in blocks:
+        h = count * pitch
+        want = (anchor + h / 2) if anchor is not None else prev_bottom
+        top = min(want, prev_bottom)
+        tops.append(top)
+        prev_bottom = top - h - gap * pitch
+    if prev_bottom < -0.5 * pitch:          # ran off the bottom
+        return None, total_rows
+
+    ys = [0.0] * n
+    for (st, count, _a), top in zip(blocks, tops):
+        for k in range(count):
+            ys[st + k] = top - (k + 0.5) * pitch
+    return ys, total_rows
+
+
+def _respace_checkbuttons(cb, breaks, gap=GROUP_GAP_ROWS, anchors=None):
     """Re-lay-out a CheckButtons so each graph's series sit in their own block.
 
     matplotlib spaces rows uniformly (widgets.py: ``ys = linspace(1, 0, n+2)``),
@@ -523,29 +709,31 @@ def _respace_checkbuttons(cb, breaks, gap=GROUP_GAP_ROWS):
     and the next begin.
 
     There is no public API for row positions, so this moves the label Text
-    artists and BOTH scatter collections -- ``_frames`` (the boxes) and
-    ``_checks`` (the marks).  Hit-testing follows for free: ``_clicked`` resolves
-    a click against ``_frames.get_offsets()`` and the label extents, which are
-    exactly the two things moved here.
+    artists and, depending on the matplotlib generation, either the two scatter
+    collections (3.7+) or the Rectangle/Line2D pairs (3.6).  Hit-testing follows
+    for free in both: the click handler resolves against exactly those artists.
 
-    With ``gap=0`` the formula below reduces to matplotlib's own, so the only
-    thing that ever changes appearance is the deliberate spacing.
-
-    `breaks` is the set of entry indices that START a group.  Private-attribute
-    access is guarded: a matplotlib that renames them costs the spacing, not the
-    panel.
+    `breaks` is the set of entry indices that START a group.  `anchors` optionally
+    maps such an index to the y (axes fraction) its block should centre on.
+    Private-attribute access is guarded: a matplotlib that renames these costs
+    the spacing, not the panel.
     """
     n = len(cb.labels)
     if n == 0 or not breaks:
         return
-    cum, centers = 0.5, []          # 0.5 = half-row margin above the first row
-    for i in range(n):
-        if i in breaks and i > 0:
-            cum += gap
-        centers.append(cum + 0.5)
-        cum += 1.0
-    total = cum + 0.5               # matching half-row margin below the last row
-    ys = [1.0 - c / total for c in centers]
+    laid = _block_layout(n, breaks, gap, anchors)
+    if laid and laid[0] is not None:
+        ys, total = laid
+    else:
+        total = laid[1] if laid else (n + 1.0)
+        cum, centers = 0.5, []      # 0.5 = half-row margin above the first row
+        for i in range(n):
+            if i in breaks and i > 0:
+                cum += gap
+            centers.append(cum + 0.5)
+            cum += 1.0
+        total = cum + 0.5           # matching half-row margin below the last row
+        ys = [1.0 - c / total for c in centers]
 
     for text, y in zip(cb.labels, ys):
         text.set_position((text.get_position()[0], y))
@@ -594,7 +782,8 @@ def _respace_checkbuttons(cb, breaks, gap=GROUP_GAP_ROWS):
             text.set_fontsize(max(5.5, min(text.get_fontsize(), 0.72 * pitch_pt)))
 
 
-def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="series"):
+def check_panel(fig, rect, series, groups, extra=(), on_change=None,
+                title="series", anchors=None):
     """The checkbox panel that doubles as the legend.
 
     Labels are painted in their line's color, so identity is carried without a
@@ -609,11 +798,14 @@ def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="seri
 
     entries = []          # (label, series_or_None, group_or_key)
     breaks = set()        # entry indices that begin a new block, for the spacing
+    block_anchor = {}     # break index -> y (axes fraction) to centre it on
     for gname, master in groups:
         members = [s for s in series if s.group == gname]
         if not members:
             continue
         breaks.add(len(entries))
+        if anchors and gname in anchors:
+            block_anchor[len(entries)] = anchors[gname]
         indent = master and len(members) > 1
         if indent:
             entries.append((master, None, gname))
@@ -683,7 +875,7 @@ def check_panel(fig, rect, series, groups, extra=(), on_change=None, title="seri
         fig.canvas.draw_idle()
 
     cb.on_clicked(on_click)
-    _respace_checkbuttons(cb, breaks)
+    _respace_checkbuttons(cb, breaks, anchors=block_anchor or None)
     # A matplotlib widget whose only reference is a local gets garbage-collected
     # and silently stops responding -- keep it alive on the figure.
     fig._checkbuttons = cb
