@@ -21,6 +21,7 @@ import ulog_alt
 import ulog_cpu
 import ulog_graph
 import ulog_localz
+import ulog_path
 from ulog_common import PlotCtx  # re-exported: callers build one and pass it on
 
 __all__ = ["PlotSpec", "PLOTS", "PlotCtx", "all_topics", "by_key"]
@@ -78,6 +79,17 @@ PLOTS = [
         # Fallback only: build_accel sizes its own figure from the fault-row
         # count and sets fig._page_height to match.
         height=1000,
+    ),
+    PlotSpec(
+        key="path",
+        title="Flight path (3D)",
+        topics=ulog_path.PATH_TOPICS,
+        build=ulog_path.build_path,
+        blurb="the flown track in 3D, coloured by time, with the commanded "
+              "setpoints and the raw GPS fix beside it, in a georeferenced "
+              "frame that survives an EKF handover",
+        # Fallback only: build_path sets fig._page_height.
+        height=860,
     ),
     PlotSpec(
         key="cpu",

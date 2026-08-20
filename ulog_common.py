@@ -927,16 +927,17 @@ class Nav:
         return event.inaxes in self.axes and not self.fig.canvas.widgetlock.locked()
 
     @staticmethod
-    def _zoom_about(ax, which, pixel, scale):
-        """Scale one axis about a pixel position, in DISPLAY space.
+    def _zoomed_limits(ax, which, pixel, scale):
+        """The (lo, hi) one axis WOULD have, zoomed about a pixel position.
 
-        Doing the arithmetic in data coordinates is only correct on a linear
-        axis.  The local-z plot's test-ratio panel is log-scaled, where
-        `yc - (yc - y0) * scale` is meaningless -- it collapses the decade under
-        the cursor and can produce a non-positive limit, which matplotlib then
-        quietly refuses, so the axis appears not to zoom at all.  Converting
-        through transData handles linear, log and symlog identically because the
-        transform already knows the scale.
+        Separate from applying them because the time axis is shared: computing
+        the new window once and assigning it to every panel is not the same as
+        zooming each panel in turn.  Doing the latter compounds, since sharex
+        propagates each panel's set_xlim to all the others before the next one
+        is computed -- a 5-panel figure zoomed 0.87 per panel per notch, i.e.
+        0.87**5 = 0.50, so one notch halved the window on the local-z plot and
+        moved it 13% on the single-axis thermal plot.  Same gesture, different
+        result per figure.
         """
         lo, hi = ax.get_ylim() if which == "y" else ax.get_xlim()
         to, back = ax.transData, ax.transData.inverted()
@@ -948,13 +949,32 @@ class Nav:
         if which == "y":
             a = back.transform((0, n_lo))[1]
             b = back.transform((0, n_hi))[1]
-            if np.isfinite(a) and np.isfinite(b) and a != b:
-                ax.set_ylim(a, b)
         else:
             a = back.transform((n_lo, 0))[0]
             b = back.transform((n_hi, 0))[0]
-            if np.isfinite(a) and np.isfinite(b) and a != b:
-                ax.set_xlim(a, b)
+        if not (np.isfinite(a) and np.isfinite(b)) or a == b:
+            return None
+        return a, b
+
+    @staticmethod
+    def _zoom_about(ax, which, pixel, scale):
+        """Scale one axis about a pixel position, in DISPLAY space.
+
+        Doing the arithmetic in data coordinates is only correct on a linear
+        axis.  The local-z plot's test-ratio panel is log-scaled, where
+        `yc - (yc - y0) * scale` is meaningless -- it collapses the decade under
+        the cursor and can produce a non-positive limit, which matplotlib then
+        quietly refuses, so the axis appears not to zoom at all.  Converting
+        through transData handles linear, log and symlog identically because the
+        transform already knows the scale.
+        """
+        got = Nav._zoomed_limits(ax, which, pixel, scale)
+        if got is None:
+            return
+        if which == "y":
+            ax.set_ylim(*got)
+        else:
+            ax.set_xlim(*got)
 
     def _under(self, event):
         """The axes the pointer is actually inside -- base AND any twin.
@@ -1001,15 +1021,7 @@ class Nav:
         # does nothing.  PlotCanvas therefore reads Qt's modifiers straight off
         # the wheel event and leaves them here; this falls back to event.key for
         # the standalone --classic window, which has no PlotCanvas.
-        key = getattr(event.canvas, "_nav_mods", None)
-        if key is None:
-            key = event.key or ""
-        ctrl = "ctrl" in key or "control" in key
-        shift = "shift" in key
-        if self.page_scroll:
-            do_x, do_y = ctrl and not shift, ctrl and shift
-        else:
-            do_x, do_y = not ctrl, ctrl or shift
+        do_x, do_y = wheel_mods(event, self.page_scroll)
         if not (do_x or do_y):
             return
         # One notch = 15%.  event.step is +1 up / -1 down (fractional on
@@ -1018,11 +1030,16 @@ class Nav:
 
         if do_x and event.x is not None:
             # Zoom about the cursor, not the axis centre, so the sample under the
-            # pointer stays put.  Applied to EVERY axis, because the time axis is
-            # shared and one panel drifting off the others is the one thing this
-            # figure must never do.
-            for a in self.axes:
-                self._zoom_about(a, "x", event.x, scale)
+            # pointer stays put.  Computed ONCE -- on the panel the pointer is
+            # over, so that is the one whose sample stays exactly put -- then
+            # assigned to every axis, because the time axis is shared and one
+            # panel drifting off the others is the one thing this figure must
+            # never do.  See _zoomed_limits for why this is not a loop.
+            ref = (self._under(event) or self.axes)[0]
+            got = self._zoomed_limits(ref, "x", event.x, scale)
+            if got is not None:
+                for a in self.axes:
+                    a.set_xlim(*got)
         if do_y:
             # Value zoom applies ONLY to the panel under the pointer.  Zooming
             # every panel meant the pointer's pixel row was outside all the
@@ -1088,3 +1105,158 @@ def nav_hint(page_scroll):
                 "ctrl+shift+wheel: zoom values  ·  drag: pan  ·  double-click: reset")
     return ("wheel: zoom time  ·  ctrl+wheel: zoom values  ·  "
             "drag: pan  ·  double-click: reset")
+
+
+def wheel_mods(event, page_scroll):
+    """(zoom_time, zoom_values) for one wheel event, per the host's binding table.
+
+    Split out of Nav because the flight-path figure has to decode the SAME
+    gesture and it must not drift from what the time-series plots do.
+
+    matplotlib fills a scroll event's `key` from keyboard state it tracks in its
+    own keyPressEvent, which only arrives when the CANVAS HAS KEYBOARD FOCUS.  In
+    the browser the focus is usually elsewhere, so event.key is None however hard
+    you hold ctrl.  log_browser.PlotCanvas therefore reads Qt's modifiers off the
+    wheel event and leaves them on the canvas; event.key is the fallback for the
+    standalone --classic window, which has no PlotCanvas.
+    """
+    key = getattr(event.canvas, "_nav_mods", None)
+    if key is None:
+        key = event.key or ""
+    ctrl = "ctrl" in key or "control" in key
+    shift = "shift" in key
+    if page_scroll:
+        return ctrl and not shift, ctrl and shift
+    return (not ctrl), (ctrl or shift)
+
+
+class ViewNav:
+    """Mouse navigation for SPATIAL axes -- a map and a 3D view, not a time series.
+
+    Nav is wrong for these in two ways.  It zooms x and y independently, which on
+    a ground track changes the SHAPE of the flight and is the one thing a map
+    must never do; and it has no notion of a 3D axis at all.
+
+      plan_axes  -- equal-aspect 2D maps.  Wheel scales BOTH axes by the same
+                    factor about the cursor, so the aspect is preserved by
+                    construction rather than by matplotlib correcting it after
+                    the fact.  Drag pans, double-click resets.
+
+      view_axes  -- mplot3d axes.  Wheel scales all three limits about their
+                    centres: there is no cursor-anchored zoom that stays
+                    meaningful while the view rotates, because the pixel under
+                    the pointer is not a point in the data at all.  DRAG IS LEFT
+                    ALONE -- that is mplot3d's own rotate, and taking it over
+                    would cost the whole point of a 3D view.
+
+    Deliberately NOT stored as fig._nav: the browser links every fig._nav onto
+    one shared TIME window, and an east axis driven to a time range would empty
+    the plot.
+    """
+
+    def __init__(self, fig, plan_axes=(), view_axes=(), page_scroll=False):
+        self.fig = fig
+        self.plan = list(plan_axes)
+        self.view = list(view_axes)
+        self.page_scroll = page_scroll
+        self.home = [(a, a.get_xlim(), a.get_ylim()) for a in self.plan]
+        self.home3 = [(a, a.get_xlim3d(), a.get_ylim3d(), a.get_zlim3d())
+                      for a in self.view]
+        self._drag = {}
+        for name, fn in (("scroll_event", self._on_scroll),
+                         ("button_press_event", self._on_press),
+                         ("motion_notify_event", self._on_motion),
+                         ("button_release_event", self._on_release)):
+            fig.canvas.mpl_connect(name, fn)
+
+    @staticmethod
+    def _zoom_limits(lo, hi, scale):
+        mid = 0.5 * (lo + hi)
+        half = 0.5 * (hi - lo) * scale
+        return mid - half, mid + half
+
+    def reset(self):
+        for a, xl, yl in self.home:
+            a.set_xlim(xl)
+            a.set_ylim(yl)
+        for a, xl, yl, zl in self.home3:
+            a.set_xlim3d(xl)
+            a.set_ylim3d(yl)
+            a.set_zlim3d(zl)
+        self.fig.canvas.draw_idle()
+
+    def _on_scroll(self, event):
+        if self.fig.canvas.widgetlock.locked():
+            return
+        do_x, do_y = wheel_mods(event, self.page_scroll)
+        if not (do_x or do_y):
+            return
+        scale = 1.15 ** (-event.step)
+        hit = False
+        for a in self.plan:
+            if event.x is None or not a.bbox.contains(event.x, event.y):
+                continue
+            hit = True
+            # Same factor on both axes, anchored on the cursor: the point under
+            # the pointer stays put and the ground track keeps its shape.
+            Nav._zoom_about(a, "x", event.x, scale)
+            Nav._zoom_about(a, "y", event.y, scale)
+        for a in self.view:
+            if event.x is None or not a.bbox.contains(event.x, event.y):
+                continue
+            hit = True
+            a.set_xlim3d(*self._zoom_limits(*a.get_xlim3d(), scale))
+            a.set_ylim3d(*self._zoom_limits(*a.get_ylim3d(), scale))
+            a.set_zlim3d(*self._zoom_limits(*a.get_zlim3d(), scale))
+        if hit:
+            self.fig.canvas.draw_idle()
+
+    def _on_press(self, event):
+        if event.button != 1 or self.fig.canvas.widgetlock.locked():
+            return
+        if event.dblclick and (event.inaxes in self.plan
+                               or event.inaxes in self.view):
+            self._drag.clear()
+            self.reset()
+            return
+        if event.inaxes not in self.plan:
+            return              # a press in the 3D box belongs to mplot3d
+        self._drag = {"at": (event.x, event.y),
+                      "axes": [(event.inaxes, event.inaxes.get_xlim(),
+                                event.inaxes.get_ylim(),
+                                event.inaxes.transData.inverted())]}
+
+    def _on_motion(self, event):
+        if not self._drag or event.x is None:
+            return
+        px, py = self._drag["at"]
+        for a, (x0, x1), (y0, y1), inv in self._drag["axes"]:
+            xa, ya = inv.transform((px, py))
+            xb, yb = inv.transform((event.x, event.y))
+            dx, dy = xa - xb, ya - yb
+            a.set_xlim(x0 + dx, x1 + dx)
+            a.set_ylim(y0 + dy, y1 + dy)
+        self.fig.canvas.draw_idle()
+
+    def _on_release(self, event):
+        self._drag.clear()
+
+
+def add_view_navigation(fig, plan_axes=(), view_axes=(), page_scroll=False):
+    """Wheel to zoom, drag to pan the map / rotate the 3D box, double-click to
+    reset.  See ViewNav for why this is separate from add_mouse_navigation."""
+    nav = ViewNav(fig, plan_axes=plan_axes, view_axes=view_axes,
+                  page_scroll=page_scroll)
+    # Same GC hazard as the checkbuttons -- and note the attribute name: NOT
+    # _nav, which the browser would wire onto the shared time window.
+    fig._view_nav = nav
+    return nav
+
+
+def view_nav_hint(page_scroll):
+    if page_scroll:
+        return ("wheel: scroll page  ·  ctrl+wheel: zoom  ·  "
+                "drag in the 3D box: rotate  ·  drag the map: pan  ·  "
+                "double-click: reset")
+    return ("wheel: zoom  ·  drag in the 3D box: rotate  ·  "
+            "drag the map: pan  ·  double-click: reset")
