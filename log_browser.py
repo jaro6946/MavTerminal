@@ -16,6 +16,8 @@ event loops' worth of dependencies for the same result.
 Acronyms: ULog = PX4's binary log format, HITL = hardware in the loop,
 GUI = graphical user interface, PDF = portable document format.
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -30,7 +32,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from pyulog import ULog
 
 import ulog_plots
-from ulog_common import C_MUTED, C_SURFACE, PlotCtx, duration_min
+from ulog_common import C_BAD, C_MUTED, C_SURFACE, PlotCtx, duration_min
 
 # Where logs are looked for, in order.  Each entry is (label, path, is_hitl_tree).
 # MAV_LOG_DIR is where `log pull` drops downloads, so a log you just pulled shows
@@ -53,6 +55,11 @@ STATE_PATH = os.path.join(
     "mavterminal", "log_browser.json")
 
 PLOT_HEIGHT = 470          # px per stacked plot; ~2 fit on a 1080p screen
+
+# Bumped whenever the library scan learns a new fact.  Cached rows below this
+# version are re-scanned once, rather than sitting blank in a column that did not
+# exist when they were cached.
+SCAN_VERSION = 2
 
 
 # --- state ------------------------------------------------------------------
@@ -195,6 +202,66 @@ class PlotPage(QtWidgets.QScrollArea):
             self._syncing = False
 
 
+# --- how much of the file could not be read -----------------------------------
+
+class MeasuredULog(ULog):
+    """A ULog that also reports HOW MUCH of the file the parser threw away.
+
+    pyulog reports corruption as a single boolean (`file_corruption`), which
+    cannot tell a log that lost one record from one that lost a third of the
+    flight -- and the answer matters, because the first is ignorable and the
+    second invalidates the analysis.
+
+    The recovery path is the measurement.  On a bad record the parser seeks
+    forward for the next SYNC marker (`_find_sync`), and the distance it covers
+    is exactly the span it could not read.  Measured on log_53: 21065 bytes over
+    3 events, which lines up with the 50 ms and 201 ms holes in sensor_combined.
+
+    Counting is gated on `_file_corrupt` because `_find_sync` is ALSO how pyulog
+    skips a message type it simply does not know -- a newer firmware adding a
+    record type is not corruption, and both clean logs in the library report
+    exactly 0 with this guard in place.  A file that corrupts early and then
+    meets an unknown type can over-count; that errs toward flagging, which is the
+    right way to be wrong here.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.corrupt_bytes = 0
+        self.corrupt_events = 0
+        super().__init__(*args, **kwargs)
+
+    def _find_sync(self, last_n_bytes=-1):
+        fh = self._file_handle
+        start = fh.tell()
+        # last_n_bytes != -1 means "search backwards into the payload we just
+        # read", so the span begins before the current position.
+        base = start - last_n_bytes if last_n_bytes != -1 else start
+        was_corrupt = self._file_corrupt
+        result = super()._find_sync(last_n_bytes)
+        skipped = fh.tell() - base
+        if was_corrupt and skipped > 0:
+            self.corrupt_bytes += skipped
+            self.corrupt_events += 1
+        return result
+
+
+def corruption_of(ulog, path):
+    """{corrupt_bytes, corrupt_events, corrupt_pct} for a parsed log."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    nbytes = getattr(ulog, "corrupt_bytes", 0)
+    if not nbytes and getattr(ulog, "file_corruption", False):
+        # Flagged but nothing measured: a plain ULog, or corruption found on a
+        # path that does not resync.  Report it as unknown-size rather than as
+        # clean -- "0.0%" would be a claim we cannot support.
+        return {"corrupt_bytes": -1, "corrupt_events": -1, "corrupt_pct": -1.0}
+    return {"corrupt_bytes": nbytes,
+            "corrupt_events": getattr(ulog, "corrupt_events", 0),
+            "corrupt_pct": (100.0 * nbytes / size) if size else 0.0}
+
+
 # --- when did this flight happen --------------------------------------------
 # The file's mtime answers "when was this file last written", which for a log
 # pulled off an SD card is the DOWNLOAD time, not the flight.  Measured on
@@ -256,24 +323,31 @@ def _start_from_parsed(ulog):
     return None
 
 
-def log_start_from_gps(path):
-    """_start_from_parsed, for a file we have not already read."""
-    return _start_from_parsed(ULog(path, message_name_filter_list=GPS_TOPICS))
+def scan_log(path):
+    """Everything the library columns need that requires reading the file.
+
+    One parse, because pyulog walks the whole file whatever you filter -- asking
+    separately for the date and for the corruption measurement would double a
+    23 s library scan for no gain."""
+    ulog = MeasuredULog(path, message_name_filter_list=GPS_TOPICS)
+    facts = corruption_of(ulog, path)
+    facts["started"] = _start_from_parsed(ulog) or 0.0
+    facts["date_src"] = "gps" if facts["started"] else "none"
+    return facts
 
 
-class DateScanner(QtCore.QObject):
-    """Fills in GNSS-derived log dates in the background, one log at a time.
+class LibraryScanner(QtCore.QObject):
+    """Fills in the columns that need the file read, one log at a time.
 
-    A GPS-only parse is 0.7-1.8 s on this project's logs, because pyulog walks
-    the whole file whatever you filter -- so 40 logs is around a minute.  Doing
-    that at startup would mean an empty window for a minute to populate one
-    column, so rows open with the name/mtime fallback and are corrected here as
-    the answers arrive.
+    A parse is 0.7-1.8 s on this project's logs, because pyulog walks the whole
+    file whatever you filter -- so 45 logs is around 25 s.  Doing that at startup
+    would mean an empty window while one column populates, so rows open with the
+    name/mtime fallback and are corrected here as the answers arrive.
 
     Yields to the foreground parse: the user waiting on a plot they asked for
     outranks a column filling itself in.
     """
-    found = QtCore.pyqtSignal(str, float, str)
+    found = QtCore.pyqtSignal(str, object)      # path, facts dict
     finished = QtCore.pyqtSignal()
 
     def __init__(self, paths, busy):
@@ -293,15 +367,16 @@ class DateScanner(QtCore.QObject):
             if self._stop:
                 break
             try:
-                started = log_start_from_gps(path)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    facts = scan_log(path)
             except Exception:
-                started = None      # unreadable or truncated: leave the fallback
-            if started:
-                self.found.emit(path, started, "gps")
-            elif not self._stop:
-                # Record the miss too, so the next session does not re-parse a
-                # log that simply has no GNSS in it (every HITL log).
-                self.found.emit(path, 0.0, "none")
+                # Unreadable or truncated past recovery.  Recorded anyway, so the
+                # next session does not re-parse it, and shown as unknown rather
+                # than as clean.
+                facts = {"started": 0.0, "date_src": "none",
+                         "corrupt_bytes": -1, "corrupt_events": -1,
+                         "corrupt_pct": -1.0}
+            self.found.emit(path, facts)
         self.finished.emit()
 
 
@@ -326,7 +401,7 @@ class ParseWorker(QtCore.QObject):
     def run(self):
         try:
             t0 = time.time()
-            ulog = ULog(self.path, message_name_filter_list=self.topics)
+            ulog = MeasuredULog(self.path, message_name_filter_list=self.topics)
             self.done.emit(ulog, self.path, time.time() - t0)
         except Exception as e:
             self.failed.emit(self.path, f"{type(e).__name__}: {e}")
@@ -377,14 +452,15 @@ class Browser(QtWidgets.QMainWindow):
         lv.addLayout(row)
 
         self.tree = QtWidgets.QTreeWidget()
-        self.tree.setHeaderLabels(["log", "duration", "size", "date", "time"])
+        self.tree.setHeaderLabels(["log", "duration", "size", "date", "time",
+                                   "corrupt"])
         # The name column absorbs the slack and the rest size to their contents;
         # fixed widths truncated the "duration"/"size" headers at the default
         # pane width, and a horizontal scrollbar to read a 6-character column is
         # not a trade worth making.
         header = self.tree.header()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        for col in (1, 2, 3, 4):
+        for col in (1, 2, 3, 4, 5):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
         self.tree.setTextElideMode(QtCore.Qt.ElideMiddle)
         self.tree.setAlternatingRowColors(True)
@@ -551,12 +627,12 @@ class Browser(QtWidgets.QMainWindow):
 
         if current:
             self._select_path(current)
-        self._start_date_scan()
+        self._start_library_scan()
 
     # -- log dates, filled in behind the library
-    def _start_date_scan(self):
-        """(Re)start the background GNSS-date scan over rows still guessing."""
-        self._stop_date_scan()
+    def _start_library_scan(self):
+        """(Re)start the background scan over rows we have not read yet."""
+        self._stop_library_scan()
         todo = []
         for it in self._iter_items():
             path = it.data(0, QtCore.Qt.UserRole)
@@ -565,19 +641,21 @@ class Browser(QtWidgets.QMainWindow):
             except OSError:
                 continue
             rec = self._cached_record(path, st) or {}
-            if "started" not in rec:        # 0.0 counts as answered: no GNSS
+            # Version-stamped, so adding a column re-scans once instead of
+            # leaving old rows permanently blank in the new column.
+            if rec.get("scan_v") != SCAN_VERSION:
                 todo.append(path)
         if not todo:
             return
         self._scan_thread = QtCore.QThread(self)
-        self._scanner = DateScanner(todo, lambda: self._thread is not None)
+        self._scanner = LibraryScanner(todo, lambda: self._thread is not None)
         self._scanner.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scanner.run)
-        self._scanner.found.connect(self._on_log_date)
-        self._scanner.finished.connect(self._stop_date_scan)
+        self._scanner.found.connect(self._on_scanned)
+        self._scanner.finished.connect(self._stop_library_scan)
         self._scan_thread.start()
 
-    def _stop_date_scan(self):
+    def _stop_library_scan(self):
         if self._scanner is not None:
             self._scanner.stop()
         if self._scan_thread is not None:
@@ -586,17 +664,17 @@ class Browser(QtWidgets.QMainWindow):
         self._scan_thread = None
         self._scanner = None
 
-    @QtCore.pyqtSlot(str, float, str)
-    def _on_log_date(self, path, started, source):
+    @QtCore.pyqtSlot(str, object)
+    def _on_scanned(self, path, facts):
         try:
-            self._update_record(path, started=started, date_src=source)
+            self._update_record(path, scan_v=SCAN_VERSION, **facts)
         except OSError:
             return                  # the file went away mid-scan
-        if not started:
-            return                  # no GNSS in it: the row keeps its fallback
         for it in self._iter_items():
             if it.data(0, QtCore.Qt.UserRole) == path:
-                self._set_date_cells(it, started, source)
+                st = os.stat(path)
+                self._set_date_cells(it, *self._log_date(path, st))
+                self._set_corrupt_cell(it, self._cached_record(path, st) or {})
 
     def _scan(self, root, is_tree):
         """(display name, path) for the .ulg files under `root`.
@@ -639,9 +717,10 @@ class Browser(QtWidgets.QMainWindow):
             name,
             f"{mins:.1f} min" if mins is not None else "—",
             _fmt_size(st.st_size),
-            "", "",
+            "", "", "",
         ])
         self._set_date_cells(item, *self._log_date(path, st))
+        self._set_corrupt_cell(item, self._cached_record(path, st) or {})
         item.setData(0, QtCore.Qt.UserRole, path)
         item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
         item.setCheckState(0, QtCore.Qt.Checked
@@ -676,6 +755,38 @@ class Browser(QtWidgets.QMainWindow):
             else:
                 item.setData(col, QtCore.Qt.ForegroundRole, None)
             item.setToolTip(col, note)
+
+    def _set_corrupt_cell(self, item, rec):
+        """Column 5: how much of the file the parser could not read.
+
+        A percentage rather than a flag because the two failures it covers are
+        not the same problem: 0.01% is three bad records in a 47-minute flight
+        and changes nothing, while a percent or more means whole seconds are
+        missing and any conclusion drawn across that gap is guesswork.  Real
+        measured values on this library are 0.0131% and 0.0174%.
+        """
+        if rec.get("scan_v") != SCAN_VERSION:
+            item.setText(5, "")
+            item.setToolTip(5, "not read yet")
+            return
+        pct = rec.get("corrupt_pct", 0.0)
+        nbytes = rec.get("corrupt_bytes", 0)
+        if pct < 0:
+            text, note = "?", ("flagged corrupt by pyulog, but the damaged span "
+                               "could not be measured")
+        elif nbytes <= 0:
+            text, note = "ok", "parsed clean end to end"
+        else:
+            # Never round a corrupt file down to 0.00%: the whole point of the
+            # column is that it is not clean.
+            text = f"{pct:.3g}%" if pct >= 0.001 else "<0.001%"
+            note = (f"{nbytes} bytes unreadable across "
+                    f"{rec.get('corrupt_events', 0)} recovery point(s) -- the "
+                    f"parser resynced and continued, so the rest of the log is "
+                    f"good")
+        item.setText(5, text)
+        item.setToolTip(5, note)
+        item.setForeground(5, QtGui.QColor(C_BAD if (pct > 0 or pct < 0) else C_MUTED))
 
     def _iter_items(self):
         for i in range(self.tree.topLevelItemCount()):
@@ -744,15 +855,19 @@ class Browser(QtWidgets.QMainWindow):
         # The date comes free here: this parse already asked for the GPS topics
         # (the altitude plot needs them), so re-reading the file in the scanner
         # for a log the user just opened would be pure waste.
-        started, src = _start_from_parsed(ulog), "gps"
-        if started is None:
-            started, src = 0.0, "none"
-        self._update_record(path, started=started, date_src=src)
+        started = _start_from_parsed(ulog) or 0.0
+        facts = corruption_of(ulog, path)
+        facts.update(started=started, date_src="gps" if started else "none",
+                     scan_v=SCAN_VERSION)
+        self._update_record(path, **facts)
+        if facts["corrupt_bytes"]:
+            self._log(f"  !! {facts['corrupt_bytes']} bytes unreadable "
+                      f"({facts['corrupt_pct']:.3g}% of the file)")
         for it in self._iter_items():
             if it.data(0, QtCore.Qt.UserRole) == path:
                 it.setText(1, f"{mins:.1f} min")
-                if started:
-                    self._set_date_cells(it, started, src)
+                self._set_date_cells(it, *self._log_date(path, os.stat(path)))
+                self._set_corrupt_cell(it, self._cached_record(path, os.stat(path)) or {})
 
         self.page.clear()
         self.jump.clear()
@@ -775,7 +890,11 @@ class Browser(QtWidgets.QMainWindow):
             if fig is None:
                 self._log(f"  {spec.title}: nothing plottable in this log")
                 continue
-            self.page.add(spec.key, fig, spec.height)
+            # A builder whose figure height depends on the log (the accel
+            # plot's fault band is sized to its row count) states the pixels it
+            # wants; spec.height is the fallback for the fixed-layout plots.
+            self.page.add(spec.key, fig,
+                          getattr(fig, "_page_height", spec.height))
             self.jump.addItem(spec.title, spec.key)
         self.page.finish()
 
@@ -945,7 +1064,7 @@ class Browser(QtWidgets.QMainWindow):
                 f"the reason.")
 
     def closeEvent(self, event):
-        self._stop_date_scan()
+        self._stop_library_scan()
         self._teardown_thread()
         if self._proc is not None:
             self._proc.kill()

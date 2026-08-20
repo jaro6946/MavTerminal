@@ -42,7 +42,6 @@ Acronyms: EKF = extended Kalman filter, IMU = inertial measurement unit,
 TC = thermal compensation.
 """
 import os
-import textwrap
 
 import numpy as np
 
@@ -78,6 +77,29 @@ AXIS_NAME = {0: "x", 1: "y", 2: "z"}
 # changes them, the reproduction in panel 2 silently stops matching the firmware.
 PREFLIGHT_LIMIT_FRAC = 0.75
 PREFLIGHT_SIGMA = 3.0
+
+# --- layout, in inches ------------------------------------------------------
+# The four trace panels have fixed heights; the fault band does NOT, because its
+# height is content.  A log with two flags and a log with fifteen are the same
+# figure with the same fraction reserved, and at fifteen the rows are 0.1 inch
+# apart with 7 pt labels sitting on top of each other.  The band is therefore
+# sized per row and the FIGURE grows to fit it, which also keeps every trace
+# panel exactly as tall as it was regardless of how eventful the log is.
+PANEL_IN = [("acc", 2.05), ("bias", 1.95), ("corr", 1.75), ("cons", 1.75)]
+GAP_IN = 0.30          # between panels; enough for the shared tick marks
+TOP_IN = 0.95          # title + subtitle + instance key
+BOTTOM_IN = 1.10       # band's x label + nav hint + margins
+BAND_ROW_IN = 0.52     # per fault row; a 3-lane row needs 3 readable bars AND
+                       # a title, so this is ~4x the label's own height
+BAND_PAD_IN = 0.30
+BAND_MIN_IN = 1.25     # a log with one row still needs a readable axis
+BAND_MAX_IN = 9.00     # past this the band would push the traces off a screen
+# Pixels per inch the browser's scroll page is asked for.  The figure's height
+# now depends on the log, so a fixed PlotSpec.height would squeeze an eventful
+# log's five panels into the same strip as a quiet one's -- exactly the
+# compression this layout exists to remove.  Below print dpi on purpose: this is
+# a page you scroll, not one you read at 1:1.
+PAGE_PX_PER_IN = 78
 
 # Minimum drawn width of a band event, as a fraction of the log duration.  An
 # accel_healthy dropout in a real log lasts ONE sample; at true width that is a
@@ -407,136 +429,153 @@ def _counter_spans(t, counter, hold):
 
 
 def _fault_rows(ulog, ctx, instances, spans, dev_map, hold):
-    """([(label, spans, color)], [labels that were checked and never fired]).
+    """([(label, lanes, label_colour)], n_clean) -- the accelerometer checklist.
 
-    Everything red is a fault.  Instance-coloured rows are context (armed, bias
-    validity) -- the reader should be able to scan for red and stop there.
+    Every condition this function knows how to check gets a row WHETHER OR NOT it
+    fired, and every row carries one lane per EKF instance whether or not that
+    instance fired.  The earlier version emitted a row only on a hit, which made
+    the panel's shape depend on the log: a reader seeing "EKF 1 UNHEALTHY" and
+    "EKF 2 UNHEALTHY" could not tell whether instance 0 was healthy or simply not
+    checked, and the answer lived in a flat list under the figure.  A fault panel
+    that reads "nothing here" must mean it.
 
-    Conditions that never fired are NOT given an empty row: 15 blank rows is a
-    worse answer than a one-line list, and the list is returned so the caller can
-    print what was checked.  A fault plot that shows nothing must still say what
-    it looked for, or "nothing here" is unreadable as either clean or broken.
+    Lanes are ordered by instance, so instance 0 is the top lane of every row and
+    the panel reads across; their colour is the same instance hue as the shading.
     """
-    rows, clean = [], []
+    rows = []
+    n_clean = 0
 
-    def add(label, sp, color):
-        (rows if sp else clean).append((label, sp, color) if sp else label)
+    def lanes_for(fn):
+        """[(spans, colour)] over every instance, empty lanes included."""
+        return [(fn(i) or [], inst_color(i)) for i in instances]
+
+    def add(label, lanes, fault=True):
+        nonlocal n_clean
+        if not any(sp for sp, _c in lanes):
+            n_clean += 1
+        rows.append((label, lanes, C_BAD if fault else C_MUTED))
 
     a = armed_spans(ulog)
-    if a:
-        rows.append(("armed", a, C_ARMED))
+    rows.append(("armed", [(a, C_ARMED)], C_MUTED))
 
     # -- the arming check, reproduced, and then narrowed to when it mattered ---
-    blocking = []
+    fails, blocking = {}, []
     for i in instances:
         t, fail = preflight_bias_fail(ulog, i)
         if t.size == 0:
+            fails[i] = []
             continue
         any_fail = fail.any(axis=1)
-        if any_fail.any():
-            axes = "".join(AXIS_NAME[j] for j in range(3) if fail[:, j].any())
-            rows.append((f"EKF {i} bias > arming limit ({axes})",
-                         spans_from_bool(t, any_fail), C_BAD))
-            # Only the primary instance is tested by commander, so the same
-            # excursion is either an arming refusal or a latent one depending on
-            # the shading.  Intersecting here is what makes that legible.
-            prim = np.zeros(t.size, dtype=bool)
-            for t0, t1, who in spans:
-                if who == i:
-                    prim |= (t >= t0) & (t < t1)
-            blocking += spans_from_bool(t, any_fail & prim)
-        else:
-            clean.append(f"EKF {i} bias > arming limit")
-    if blocking:
-        rows.append(("PREFLIGHT FAIL: high accel bias (primary)", blocking, C_BAD))
-    elif instances:
-        clean.append("preflight high-accel-bias failure (on the primary)")
+        fails[i] = spans_from_bool(t, any_fail)
+        # Only the primary instance is tested by commander, so the same
+        # excursion is either an arming refusal or a latent one depending on
+        # the shading.  Intersecting here is what makes that legible.
+        prim = np.zeros(t.size, dtype=bool)
+        for t0, t1, who in spans:
+            if who == i:
+                prim |= (t >= t0) & (t < t1)
+        blocking += spans_from_bool(t, any_fail & prim)
+    add("PREFLIGHT FAIL: high accel bias (primary)", [(blocking, C_BAD)])
+    add("bias over arming limit", lanes_for(fails.get))
 
     # -- the EKF's own accelerometer fault flags ------------------------------
-    for i in instances:
-        fl = _get(ulog, "estimator_status_flags", i)
-        if fl is None:
-            continue
-        t = _time_min(ulog, fl)
-        for key, name in (("fs_bad_acc_bias", "bad accel bias"),
-                          ("fs_bad_acc_clipping", "accel clipping"),
-                          ("fs_bad_acc_vertical", "bad accel vertical")):
-            if key not in fl.data:
-                continue
+    def _flag(key):
+        def get(i):
+            fl = _get(ulog, "estimator_status_flags", i)
+            if fl is None or key not in fl.data:
+                return []
             v = np.asarray(fl.data[key], dtype=float) > 0.5
-            add(f"EKF {i} {name}", spans_from_bool(t, v) if v.any() else [], C_BAD)
+            return spans_from_bool(_time_min(ulog, fl), v)
+        return get
 
-    # -- the selector's view --------------------------------------------------
+    for key, label in (("fs_bad_acc_bias", "EKF fault: bad accel bias"),
+                       ("fs_bad_acc_clipping", "EKF fault: accel clipping"),
+                       ("fs_bad_acc_vertical", "EKF fault: bad accel vertical")):
+        add(label, lanes_for(_flag(key)))
+
+    # -- the selector's view (one instance-independent flag) ------------------
     d = _get(ulog, "estimator_selector_status")
-    if d is not None:
-        t = _time_min(ulog, d)
-        if "accel_fault_detected" in d.data:
-            v = np.asarray(d.data["accel_fault_detected"], dtype=float) > 0.5
-            add("selector: accel FAULT", spans_from_bool(t, v) if v.any() else [],
-                C_BAD)
+    if d is not None and "accel_fault_detected" in d.data:
+        v = np.asarray(d.data["accel_fault_detected"], dtype=float) > 0.5
+        add("selector: accel FAULT", [(spans_from_bool(_time_min(ulog, d), v), C_BAD)])
     else:
         ctx.note("no estimator_selector_status -- no instance shading, and the "
                  "selector's own accel fault flag is unavailable")
 
-    # -- sensor health and clipping ------------------------------------------
-    d = _get(ulog, "sensors_status_imu")
-    if d is not None:
-        t = _time_min(ulog, d)
+    # -- sensor health, by device rather than by slot index -------------------
+    def _healthy(i):
+        d = _get(ulog, "sensors_status_imu")
+        if d is None:
+            return []
         for k in range(4):
             key = f"accel_healthy[{k}]"
             if key not in d.data:
                 continue
             ids = np.asarray(d.data.get(f"accel_device_ids[{k}]", [0]), dtype=np.int64)
             ids = ids[ids != 0]
-            if not ids.size:
+            if not ids.size or dev_map.get(int(ids[0])) != i:
                 continue
-            _c, inst = _color_for_device(dev_map, int(ids[0]))
-            tag = f"EKF {inst}" if inst is not None else f"IMU slot {k}"
             bad = ~(np.asarray(d.data[key], dtype=float) > 0.5)
-            add(f"{tag} accel UNHEALTHY", spans_from_bool(t, bad) if bad.any() else [],
-                C_BAD)
+            return spans_from_bool(_time_min(ulog, d), bad)
+        return []
 
-    for m in _imu_multi_ids(ulog, "vehicle_imu_status"):
-        d = _get(ulog, "vehicle_imu_status", m)
-        if d is None:
-            continue
-        t = _time_min(ulog, d)
-        dev = int(np.asarray(d.data.get("accel_device_id", [0]))[0])
-        _c, inst = _color_for_device(dev_map, dev)
-        tag = f"EKF {inst}" if inst is not None else f"IMU {m}"
-        clip = np.zeros(t.size)
-        for j in range(3):
-            key = f"accel_clipping[{j}]"
-            if key in d.data:
-                clip = clip + np.asarray(d.data[key], dtype=float)
-        add(f"{tag} accel clipping", _counter_spans(t, clip, hold), C_BAD)
-        if "accel_error_count" in d.data:
-            add(f"{tag} driver errors",
-                _counter_spans(t, d.data["accel_error_count"], hold), C_BAD)
+    add("accel UNHEALTHY", lanes_for(_healthy))
 
-    # -- context rows: is the bias estimate even usable, and is it being kept --
-    for i in instances:
-        d = _get(ulog, "estimator_sensor_bias", i)
-        if d is None:
-            continue
-        t = _time_min(ulog, d)
-        if "accel_bias_valid" in d.data:
-            v = np.asarray(d.data["accel_bias_valid"], dtype=float) > 0.5
-            # Drawn as the NEGATIVE, in red: "the arming check was not run on
-            # this instance" is a fault-adjacent fact, and a solid green-ish bar
-            # covering the whole flight to say "valid" carries no information.
-            add(f"EKF {i} bias NOT valid (check skipped)",
-                spans_from_bool(t, ~v) if (~v).any() else [], C_BAD)
-        if "accel_bias_stable" in d.data:
-            v = np.asarray(d.data["accel_bias_stable"], dtype=float) > 0.5
-            # Not a fault -- but this is the flag that lets VehicleIMU write the
-            # learned bias into the calibration parameters at disarm
-            # (VehicleIMU.cpp:866), so a bad bias that is "stable" is the one
-            # that survives a reboot.
-            add(f"EKF {i} bias stable (learned -> CAL_ACC)",
-                spans_from_bool(t, v) if v.any() else [], inst_color(i))
+    # -- driver counters ------------------------------------------------------
+    # Named "driver:" to keep them apart from the EKF's own clipping FAULT above.
+    # They were both "EKF i accel clipping" before, so one label could appear as
+    # both fired and not-fired in the same figure -- they are different facts
+    # from different modules and now say so.
+    def _counter(field, combine3=False):
+        def get(i):
+            for m in _imu_multi_ids(ulog, "vehicle_imu_status"):
+                d = _get(ulog, "vehicle_imu_status", m)
+                if d is None:
+                    continue
+                dev = int(np.asarray(d.data.get("accel_device_id", [0]))[0])
+                if dev_map.get(dev) != i:
+                    continue
+                t = _time_min(ulog, d)
+                if combine3:
+                    c = np.zeros(t.size)
+                    for j in range(3):
+                        key = f"{field}[{j}]"
+                        if key in d.data:
+                            c = c + np.asarray(d.data[key], dtype=float)
+                elif field in d.data:
+                    c = np.asarray(d.data[field], dtype=float)
+                else:
+                    return []
+                return _counter_spans(t, c, hold)
+            return []
+        return get
 
-    return rows, clean
+    add("driver: clip events", lanes_for(_counter("accel_clipping", combine3=True)))
+    add("driver: errors (bad transfer / FIFO)",
+        lanes_for(_counter("accel_error_count")))
+
+    # -- context rows: is the bias estimate usable, and is it being kept -------
+    def _bias_flag(key, invert):
+        def get(i):
+            d = _get(ulog, "estimator_sensor_bias", i)
+            if d is None or key not in d.data:
+                return []
+            v = np.asarray(d.data[key], dtype=float) > 0.5
+            return spans_from_bool(_time_min(ulog, d), ~v if invert else v)
+        return get
+
+    # The NEGATIVE, because "the arming check was not run on this instance" is
+    # the fault-adjacent fact; a bar covering the whole flight to say "valid"
+    # carries no information.
+    add("bias NOT valid (arming check skipped)",
+        lanes_for(_bias_flag("accel_bias_valid", True)))
+    # Not a fault -- but this is the flag that lets VehicleIMU write the learned
+    # bias into the calibration parameters at disarm (VehicleIMU.cpp:866), so a
+    # bad bias that is "stable" is the one that survives a reboot.
+    add("bias stable -> learned into CAL_ACC",
+        lanes_for(_bias_flag("accel_bias_stable", False)), fault=False)
+
+    return rows, n_clean
 
 
 def _calibration_changes(ulog):
@@ -619,23 +658,48 @@ def build_accel(ulog, ctx=None, path=""):
                  f"claims (drawn grey) -- check EKF2_MULTI_IMU")
 
     # --- figure -------------------------------------------------------------
-    fig = plt.figure(figsize=(15, 12.5), facecolor=C_SURFACE)
+    # The fault rows are needed before the figure exists, because they decide how
+    # tall it is.  _fault_rows touches no axes, so this is only a reordering.
+    rows, n_clean = _fault_rows(ulog, ctx, instances, spans, dev_map, hold)
+
+    band_in = min(max(len(rows) * BAND_ROW_IN + BAND_PAD_IN, BAND_MIN_IN),
+                  BAND_MAX_IN)
+    fig_h = (TOP_IN + sum(h for _k, h in PANEL_IN) + GAP_IN * len(PANEL_IN)
+             + band_in + BOTTOM_IN)
+    if len(rows) * BAND_ROW_IN + BAND_PAD_IN > BAND_MAX_IN:
+        ctx.note(f"{len(rows)} fault rows do not fit the band at full spacing -- "
+                 f"it is capped at {BAND_MAX_IN:g} in and the rows are tighter "
+                 f"than the rest of the figure")
+
+    fig = plt.figure(figsize=(15, fig_h), facecolor=C_SURFACE)
     if fig.canvas.manager is not None:
         fig.canvas.manager.set_window_title(
             f"logGraph accelerometer - {os.path.basename(path)}")
 
     # Panel 1 carries the raw measurement and panel 2 the argument, so those two
     # get the room; the correction and consistency panels are supporting, and the
-    # band is categorical.  The gap between the checkbox panel's right edge and
+    # band is sized above.  The gap between the checkbox panel's right edge and
     # `left` has to hold both the tick labels and the axis label.
+    #
+    # Stacked bottom-up in inches and converted at the end: with a figure whose
+    # height depends on the content, hand-written fractions would have to be
+    # re-derived every time a panel changed, and silently overlap when they were
+    # not.
     left, width = 0.260, 0.655
-    rects = [(0.780, 0.160),    # accel
-             (0.600, 0.150),    # bias
-             (0.435, 0.135),    # thermal correction
-             (0.270, 0.135),    # consistency / vibration
-             (0.110, 0.130)]    # band
+
+    def _f(inches):
+        return inches / fig_h
+
+    rects, bottom = {}, BOTTOM_IN
+    rects["band"] = (_f(bottom), _f(band_in))
+    bottom += band_in + GAP_IN
+    for key, h in reversed(PANEL_IN):
+        rects[key] = (_f(bottom), _f(h))
+        bottom += h + GAP_IN
+
     ax_acc, ax_bias, ax_corr, ax_cons, ax_band = [
-        fig.add_axes([left, b, width, h], facecolor=C_SURFACE) for b, h in rects]
+        fig.add_axes([left, rects[k][0], width, rects[k][1]], facecolor=C_SURFACE)
+        for k in ("acc", "bias", "corr", "cons", "band")]
     for a in (ax_acc, ax_bias, ax_corr, ax_cons):
         a.sharex(ax_band)
     ax_temp = ax_corr.twinx()
@@ -664,10 +728,9 @@ def build_accel(ulog, ctx=None, path=""):
     ax_bias.axhline(0.0, color=C_MUTED, lw=1.0, ls=":", alpha=0.6, zorder=1)
     ax_corr.axhline(0.0, color=C_MUTED, lw=1.0, ls=":", alpha=0.6, zorder=1)
 
-    rows, clean = _fault_rows(ulog, ctx, instances, spans, dev_map, hold)
     draw_band_rows(ax_band, rows, ylabel="accel faults",
                    empty_msg="no accelerometer flags in this log",
-                   min_width=hold)
+                   min_width=hold, track=True)
 
     for s in series:
         (line,) = axis_of[s.group].plot(
@@ -704,7 +767,8 @@ def build_accel(ulog, ctx=None, path=""):
     for a in (ax_temp, ax_vib):
         _style_axis(a, C_MUTED)
 
-    fig.text(left, 0.965, "Accelerometer and calibration faults by EKF instance",
+    y_title = 1.0 - _f(0.35)
+    fig.text(left, y_title, "Accelerometer and calibration faults by EKF instance",
              color=C_INK, fontsize=13, fontweight="bold", ha="left")
     who = f"{os.path.basename(path)}   |   " if path else ""
     if spans:
@@ -713,9 +777,9 @@ def build_accel(ulog, ctx=None, path=""):
                       f"{max(len(spans) - 1, 0)} handover(s)")
     else:
         shade_note = "no selector topic -- single EKF, no shading"
-    fig.text(left, 0.943, f"{who}{dur:.1f} min   |   {shade_note}",
+    fig.text(left, 1.0 - _f(0.62), f"{who}{dur:.1f} min   |   {shade_note}",
              color=C_MUTED, fontsize=9, ha="left")
-    instance_key(fig, left, width, spans, y=0.963)
+    instance_key(fig, left, width, spans, y=y_title - _f(0.02))
 
     # The at-rest calibration read, on the panel it belongs to.  Text rather than
     # a note, because it is a per-IMU number the reader wants next to the traces
@@ -747,17 +811,10 @@ def build_accel(ulog, ctx=None, path=""):
 
     # A band panel with three bars on it does not say what it looked for and did
     # not find, and "no red" has to be readable as a RESULT, not as an omission.
-    if clean:
-        # Wrapped and anchored to the FIGURE, not the band axes: as one axes-
-        # relative line it runs off the left edge of the page and the first
-        # entries are simply lost, which is the opposite of what this line is
-        # for.
-        body = textwrap.fill("checked, never fired:  " + ",  ".join(clean),
-                             width=170)
-        fig.text(left, 0.072, body, color=C_MUTED, fontsize=6.5, ha="left",
-                 va="top", linespacing=1.5)
-        ctx.note(f"{len(clean)} accelerometer fault condition(s) checked and "
-                 f"never triggered")
+    if n_clean:
+        ctx.note(f"{n_clean} of the {len(rows) - 1} accelerometer conditions "
+                 f"never fired on any instance -- they are drawn as empty rows, "
+                 f"not omitted")
     if hold:
         ctx.note(f"band events are drawn at least {hold * 60:.1f} s wide so "
                  f"single-sample faults stay visible -- read their width as "
@@ -809,8 +866,10 @@ def build_accel(ulog, ctx=None, path=""):
     if armed_art:
         extra.append(("armed (shaded)", armed_art, False))
 
-    h = min(0.86, 0.0185 * (len(series) + 8) + 0.05)
-    check_panel(fig, [0.012, 0.90 - h, 0.155, h], series,
+    cb_top = rects["acc"][0] + rects["acc"][1]
+    cb_bot = rects["band"][0]
+    h = min(cb_top - cb_bot, _f(0.24) * (len(series) + 8) + _f(0.6))
+    check_panel(fig, [0.012, cb_top - h, 0.155, h], series,
                 [("acc", "ALL accelerometer"), ("bias", "ALL bias"),
                  ("corr", "ALL thermal offset"), ("temp", "ALL temperature"),
                  ("cons", "ALL inconsistency"), ("vib", "ALL vibration")],
@@ -818,6 +877,7 @@ def build_accel(ulog, ctx=None, path=""):
     refresh()
     add_mouse_navigation(fig, [ax_acc, ax_bias, ax_corr, ax_temp, ax_cons,
                                ax_vib, ax_band], page_scroll=ctx.page_scroll)
-    fig.text(left, 0.022, nav_hint(ctx.page_scroll), color=C_MUTED, fontsize=8,
-             ha="left")
+    fig.text(left, _f(0.28), nav_hint(ctx.page_scroll), color=C_MUTED,
+             fontsize=8, ha="left")
+    fig._page_height = int(round(fig_h * PAGE_PX_PER_IN))
     return fig

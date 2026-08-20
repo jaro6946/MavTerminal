@@ -74,7 +74,9 @@ PLOTS = [
         blurb="per-IMU accelerometer, the EKF's bias estimate against the exact "
               "preflight arming threshold, the thermal-compensation offset, and "
               "every accel fault flag -- shaded by primary EKF instance",
-        height=980,
+        # Fallback only: build_accel sizes its own figure from the fault-row
+        # count and sets fig._page_height to match.
+        height=1000,
     ),
 ]
 

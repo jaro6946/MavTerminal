@@ -400,8 +400,27 @@ def spans_from_bool(t, ok):
     return out
 
 
-def draw_band_rows(ax, rows, ylabel="", empty_msg="nothing to show", min_width=0.0):
-    """Render [(label, spans, color)] as stacked filled bars, top row first.
+def _row_lanes(row):
+    """Normalise a row to (label, [(spans, color), ...], label_color).
+
+    Two forms are accepted because two kinds of row exist.  `(label, spans,
+    color)` is one bar per row -- what the altitude and local-z plots want, where
+    the row IS the fact.  `(label, [(spans, color), ...], label_color)` splits a
+    row into parallel lanes, which is what a per-instance condition needs: the
+    row is the condition and each lane is one EKF, so a lane with nothing in it
+    says "checked, this instance was clean" instead of vanishing.
+    """
+    label, data, color = row
+    lanes_form = bool(data) and isinstance(data[0], (list, tuple)) and \
+        len(data[0]) == 2 and isinstance(data[0][0], (list, tuple))
+    if lanes_form:
+        return label, [(list(sp), c) for sp, c in data], color
+    return label, [(list(data), color)], None
+
+
+def draw_band_rows(ax, rows, ylabel="", empty_msg="nothing to show",
+                   min_width=0.0, track=False):
+    """Render stacked boolean rows, top row first.  See _row_lanes for the forms.
 
     Filled bars rather than lines because every row is boolean -- a line between
     0 and 1 implies intermediate values that do not exist.
@@ -410,55 +429,79 @@ def draw_band_rows(ax, rows, ylabel="", empty_msg="nothing to show", min_width=0
     fault that lasts one 30 Hz sample is a real event and a 0.0005-minute bar is
     an invisible one; without a floor the panel would say "clean" about a log
     that was not.  Applied per bar, so it never merges two separate events.
+
+    `track` draws a faint full-width rail behind every lane.  Without it an empty
+    lane and an absent lane look identical -- blank -- and "this instance was
+    checked and was fine" is exactly the thing a fault panel must not leave to
+    inference.
     """
     if not rows:
         ax.text(0.5, 0.5, empty_msg, transform=ax.transAxes, ha="center",
                 va="center", color=C_MUTED, fontsize=9)
         ax.set_yticks([])
         return
+    rows = [_row_lanes(r) for r in rows]
+
     # The x extent the labels have to share with the bars.  Taken from the rows
     # themselves rather than from the axis, because draw_band_rows runs before
     # the shared x limits are settled.
-    t_lo = min(a for _l, sp, _c in rows for a, _b in sp) if any(sp for _l, sp, _c in rows) else 0.0
-    t_hi = max(b for _l, sp, _c in rows for _a, b in sp) if any(sp for _l, sp, _c in rows) else 1.0
+    all_spans = [sp for _l, lanes, _c in rows for spans, _lc in lanes for sp in spans]
+    t_lo = min(a for a, _b in all_spans) if all_spans else 0.0
+    t_hi = max(b for _a, b in all_spans) if all_spans else 1.0
     span_x = max(t_hi - t_lo, 1e-9)
 
-    for i, (label, spans, color) in enumerate(rows):
+    multi = any(len(lanes) > 1 for _l, lanes, _c in rows)
+    for i, (label, lanes, label_color) in enumerate(rows):
         y = len(rows) - 1 - i
-        for a, b in spans:
-            ax.barh(y, max(b - a, min_width, 1e-6), left=a, height=0.62,
-                    color=color, alpha=0.85, lw=0, zorder=3)
+        n = max(len(lanes), 1)
+        # A one-lane row keeps the label centred on its bar, which is what the
+        # altitude and local-z panels already read as normal.  A multi-lane row
+        # CANNOT: with an odd lane count the middle lane sits exactly on the row
+        # centre, so the label's background box hides it -- on the d05a88e3 log
+        # that silently erased instance 1 from the driver-error row, the one row
+        # where all three instances had something to say.
+        row_h = 0.62 if n == 1 else 0.52
+        lane_h = row_h / n
+        for j, (spans, color) in enumerate(lanes):
+            # Lanes run top-down in the order given, so instance 0 is the top
+            # lane of every row and the panel can be read across.
+            ly = y + row_h / 2 - (j + 0.5) * lane_h
+            if track:
+                ax.barh(ly, span_x, left=t_lo, height=lane_h * 0.88,
+                        color=C_GRID, alpha=0.9, lw=0, zorder=1)
+            for a, b in spans:
+                ax.barh(ly, max(b - a, min_width, 1e-6), left=a,
+                        height=lane_h * 0.88, color=color, alpha=0.9, lw=0,
+                        zorder=3)
         # Labels go INSIDE the axes, not on the y ticks: these names run to ~22
         # characters and as tick labels they extend left into the checkbox panel
         # and get clipped by the figure edge.  Anchored in axes coordinates they
         # also survive a time-axis zoom, which data coordinates would not.
-        #
-        # A label sits on the left unless that would bury the row's data: a SPARSE
-        # row (a fault that fired briefly) whose first event is near the start of
-        # the log would otherwise have its only bar hidden under the label's
-        # background box.  Continuous rows -- "armed", "fusing GPS" -- are
-        # deliberately excluded by the coverage test, so they keep the left
-        # alignment the other plots already read as normal.
-        covered = sum(b - a for a, b in spans) / span_x
+        row_spans = [sp for spans, _c in lanes for sp in spans]
+        covered = sum(b - a for a, b in row_spans) / span_x
         # A dense row (armed, "fusing GPS") has no free side, so leave it on the
         # left where every other plot already puts it.  A sparse row gets the
         # emptier third: its handful of bars are the only thing on the row, and
         # the label's background box would hide them.
-        if covered < 0.2:
+        if covered < 0.2 and row_spans:
             def _in(lo, hi):
-                return sum(max(0.0, min(b, hi) - max(a, lo)) for a, b in spans)
+                return sum(max(0.0, min(b, hi) - max(a, lo)) for a, b in row_spans)
             third = span_x / 3.0
             right = _in(t_hi - third, t_hi) < _in(t_lo, t_lo + third)
         else:
             right = False
-        ax.text(0.996 if right else 0.004, y, label,
-                transform=ax.get_yaxis_transform(which="grid"),
-                fontsize=7, color=C_MUTED, va="center",
+        # Just clear of its own top lane, NOT centred in the gap: at the halfway
+        # point a title is equidistant from the lanes above and below it and
+        # reads as belonging to either.
+        ax.text(0.996 if right else 0.004, y if n == 1 else y + row_h / 2 + 0.11,
+                label, transform=ax.get_yaxis_transform(which="grid"),
+                fontsize=7, color=label_color or C_MUTED, va="center",
                 ha="right" if right else "left", zorder=5,
                 bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=1.0,
                           alpha=0.75))
     ax.set_yticks([])
-    ax.set_ylim(-0.6, len(rows) - 0.4)
+    # Headroom for the top row's label when it sits above its lanes.
+    ax.set_ylim(-0.6, len(rows) - (0.15 if multi else 0.4))
     if ylabel:
         ax.set_ylabel(ylabel, fontsize=9, color=C_MUTED)
     for spine in ("top", "right", "left"):
