@@ -204,6 +204,36 @@ class PlotPage(QtWidgets.QScrollArea):
             self._syncing = False
 
 
+# --- parameters ---------------------------------------------------------------
+
+def params_of(path):
+    """{name: value} as the log was booted with, plus the firmware it booted.
+
+    `parse_header_only` reads the definition section and stops: 16 ms for a
+    160 MB log against ~2 s for a full parse, because the parameters all live in
+    the header.  That is what makes comparing two arbitrary logs a click rather
+    than a wait.
+
+    `initial_parameters` is the boot-time set.  In-flight changes live in
+    `changed_parameters` and are deliberately NOT merged: "what was this aircraft
+    configured with" is the question being asked, and folding a mid-flight tweak
+    into it would answer a different one silently.
+    """
+    ulog = ULog(path, parse_header_only=True)
+    return dict(ulog.initial_parameters), dict(ulog.msg_info_dict)
+
+
+def fmt_param(v):
+    """PX4 shows ints as ints and floats to 6 significant figures."""
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        # %g drops the trailing zeros that make a table of calibration offsets
+        # unreadable, without rounding away a real difference at 1e-6.
+        return f"{v:.6g}"
+    return str(v)
+
+
 # --- how much of the file could not be read -----------------------------------
 
 class MeasuredULog(ULog):
@@ -471,6 +501,12 @@ class Browser(QtWidgets.QMainWindow):
             bh.addWidget(b)
             if label == "Rename…":
                 self.btn_rename = b
+        self.btn_params = QtWidgets.QPushButton("Compare params…")
+        self.btn_params.setToolTip("Show every parameter that differs between "
+                                   "the open log and another one")
+        self.btn_params.setEnabled(False)      # needs a log open to compare FROM
+        self.btn_params.clicked.connect(self._compare_params)
+        bh.addWidget(self.btn_params)
         self.btn_pdf = QtWidgets.QPushButton("Export PDF…")
         self.btn_pdf.clicked.connect(self._export_pdf)
         bh.addWidget(self.btn_pdf)
@@ -952,6 +988,7 @@ class Browser(QtWidgets.QMainWindow):
                 self._set_corrupt_cell(it, self._cached_record(path, os.stat(path)) or {})
                 self._refresh_picker_row(path)
 
+        self.btn_params.setEnabled(True)
         self.page.clear()
         self.jump.clear()
         self.jump.addItem("jump to plot…")
@@ -1077,6 +1114,152 @@ class Browser(QtWidgets.QMainWindow):
         self._select_path(target)
 
     # -- pdf
+    # -- parameter comparison
+    def _choose_log(self, title, exclude=None):
+        """Single-select log chooser.  None if cancelled.
+
+        Same rows as the dropdown, so the date and duration are there to pick by
+        -- with 36 identically-named HITL logs the name alone is not enough to
+        choose the right one."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(820, 560)
+        v = QtWidgets.QVBoxLayout(dlg)
+        lst = QtWidgets.QListWidget()
+        lst.setStyleSheet("font-family: monospace;")
+        v.addWidget(lst, 1)
+        skip = os.path.abspath(exclude) if exclude else None
+        for it in self._iter_items():
+            path = it.data(0, QtCore.Qt.UserRole)
+            if not path or (skip and os.path.abspath(path) == skip):
+                continue
+            row = QtWidgets.QListWidgetItem(self._row_text(it))
+            row.setData(QtCore.Qt.UserRole, path)
+            lst.addItem(row)
+        lst.itemDoubleClicked.connect(lambda *_: dlg.accept())
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        v.addWidget(btns)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted or not lst.currentItem():
+            return None
+        return lst.currentItem().data(QtCore.Qt.UserRole)
+
+    def _compare_params(self):
+        """Every parameter that differs between the open log and another."""
+        if not self._current:
+            return
+        other = self._choose_log("Compare parameters with…", exclude=self._current)
+        if not other:
+            return
+        try:
+            pa, ia = params_of(self._current)
+            pb, ib = params_of(other)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Compare parameters",
+                                          f"{type(e).__name__}: {e}")
+            return
+        self._show_param_diff(self._current, other, pa, pb, ia, ib)
+
+    def _show_param_diff(self, path_a, path_b, pa, pb, info_a, info_b):
+        name_a, name_b = os.path.basename(path_a), os.path.basename(path_b)
+        keys = sorted(set(pa) | set(pb))
+        # A missing parameter is a difference, and usually the most informative
+        # one -- it means the two logs are not even the same firmware build.
+        diff = [k for k in keys if pa.get(k) != pb.get(k)]
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Parameter differences")
+        dlg.resize(1000, 700)
+        v = QtWidgets.QVBoxLayout(dlg)
+
+        only_a = sum(1 for k in diff if k not in pb)
+        only_b = sum(1 for k in diff if k not in pa)
+        head = QtWidgets.QLabel(
+            f"<b>{len(diff)}</b> of {len(keys)} parameters differ"
+            + (f"  ·  {only_a} only in <b>{name_a}</b>" if only_a else "")
+            + (f"  ·  {only_b} only in <b>{name_b}</b>" if only_b else ""))
+        v.addWidget(head)
+
+        fw_a = (info_a.get("ver_sw") or "")[:12]
+        fw_b = (info_b.get("ver_sw") or "")[:12]
+        if fw_a != fw_b:
+            # Say this loudly: a firmware change explains a long diff list all by
+            # itself, and reading those rows as configuration drift would be wrong.
+            warn = QtWidgets.QLabel(
+                f"⚠ different firmware: {name_a} on <tt>{fw_a}</tt>, "
+                f"{name_b} on <tt>{fw_b}</tt> — some differences will be the "
+                f"build, not the configuration")
+            warn.setStyleSheet(f"color: {C_BAD};")
+            warn.setWordWrap(True)
+            v.addWidget(warn)
+
+        filt = QtWidgets.QLineEdit()
+        filt.setPlaceholderText("filter by name (e.g. EKF2, CAL_ACC, SDLOG)…")
+        v.addWidget(filt)
+
+        table = QtWidgets.QTableWidget(len(diff), 3)
+        table.setHorizontalHeaderLabels(["parameter", name_a, name_b])
+        table.setStyleSheet("font-family: monospace;")
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)          # rows are filled below; sort after
+        for r, k in enumerate(diff):
+            table.setItem(r, 0, QtWidgets.QTableWidgetItem(k))
+            for c, src in ((1, pa), (2, pb)):
+                cell = QtWidgets.QTableWidgetItem(fmt_param(src.get(k)))
+                if k not in src:
+                    cell.setForeground(QtGui.QColor(C_MUTED))
+                    cell.setToolTip("not present in this log")
+                else:
+                    cell.setForeground(QtGui.QColor(C_BAD))
+                cell.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                table.setItem(r, c, cell)
+        table.setSortingEnabled(True)
+        # Enabling sorting applies the header's CURRENT indicator, which is not
+        # ascending-by-column-0 until it is told to be -- without this the list
+        # comes out reverse-alphabetical.
+        table.sortItems(0, QtCore.Qt.AscendingOrder)
+        table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents)
+        for c in (1, 2):
+            table.horizontalHeader().setSectionResizeMode(
+                c, QtWidgets.QHeaderView.Stretch)
+        v.addWidget(table, 1)
+
+        def apply_filter(text):
+            t = text.strip().upper()
+            for r in range(table.rowCount()):
+                table.setRowHidden(r, bool(t) and t not in table.item(r, 0).text())
+        filt.textChanged.connect(apply_filter)
+
+        row = QtWidgets.QHBoxLayout()
+        def copy_all():
+            # Walk the TABLE, not the source list: what lands on the clipboard is
+            # then exactly what is on screen, in the order and with the filter
+            # the reader is looking at.
+            lines = [f"parameter\t{name_a}\t{name_b}"]
+            for r in range(table.rowCount()):
+                if table.isRowHidden(r):
+                    continue
+                lines.append("\t".join(table.item(r, c).text() for c in range(3)))
+            QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+            self._log(f"copied {len(lines) - 1} parameter difference(s)")
+        btn_copy = QtWidgets.QPushButton("Copy (tab-separated)")
+        btn_copy.clicked.connect(copy_all)
+        row.addWidget(btn_copy)
+        row.addStretch(1)
+        close = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        close.rejected.connect(dlg.reject)
+        row.addWidget(close)
+        v.addLayout(row)
+
+        self._log(f"params: {len(diff)} difference(s) between {name_a} and {name_b}")
+        dlg.exec_()
+
     def _pick_pdf_logs(self):
         """Choose which logs go in the report.  [] if the user cancelled.
 
