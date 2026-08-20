@@ -46,14 +46,14 @@ import os
 import numpy as np
 
 from ulog_common import (C_ARMED, C_BAD, C_INK, C_MUTED, C_SURFACE, PlotCtx,
-                         Series, _clean, _get, _rescale, _style_axis, _time_min,
-                         add_mouse_navigation, armed_spans, check_panel,
-                         draw_armed, draw_band_rows, draw_primary_shading,
-                         draw_mode_changes, duration_min, has_topic,
-                         inst_color, instance_key, mode_changes, mode_key,
-                         nav_hint,
-                         primary_ekf, primary_spans, resample_to,
-                         spans_from_bool, style_time_axis)
+                         Series, _clean, _get, _rescale, _style_axis,
+                         _time_min, add_mouse_navigation, armed_spans,
+                         check_panel, draw_armed, draw_band_rows,
+                         draw_primary_shading, draw_mode_changes,
+                         duration_min, has_topic, inst_color, instance_key,
+                         mode_changes, mode_key, nav_hint, primary_ekf,
+                         primary_spans, resample_to, spans_from_bool,
+                         style_time_axis, window_values)
 
 ACCEL_TOPICS = [
     "sensor_accel", "sensor_combined", "sensors_status_imu",
@@ -612,13 +612,9 @@ def _rescale_clipped(ax, lines, pct=99.5, keep=None):
     off the top is worse than one that crops data.  Returns the number of
     off-scale samples so the caller can admit to the clipping.
     """
-    vals = [np.asarray(ln.get_ydata(), dtype=float)
-            for ln in lines if ln.get_visible()]
-    vals = [v[np.isfinite(v)] for v in vals]
-    vals = [v for v in vals if v.size]
-    if not vals:
+    allv = window_values(ax, lines)
+    if allv.size == 0:
         return 0
-    allv = np.concatenate(vals)
     lo = float(np.percentile(allv, 100.0 - pct))
     hi = float(np.percentile(allv, pct))
     if keep is not None:
@@ -907,7 +903,7 @@ def build_accel(ulog, ctx=None, path=""):
     refresh()
     add_mouse_navigation(fig, [ax_acc, ax_bias, ax_corr, ax_temp, ax_cons,
                                ax_vib, ax_band], page_scroll=ctx.page_scroll,
-                         fixed_y=[ax_band])
+                         fixed_y=[ax_band], on_view=refresh)
     fig.text(left, _f(0.32), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     fig._page_height = int(round(fig_h * PAGE_PX_PER_IN))

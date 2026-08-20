@@ -43,14 +43,14 @@ import os
 import numpy as np
 
 from ulog_common import (C_ARMED, C_BAD, C_GRID, C_INK, C_MUTED, C_SURFACE,
-                         INST_COLORS, PlotCtx, Series, _clean, _get, _rescale,
-                         _style_axis, _time_min, add_mouse_navigation,
-                         armed_spans, check_panel, draw_armed, draw_band_rows,
-                         draw_mode_changes, draw_primary_shading, duration_min,
-                         field, has_topic, inst_color, instance_key,
-                         mode_changes, mode_key, nav_hint, primary_spans,
-                         spans_from_bool,
-                         style_time_axis)
+                         INST_COLORS, PlotCtx, Series, _clean, _get,
+                         _rescale, _style_axis, _time_min,
+                         add_mouse_navigation, armed_spans, check_panel,
+                         draw_armed, draw_band_rows, draw_mode_changes,
+                         draw_primary_shading, duration_min, field,
+                         has_topic, inst_color, instance_key, mode_changes,
+                         mode_key, nav_hint, primary_spans, spans_from_bool,
+                         style_time_axis, window_values)
 
 LOCALZ_TOPICS = [
     "vehicle_local_position", "estimator_local_position",
@@ -226,13 +226,9 @@ def _rescale_log(ax, lines, pct=99.5):
     The ratios span three decades and spike past 25 at a height reset, so min/max
     limits squash the 0.01-1.0 range everything interesting lives in.  Returns
     (n_offscale, max_value) so the caller can say what was cut."""
-    vals = [np.asarray(ln.get_ydata(), dtype=float)
-            for ln in lines if ln.get_visible()]
-    vals = [v[np.isfinite(v) & (v > 0)] for v in vals]
-    vals = [v for v in vals if v.size]
-    if not vals:
+    allv = window_values(ax, lines, positive_only=True)
+    if allv.size == 0:
         return 0, 0.0
-    allv = np.concatenate(vals)
     hi = float(np.percentile(allv, pct))
     lo = float(np.percentile(allv, 100.0 - pct))
     hi = max(hi, WARN_RATIO * 2.0)
@@ -327,10 +323,12 @@ def build_local_z(ulog, ctx=None, path=""):
         if abs(dz) < LABEL_RESET_M:
             n_small += 1
             continue
-        reset_art.append(ax_z.text(
+        lbl = ax_z.text(
             t_r, 0.985, f" reset {c0}->{c1}  dz={dz:+.1f}",
             transform=ax_z.get_xaxis_transform(), rotation=90, fontsize=6,
-            color=C_BAD, va="top", ha="left", zorder=6))
+            color=C_BAD, va="top", ha="left", zorder=6)
+        lbl.set_clip_on(True)       # text is unclipped by default; see
+        reset_art.append(lbl)       # draw_mode_changes for what that costs
     if n_small:
         ctx.note(f"{n_small} height reset(s) smaller than {LABEL_RESET_M:g} m are "
                  f"marked but not labelled")
@@ -412,7 +410,8 @@ def build_local_z(ulog, ctx=None, path=""):
                 extra=extra, on_change=refresh)
     refresh()
     add_mouse_navigation(fig, [ax_z, ax_ref, ax_sel, ax_rel, ax_band],
-                         page_scroll=ctx.page_scroll, fixed_y=[ax_band])
+                         page_scroll=ctx.page_scroll, fixed_y=[ax_band],
+                         on_view=refresh)
     fig.text(left, 0.048, nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     return fig

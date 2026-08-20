@@ -271,18 +271,58 @@ def resample_to(t_dst, t_src, y_src):
 
 # --- rendering helpers ------------------------------------------------------
 
+def window_values(ax, lines, positive_only=False):
+    """Y values of the VISIBLE lines that fall inside ax's current TIME window.
+
+    Two filters, and both matter:
+
+    Visible-only, because matplotlib's autoscale counts hidden artists, so a
+    toggled-off 80 degC channel would keep the axis stretched.
+
+    Window-only, because otherwise zooming the time axis does not change the
+    picture.  The local-z plot is the case that proves it: its full-flight y
+    range is set by one 89 m reset step and a 30 m origin split, so every
+    zoomed-in window renders as the same flat line in the same place, and the
+    zoom looks like it did nothing.  Fitting the value axis to what is actually
+    on screen is what makes the gesture do something.
+
+    A binary search rather than a boolean mask: this runs on every wheel notch,
+    and the accel plot carries ~50 lines of a couple hundred thousand samples
+    each.  Every series here is time-sorted (field() cleans through _clean), and
+    the endpoint check falls back to a mask if some caller ever passes one that
+    is not.  One sample of overhang each side keeps a line that crosses the edge
+    of the window contributing, so the trace does not get cropped at the frame.
+    """
+    lo, hi = ax.get_xlim()
+    if lo > hi:
+        lo, hi = hi, lo
+    out = []
+    for ln in lines:
+        if not ln.get_visible():
+            continue
+        x = np.asarray(ln.get_xdata(), dtype=float)
+        v = np.asarray(ln.get_ydata(), dtype=float)
+        if v.size == 0 or x.size != v.size:
+            continue
+        if x.size > 1 and x[0] <= x[-1]:
+            i0, i1 = np.searchsorted(x, (lo, hi))
+            v = v[max(int(i0) - 1, 0):min(int(i1) + 1, v.size)]
+        else:
+            v = v[(x >= lo) & (x <= hi)]
+        v = v[np.isfinite(v)]
+        if positive_only:
+            v = v[v > 0]
+        if v.size:
+            out.append(v)
+    return np.concatenate(out) if out else np.array([])
+
+
 def _rescale(ax, lines, pad=0.06):
-    """Fit an axis to only its VISIBLE lines (matplotlib's autoscale counts
-    hidden artists, so a toggled-off 80 degC channel would keep the axis
-    stretched)."""
-    vals = [ln.get_ydata() for ln in lines if ln.get_visible()]
-    vals = [np.asarray(v, dtype=float) for v in vals]
-    vals = [v[np.isfinite(v)] for v in vals]
-    vals = [v for v in vals if v.size]
-    if not vals:
+    """Fit an axis to its visible lines, within the visible time window."""
+    v = window_values(ax, lines)
+    if v.size == 0:
         return
-    lo = min(float(v.min()) for v in vals)
-    hi = max(float(v.max()) for v in vals)
+    lo, hi = float(v.min()), float(v.max())
     if hi == lo:
         lo, hi = lo - 1, hi + 1
     m = (hi - lo) * pad
@@ -494,11 +534,17 @@ def draw_mode_changes(axes, changes, text_ax=None, min_gap=0.0, label=True):
         if last_label is not None and (t - last_label) < min_gap:
             continue
         last_label = t
-        artists.append(text_ax.text(
+        txt = text_ax.text(
             t, 0.985, " " + nav_state_name(code),
             transform=text_ax.get_xaxis_transform(), rotation=90, fontsize=6.5,
             color=color, va="top", ha="left", zorder=6,
-            bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=0.8, alpha=0.7)))
+            bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=0.8, alpha=0.7))
+        # Text is NOT clipped to its axes by default, unlike a Line2D.  Zoom in
+        # and every label for a change outside the window keeps drawing -- over
+        # the y tick labels, over the checkbox panel, over the neighbouring
+        # figure.  The rules themselves clip already, being lines.
+        txt.set_clip_on(True)
+        artists.append(txt)
     return artists, codes
 
 
@@ -900,9 +946,20 @@ class Nav:
     what lets the browser keep every plot on the same time window.
     """
 
-    def __init__(self, fig, axes, page_scroll=False, on_xlim=None, fixed_y=()):
+    def __init__(self, fig, axes, page_scroll=False, on_xlim=None, fixed_y=(),
+                 on_view=None):
         self.fig = fig
         self.axes = list(axes)
+        # Called after the time window changes, to refit the value axes to what
+        # is now on screen.  Each plot passes its own refresh() -- they already
+        # know how to scale their own panels (percentile limits on the log
+        # ratios, thresholds that must stay in view on the accel panels), and
+        # re-deriving that generically here would get those wrong.
+        self.on_view = on_view
+        # Axes the user has value-zoomed or panned by hand.  Auto-fit leaves
+        # those alone until a reset: having the axis you just set snap back on
+        # the next wheel notch is worse than not auto-fitting at all.
+        self.manual_y = set()
         # Axes whose y is a LAYOUT, not a measurement: the band panels put one
         # row per flag at integer y and label them in axes coordinates, so
         # zooming or panning their y scrambles the rows into nonsense.  They
@@ -999,12 +1056,24 @@ class Nav:
                 a.set_xlim(lo, hi)
         finally:
             self._echo = False
+        self._refit()
         self.fig.canvas.draw_idle()
 
+    def _refit(self):
+        """Refit the value axes to the new window, honouring manual overrides."""
+        if self.on_view is None:
+            return
+        keep = {a: a.get_ylim() for a in self.manual_y}
+        self.on_view()
+        for a, yl in keep.items():
+            a.set_ylim(yl)
+
     def reset(self):
+        self.manual_y.clear()
         for a, xl, yl in self.home:
             a.set_xlim(xl)
             a.set_ylim(yl)
+        self._refit()
         self.fig.canvas.draw_idle()
         self._announce()
 
@@ -1040,6 +1109,7 @@ class Nav:
             if got is not None:
                 for a in self.axes:
                     a.set_xlim(*got)
+                self._refit()
         if do_y:
             # Value zoom applies ONLY to the panel under the pointer.  Zooming
             # every panel meant the pointer's pixel row was outside all the
@@ -1049,6 +1119,7 @@ class Nav:
             for a in self._under(event):
                 if a not in self.fixed_y:
                     self._zoom_about(a, "y", event.y, scale)
+                    self.manual_y.add(a)     # you set it; auto-fit leaves it
         self.fig.canvas.draw_idle()
         if do_x:
             self._announce()
@@ -1071,6 +1142,7 @@ class Nav:
         if not self._drag or event.x is None:
             return
         px, py = self._drag["at"]
+        moved_y = abs(event.y - py) > 1
         for a, (x0, x1), (y0, y1), inv in self._drag["axes"]:
             xa, ya = inv.transform((px, py))
             xb, yb = inv.transform((event.x, event.y))
@@ -1078,6 +1150,11 @@ class Nav:
             a.set_xlim(x0 + dx, x1 + dx)
             if a not in self.fixed_y:
                 a.set_ylim(y0 + dy, y1 + dy)
+                if moved_y:
+                    self.manual_y.add(a)
+        # A pan that only moved sideways should still refit; one that moved the
+        # value axis has just been positioned by hand, and _refit preserves it.
+        self._refit()
         self.fig.canvas.draw_idle()
         self._announce()
 
@@ -1085,14 +1162,18 @@ class Nav:
         self._drag.clear()
 
 
-def add_mouse_navigation(fig, axes, page_scroll=False, on_xlim=None, fixed_y=()):
+def add_mouse_navigation(fig, axes, page_scroll=False, on_xlim=None, fixed_y=(),
+                         on_view=None):
     """Wheel to zoom, drag to pan, double-click to reset -- without having to arm
     a mode on the toolbar first.  See Nav for the binding table.
 
     `fixed_y` lists axes whose y is a row layout rather than a scale (the band
-    panels), so value zoom and vertical pan leave them alone."""
+    panels), so value zoom and vertical pan leave them alone.
+
+    `on_view` is the plot's own refresh(), called after the time window changes
+    so the value axes fit what is on screen."""
     nav = Nav(fig, axes, page_scroll=page_scroll, on_xlim=on_xlim,
-              fixed_y=fixed_y)
+              fixed_y=fixed_y, on_view=on_view)
     # Same GC hazard as the checkbuttons: mpl_connect holds only weak-ish refs
     # through the callback registry, and a Nav that dies stops responding.
     fig._nav = nav

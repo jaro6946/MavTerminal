@@ -29,13 +29,13 @@ QNH = the pressure setting that makes an altimeter read elevation.
 import numpy as np
 
 from ulog_common import (C_ARMED, C_BAD, C_INK, C_MUTED, C_SURFACE, PlotCtx,
-                         Series, _clean, _get, _rescale, _style_axis, _time_min,
-                         add_mouse_navigation, armed_spans, check_panel,
-                         draw_armed, draw_band_rows, duration_min, field,
-                         draw_mode_changes, gap_mask, has_topic,
-                         mode_changes, mode_key, nav_hint, primary_ekf,
-                         resample_to,
-                         spans_from_bool, style_time_axis)
+                         Series, _clean, _get, _rescale, _style_axis,
+                         _time_min, add_mouse_navigation, armed_spans,
+                         check_panel, draw_armed, draw_band_rows,
+                         duration_min, field, draw_mode_changes, gap_mask,
+                         has_topic, mode_changes, mode_key, nav_hint,
+                         primary_ekf, resample_to, spans_from_bool,
+                         style_time_axis, window_values)
 
 ALT_TOPICS = [
     "vehicle_global_position", "vehicle_local_position", "vehicle_gps_position",
@@ -167,18 +167,10 @@ def _rng_hagl(ulog, ctx):
     return t[m], y[m]
 
 
-def _visible_values(lines, positive_only=False):
-    out = []
-    for ln in lines:
-        if not ln.get_visible():
-            continue
-        v = np.asarray(ln.get_ydata(), dtype=float)
-        v = v[np.isfinite(v)]
-        if positive_only:
-            v = v[v > 0]
-        if v.size:
-            out.append(v)
-    return np.concatenate(out) if out else np.array([])
+def _visible_values(ax, lines, positive_only=False):
+    """Visible lines' values inside the visible time window -- see
+    ulog_common.window_values for why the window filter is not optional."""
+    return window_values(ax, lines, positive_only=positive_only)
 
 
 def _rescale_robust(ax, lines, pct=99.5, min_span=1.0):
@@ -195,7 +187,7 @@ def _rescale_robust(ax, lines, pct=99.5, min_span=1.0):
     and the caller annotates how many and how large.  Zooming out (ctrl+shift+
     wheel) brings them back into view.
     """
-    v = _visible_values(lines)
+    v = _visible_values(ax, lines)
     if v.size == 0:
         return 0, 0.0
     lo = float(np.percentile(v, 100.0 - pct))
@@ -222,7 +214,7 @@ def _rescale_log(ax, lines, pct=99.5):
     so well the exact value carries nothing) and always straddling 1.0, which is
     the accept/reject border the whole panel is read against.
     """
-    v = _visible_values(lines, positive_only=True)
+    v = _visible_values(ax, lines, positive_only=True)
     if v.size == 0:
         return 0, 0.0
     hi = float(np.percentile(v, pct))
@@ -522,7 +514,8 @@ def build_altitude(ulog, ctx=None, path=""):
                 extra=extra, on_change=refresh)
     refresh()
     add_mouse_navigation(fig, [ax_amsl, ax_res, ax_inn, ax_ratio, ax_band],
-                         page_scroll=ctx.page_scroll, fixed_y=[ax_band])
+                         page_scroll=ctx.page_scroll, fixed_y=[ax_band],
+                         on_view=refresh)
     fig.text(left, 0.048, nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     return fig

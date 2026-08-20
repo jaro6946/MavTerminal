@@ -331,7 +331,7 @@ def build_thermal(ulog, ctx=None, path=""):
     refresh()
     # After refresh(), so "home" is the fitted view rather than the raw one.
     add_mouse_navigation(fig, [ax, ax_cnt, ax_rate, ax_add],
-                         page_scroll=ctx.page_scroll)
+                         page_scroll=ctx.page_scroll, on_view=refresh)
     fig.text(0.20, 0.036, nav_hint(ctx.page_scroll), color=C_MUTED, fontsize=8,
              ha="left")
     return fig

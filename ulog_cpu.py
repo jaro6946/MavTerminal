@@ -408,7 +408,8 @@ def build_cpu(ulog, ctx=None, path=""):
                          "kb": _anchor("log")})
     refresh()
     add_mouse_navigation(fig, [ax_cpu, ax_slip, ax_rate, ax_log, ax_kb, ax_band],
-                         page_scroll=ctx.page_scroll, fixed_y=[ax_band])
+                         page_scroll=ctx.page_scroll, fixed_y=[ax_band],
+                         on_view=refresh)
     fig.text(left, _f(0.32), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     fig._page_height = int(round(fig_h * PAGE_PX_PER_IN))

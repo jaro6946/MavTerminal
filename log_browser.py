@@ -128,6 +128,14 @@ class PlotCanvas(FigureCanvasQTAgg):
             super().wheelEvent(event)
         finally:
             self._nav_mods = None
+        # ACCEPT, or the zoom happens AND the page scrolls out from under it.
+        # Qt calls ignore() on a wheel event before delivering it and walks up
+        # the parent chain until someone accepts; matplotlib's
+        # FigureCanvasQT.wheelEvent handles the event but never accepts it, so
+        # without this the QScrollArea gets it next and scrolls the page away
+        # from the plot you were zooming.  Unconditional on ctrl: this gesture
+        # belongs to the canvas whether or not the notch resolved to a step.
+        event.accept()
 
 
 class PlotPage(QtWidgets.QScrollArea):
@@ -145,6 +153,13 @@ class PlotPage(QtWidgets.QScrollArea):
         self._navs = []
         self._syncing = False
         self._anchors = {}          # plot key -> widget, for the sidebar jumps
+        self._last_nav = None       # the plot whose time window moved last
+        # Whether zooming one plot re-ranges the others.  OFF by default: the
+        # pointer is over ONE plot, and having the other five jump under it is
+        # not what the gesture looks like it should do -- you lose the view you
+        # had scrolled to on every other plot to zoom the one in front of you.
+        # The toolbar checkbox turns it back on for a cross-plot comparison.
+        self.link_time = False
 
     def clear(self):
         while self._box.count():
@@ -155,6 +170,7 @@ class PlotPage(QtWidgets.QScrollArea):
                 w.deleteLater()
         self._navs = []
         self._anchors = {}
+        self._last_nav = None
 
     def add(self, key, fig, height=PLOT_HEIGHT):
         canvas = PlotCanvas(fig)
@@ -174,7 +190,9 @@ class PlotPage(QtWidgets.QScrollArea):
         self._anchors[key] = canvas
         nav = getattr(fig, "_nav", None)
         if nav is not None:
-            nav.on_xlim = self._broadcast
+            # Bound per-nav so the page knows WHICH plot moved, not just that
+            # something did -- that is what set_link_time adopts the window of.
+            nav.on_xlim = lambda lo, hi, n=nav: self._nav_changed(n, lo, hi)
             self._navs.append(nav)
         canvas.draw_idle()
 
@@ -186,13 +204,33 @@ class PlotPage(QtWidgets.QScrollArea):
         if w is not None:
             self.ensureWidgetVisible(w, 0, 0)
 
+    def _nav_changed(self, nav, lo, hi):
+        self._last_nav = nav
+        self._broadcast(lo, hi)
+
+    def set_link_time(self, on):
+        """Turn cross-plot time linking on or off.
+
+        Switching it ON adopts the window of the plot you were last working in,
+        so the plots agree immediately -- rather than staying disagreed until the
+        next wheel notch, and rather than snapping to whichever plot happens to
+        be first on the page."""
+        self.link_time = bool(on)
+        if not self.link_time or not self._navs:
+            return
+        src = self._last_nav if self._last_nav in self._navs else self._navs[0]
+        lo, hi = src.axes[0].get_xlim()
+        self._broadcast(lo, hi)
+
     def _broadcast(self, lo, hi):
         """One plot's time window becomes every plot's time window.
+
+        Only when link_time is on -- see the flag in __init__.
 
         The guard is not optional: set_xlim on a sibling fires that sibling's own
         callback, which would come straight back here and recurse until the stack
         gives out."""
-        if self._syncing:
+        if self._syncing or not self.link_time:
             return
         self._syncing = True
         try:
@@ -510,6 +548,14 @@ class Browser(QtWidgets.QMainWindow):
         self.btn_pdf = QtWidgets.QPushButton("Export PDF…")
         self.btn_pdf.clicked.connect(self._export_pdf)
         bh.addWidget(self.btn_pdf)
+
+        self.chk_link = QtWidgets.QCheckBox("Link time axes")
+        self.chk_link.setToolTip(
+            "Off: ctrl+wheel zooms only the plot under the pointer.\n"
+            "On: every plot follows the same time window.")
+        self.chk_link.setChecked(False)
+        self.chk_link.toggled.connect(lambda on: self.page.set_link_time(on))
+        bh.addWidget(self.chk_link)
 
         self.jump = QtWidgets.QComboBox()
         self.jump.addItem("jump to plot…")
@@ -990,6 +1036,7 @@ class Browser(QtWidgets.QMainWindow):
 
         self.btn_params.setEnabled(True)
         self.page.clear()
+        self.page.link_time = self.chk_link.isChecked()
         self.jump.clear()
         self.jump.addItem("jump to plot…")
         self.title.setText(f"{os.path.basename(path)}   —   {mins:.1f} min")
