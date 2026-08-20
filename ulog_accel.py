@@ -906,7 +906,8 @@ def build_accel(ulog, ctx=None, path=""):
                          "cons": _anchor("cons"), "vib": _anchor("cons")})
     refresh()
     add_mouse_navigation(fig, [ax_acc, ax_bias, ax_corr, ax_temp, ax_cons,
-                               ax_vib, ax_band], page_scroll=ctx.page_scroll)
+                               ax_vib, ax_band], page_scroll=ctx.page_scroll,
+                         fixed_y=[ax_band])
     fig.text(left, _f(0.32), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     fig._page_height = int(round(fig_h * PAGE_PX_PER_IN))

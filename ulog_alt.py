@@ -522,7 +522,7 @@ def build_altitude(ulog, ctx=None, path=""):
                 extra=extra, on_change=refresh)
     refresh()
     add_mouse_navigation(fig, [ax_amsl, ax_res, ax_inn, ax_ratio, ax_band],
-                         page_scroll=ctx.page_scroll)
+                         page_scroll=ctx.page_scroll, fixed_y=[ax_band])
     fig.text(left, 0.048, nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     return fig

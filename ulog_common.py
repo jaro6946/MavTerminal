@@ -900,9 +900,14 @@ class Nav:
     what lets the browser keep every plot on the same time window.
     """
 
-    def __init__(self, fig, axes, page_scroll=False, on_xlim=None):
+    def __init__(self, fig, axes, page_scroll=False, on_xlim=None, fixed_y=()):
         self.fig = fig
         self.axes = list(axes)
+        # Axes whose y is a LAYOUT, not a measurement: the band panels put one
+        # row per flag at integer y and label them in axes coordinates, so
+        # zooming or panning their y scrambles the rows into nonsense.  They
+        # still take part in the shared TIME axis.
+        self.fixed_y = set(fixed_y)
         self.page_scroll = page_scroll
         self.on_xlim = on_xlim
         self.home = [(a, a.get_xlim(), a.get_ylim()) for a in self.axes]
@@ -920,6 +925,46 @@ class Nav:
         mode (pan/zoom) holds the canvas widget lock -- otherwise both would act
         on the same drag and the view would move twice as fast."""
         return event.inaxes in self.axes and not self.fig.canvas.widgetlock.locked()
+
+    @staticmethod
+    def _zoom_about(ax, which, pixel, scale):
+        """Scale one axis about a pixel position, in DISPLAY space.
+
+        Doing the arithmetic in data coordinates is only correct on a linear
+        axis.  The local-z plot's test-ratio panel is log-scaled, where
+        `yc - (yc - y0) * scale` is meaningless -- it collapses the decade under
+        the cursor and can produce a non-positive limit, which matplotlib then
+        quietly refuses, so the axis appears not to zoom at all.  Converting
+        through transData handles linear, log and symlog identically because the
+        transform already knows the scale.
+        """
+        lo, hi = ax.get_ylim() if which == "y" else ax.get_xlim()
+        to, back = ax.transData, ax.transData.inverted()
+        i = 1 if which == "y" else 0
+        p_lo = to.transform((0, lo))[i] if which == "y" else to.transform((lo, 0))[i]
+        p_hi = to.transform((0, hi))[i] if which == "y" else to.transform((hi, 0))[i]
+        n_lo = pixel - (pixel - p_lo) * scale
+        n_hi = pixel + (p_hi - pixel) * scale
+        if which == "y":
+            a = back.transform((0, n_lo))[1]
+            b = back.transform((0, n_hi))[1]
+            if np.isfinite(a) and np.isfinite(b) and a != b:
+                ax.set_ylim(a, b)
+        else:
+            a = back.transform((n_lo, 0))[0]
+            b = back.transform((n_hi, 0))[0]
+            if np.isfinite(a) and np.isfinite(b) and a != b:
+                ax.set_xlim(a, b)
+
+    def _under(self, event):
+        """The axes the pointer is actually inside -- base AND any twin.
+
+        Twins share a rectangle exactly, so containment returns both, which is
+        what you want: they are one panel to the reader and zooming half of it
+        would slide the two scales apart.
+        """
+        return [a for a in self.axes
+                if a.bbox.contains(event.x, event.y)]
 
     def _announce(self):
         if self.on_xlim and not self._echo:
@@ -971,20 +1016,22 @@ class Nav:
         # high-resolution trackpads, which this handles for free).
         scale = 1.15 ** (-event.step)
 
-        if do_x and event.xdata is not None:
+        if do_x and event.x is not None:
             # Zoom about the cursor, not the axis centre, so the sample under the
-            # pointer stays put.  x data coords are identical on every twin.
-            x0, x1 = self.axes[0].get_xlim()
-            xc = event.xdata
+            # pointer stays put.  Applied to EVERY axis, because the time axis is
+            # shared and one panel drifting off the others is the one thing this
+            # figure must never do.
             for a in self.axes:
-                a.set_xlim(xc - (xc - x0) * scale, xc + (x1 - xc) * scale)
+                self._zoom_about(a, "x", event.x, scale)
         if do_y:
-            for a in self.axes:
-                # The cursor's y in THIS axis's data coords -- the twins have
-                # different scales, so each needs its own inverse transform.
-                _, yc = a.transData.inverted().transform((event.x, event.y))
-                y0, y1 = a.get_ylim()
-                a.set_ylim(yc - (yc - y0) * scale, yc + (y1 - yc) * scale)
+            # Value zoom applies ONLY to the panel under the pointer.  Zooming
+            # every panel meant the pointer's pixel row was outside all the
+            # others, so their anchor landed off-screen and they translated
+            # wildly instead of zooming -- and it re-scaled the band panels,
+            # whose y is a row layout.
+            for a in self._under(event):
+                if a not in self.fixed_y:
+                    self._zoom_about(a, "y", event.y, scale)
         self.fig.canvas.draw_idle()
         if do_x:
             self._announce()
@@ -1012,7 +1059,8 @@ class Nav:
             xb, yb = inv.transform((event.x, event.y))
             dx, dy = xa - xb, ya - yb
             a.set_xlim(x0 + dx, x1 + dx)
-            a.set_ylim(y0 + dy, y1 + dy)
+            if a not in self.fixed_y:
+                a.set_ylim(y0 + dy, y1 + dy)
         self.fig.canvas.draw_idle()
         self._announce()
 
@@ -1020,10 +1068,14 @@ class Nav:
         self._drag.clear()
 
 
-def add_mouse_navigation(fig, axes, page_scroll=False, on_xlim=None):
+def add_mouse_navigation(fig, axes, page_scroll=False, on_xlim=None, fixed_y=()):
     """Wheel to zoom, drag to pan, double-click to reset -- without having to arm
-    a mode on the toolbar first.  See Nav for the binding table."""
-    nav = Nav(fig, axes, page_scroll=page_scroll, on_xlim=on_xlim)
+    a mode on the toolbar first.  See Nav for the binding table.
+
+    `fixed_y` lists axes whose y is a row layout rather than a scale (the band
+    panels), so value zoom and vertical pan leave them alone."""
+    nav = Nav(fig, axes, page_scroll=page_scroll, on_xlim=on_xlim,
+              fixed_y=fixed_y)
     # Same GC hazard as the checkbuttons: mpl_connect holds only weak-ish refs
     # through the callback registry, and a Nav that dies stops responding.
     fig._nav = nav
