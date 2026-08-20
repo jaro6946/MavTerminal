@@ -20,6 +20,7 @@ import ulog_accel
 import ulog_alt
 import ulog_cpu
 import ulog_graph
+import ulog_heading
 import ulog_localz
 import ulog_path
 from ulog_common import PlotCtx  # re-exported: callers build one and pass it on
@@ -79,6 +80,19 @@ PLOTS = [
         # Fallback only: build_accel sizes its own figure from the fault-row
         # count and sets fig._page_height to match.
         height=1000,
+    ),
+    PlotSpec(
+        key="heading",
+        title="Heading estimation",
+        topics=ulog_heading.HEADING_TOPICS,
+        build=ulog_heading.build_heading,
+        blurb="every independent witness to the heading -- each EKF instance, "
+              "the magnetometer-free EKF-GSF, an independently computed "
+              "tilt-compensated compass and GNSS course -- their disagreement "
+              "with the published estimate, the mag innovations, the learned "
+              "bias and declination, and every yaw-source and mag fault flag",
+        # Fallback only: build_heading sizes its own figure from the band.
+        height=1200,
     ),
     PlotSpec(
         key="path",
