@@ -107,13 +107,15 @@ PLOTS = [
     ),
     PlotSpec(
         key="cpu",
-        title="Processor load",
+        title="Processor load / links",
         topics=ulog_cpu.CPU_TOPICS,
         build=ulog_cpu.build_cpu,
-        blurb="CPU and RAM, plus the things that show the board struggling: EKF "
-              "time slip, IMU publish rates, SD buffer pressure and the MAVLink "
-              "rate throttle",
-        height=900,
+        blurb="CPU and RAM, the things that show the board struggling (EKF time "
+              "slip, IMU publish rates, SD buffer pressure, the MAVLink rate "
+              "throttle), and the companion/DDS bridge traffic measured from the "
+              "uORB topics the bridge writes",
+        # Fallback only: build_cpu sizes its own figure from the band.
+        height=1250,
     ),
 ]
 
