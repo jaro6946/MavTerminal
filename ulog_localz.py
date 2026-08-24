@@ -336,7 +336,6 @@ def build_local_z(ulog, ctx=None, path=""):
     # --- axis furniture -----------------------------------------------------
     for a in (ax_z, ax_ref, ax_sel):
         style_time_axis(a, label=False)
-        a.tick_params(axis="x", labelbottom=False)
     style_time_axis(ax_band)
 
     ax_z.set_ylabel("height above local origin (m)\n= -z, NED down-positive",

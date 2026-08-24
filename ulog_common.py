@@ -334,7 +334,48 @@ def _style_axis(ax, color):
     ax.yaxis.label.set_color(color)
 
 
+# --- temperature channels ----------------------------------------------------
+# A silicon temperature sensor's own operating range, with margin.  Outside it
+# the field is not a temperature, and this is not hypothetical: the external
+# magnetometer on this project's board reports +36 degC and -117 degC three
+# seconds apart in the same bench log.
+TEMP_RANGE_C = (-40.0, 150.0)
+
+# Nothing on this airframe has a thermal mass small enough to move this far
+# between two samples of a ~1 Hz channel.  MEDIAN step, not max, so one glitch
+# sample does not condemn an otherwise sound channel -- it takes a channel that
+# is jumping most of the time, which is a driver handing back a register rather
+# than a reading.
+TEMP_MAX_STEP_C = 10.0
+
+
+def temp_ok(y):
+    """Is this channel a temperature at all?  See TEMP_RANGE_C / TEMP_MAX_STEP_C.
+
+    Shared because two plots draw temperature beside something else and a bad
+    channel does the same damage in both: one -117 degC sample sets the axis for
+    every honest channel next to it.  The caller decides what to do about a
+    False -- the heading plot lists the channel and leaves it switched off, so
+    that "this sensor's temperature register is garbage" stays visible as a
+    finding rather than being silently dropped.
+    """
+    lo, hi = TEMP_RANGE_C
+    good = np.isfinite(y) & (y >= lo) & (y <= hi)
+    if y.size < 2 or good.mean() < 0.95:
+        return False
+    return float(np.median(np.abs(np.diff(y[good])))) <= TEMP_MAX_STEP_C
+
+
 def style_time_axis(ax, label=True):
+    """Grid and time ticks.  `label` is the axis TITLE, not the tick labels.
+
+    Every stacked panel keeps its own tick labels even though they all share one
+    x axis: a panel two rows up from the bottom is read on its own as often as
+    it is read as part of the stack, and tracing a feature down four panels to
+    find out when it happened is a worse cost than the row of numbers under each
+    one.  Only the bottom panel gets the axis title, which would otherwise be
+    repeated verbatim five times.
+    """
     ax.grid(True, color=C_GRID, lw=0.8, zorder=0)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)

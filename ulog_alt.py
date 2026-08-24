@@ -452,7 +452,6 @@ def build_altitude(ulog, ctx=None, path=""):
     # --- axis furniture -----------------------------------------------------
     for a in (ax_amsl, ax_res, ax_inn):
         style_time_axis(a, label=False)
-        a.tick_params(axis="x", labelbottom=False)
     style_time_axis(ax_band)
 
     ax_amsl.set_ylabel("altitude AMSL (m)", fontsize=9)

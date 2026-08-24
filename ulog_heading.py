@@ -14,7 +14,8 @@ their disagreement with the published estimate:
 
   1. heading        -- the fused estimate, each EKF instance, the EKF-GSF, the
                        magnetometer worked out from scratch, and GNSS course
-  2. disagreement   -- each of those minus the published heading, wrapped
+  2. disagreement   -- each of those minus the published heading, wrapped,
+                       with sensor temperature on the right-hand axis
   3. innovations    -- what the EKF thought of the mag data it was fed
   4. mag bias, declination and field strength
   5. band           -- yaw alignment, which source was fused, and every mag fault
@@ -36,6 +37,16 @@ witness that is still telling the truth.
 Innovations that are large but test ratios below 1.0 mean the EKF is accepting
 data it disagrees with; ratios above 1.0 mean it is rejecting them, and a yaw
 that then drifts is dead reckoning on gyro bias.
+
+Temperature rides on panel 2 rather than panel 1 deliberately.  A thermal
+effect on heading is a few degrees of slow walk: on panel 1's +/-180 degree axis
+that is a line thickness, and on the disagreement axis it is the whole signal.
+An offset that grows with the MAGNETOMETER's own temperature is a calibration
+taken at one temperature and used at another -- the shape of every stale CAL_MAG
+offset.  One that grows with the IMU temperature while the mag stays cool is the
+board heating the field around the sensor rather than the sensor drifting, and
+the two are worth telling apart because only the second gets better by moving
+the magnetometer.
 
 The magnetometer heading here is computed independently of the EKF -- the
 standard tilt-compensated compass, using only roll and pitch from the attitude
@@ -59,7 +70,8 @@ from ulog_common import (C_ARMED, C_BAD, C_GRID, C_INK, C_MUTED, C_SURFACE,
                          draw_mode_changes, draw_primary_shading, duration_min,
                          field, has_topic, inst_color, instance_key,
                          mode_changes, mode_key, nav_hint, primary_spans,
-                         spans_from_bool, style_time_axis, window_values)
+                         spans_from_bool, style_time_axis, temp_ok,
+                         TEMP_MAX_STEP_C, TEMP_RANGE_C, window_values)
 
 HEADING_TOPICS = [
     "vehicle_attitude",              # the published attitude -> published yaw
@@ -67,7 +79,8 @@ HEADING_TOPICS = [
     "vehicle_local_position",        # heading, heading_good_for_control, resets
     "yaw_estimator_status",          # the EKF-GSF: yaw WITHOUT the magnetometer
     "vehicle_magnetometer",          # the fused field vector, for our own compass
-    "sensor_mag",                    # per-device field, for the strength check
+    "sensor_mag",                    # per-device field and temperature
+    "vehicle_imu_status",            # board temperature, the mag's environment
     "estimator_innovations",
     "estimator_innovation_test_ratios",
     "estimator_status",              # mag_test_ratio, pre-flight heading check
@@ -91,6 +104,23 @@ C_COG = "#00838f"        # dark cyan -- GNSS course over ground
 C_GPSYAW = "#1565c0"     # blue -- dual-antenna GPS heading
 C_SP = "#8d6e63"         # brown -- the commanded yaw
 C_DECL = "#6a4fa3"       # violet -- declination
+
+# Temperature keeps the thermal plot's encoding -- an orange ramp, dotted -- so a
+# reader who knows that plot recognises the channel here without learning a
+# second vocabulary.  EKF instance 1 is also orange, but it is a SOLID line on
+# the left axis in its own checkbox group, so the two never read as one series.
+#
+# The magnetometer's OWN temperature is the causal channel for heading, so it is
+# the one that starts visible.  The IMU temperatures are carried hidden because
+# they are the board's temperature, which swings far harder than the mag's --
+# 28 -> 80 degC against the mag's 47 on this project's board -- and is what the
+# magnetometer is sitting next to.
+TEMP_CHANNELS = [
+    # (topic, field, shown by default)
+    ("sensor_mag", "temperature", True),
+    ("vehicle_imu_status", "temperature_accel", False),
+    ("vehicle_imu_status", "temperature_gyro", False),
+]
 
 # PX4's EKF2 state vector, 24 states.  16..18 are the earth magnetic field in
 # NED (Gauss) and 19..21 the body-frame magnetometer bias.  The declination the
@@ -488,6 +518,71 @@ def _bias_series(ulog, instances):
     return series
 
 
+def _temp_series(ulog, ctx):
+    """Panel 2, right axis: what the sensors were actually running at.
+
+    Every temperature channel that bears on heading, on one axis: the
+    magnetometer's own and the board's, one per IMU.  See the module docstring
+    for why this belongs against the DISAGREEMENT rather than the heading.
+
+    Two channels are dropped or demoted rather than drawn as if they were data:
+
+      * a slot the firmware declares but never fills -- an unpopulated slot is
+        not a cold sensor, so it is dropped outright.
+      * a channel whose values are not physically temperatures.  That one is
+        still LISTED and still plottable, because "the magnetometer's
+        temperature register is garbage" is itself a finding about the sensor
+        the heading depends on -- but it does not start visible, since one
+        -117 degC sample sets the axis for every honest channel beside it.
+    """
+    import matplotlib
+
+    found = []
+    for topic, fname, default_on in TEMP_CHANNELS:
+        for i in _instances(ulog, topic):
+            t, y = field(ulog, topic, fname, mid=i)
+            if t.size == 0 or not np.isfinite(y).any():
+                continue
+            tag = f"{topic.replace('vehicle_', '').replace('sensor_', '')}[{i}]"
+            what = fname.replace("temperature_", "").replace("temperature", "")
+            label = f"{tag} {what} temp" if what else f"{tag} temp"
+            ok = temp_ok(y)
+            found.append([f"{topic}[{i}].{fname}",
+                          label if ok else f"{label} (NOT a temperature)",
+                          t, y, default_on and ok, ok])
+
+    if not found:
+        ctx.note("no sensor temperature in this log -- panel 2 has no thermal "
+                 "channel to read the disagreement against")
+        return []
+
+    bad = [f[0] for f in found if not f[5]]
+    if bad:
+        ctx.note(f"{len(bad)} temperature channel(s) are outside "
+                 f"{TEMP_RANGE_C[0]:g}..{TEMP_RANGE_C[1]:g} degC or jump further "
+                 f"than {TEMP_MAX_STEP_C:g} degC between samples, so they are "
+                 f"listed but not shown: {', '.join(bad)}")
+    if not any(f[4] for f in found):
+        # The preferred channel is the broken one.  Fall back to the best
+        # available rather than opening the panel with an empty axis.
+        alive = next((f for f in found if f[5]), None)
+        if alive is not None:
+            alive[4] = True
+            ctx.note(f"showing {alive[0]} instead -- it is the board's "
+                     f"temperature, not the magnetometer's own")
+
+    # DARK -> light, the opposite of the thermal plot's ramp, because the order
+    # here is meaningful rather than alphabetical: TEMP_CHANNELS puts the
+    # magnetometer's own temperature first because it is the causal one, and the
+    # channel that carries the argument should not be the palest line on the
+    # panel.  Stops short of 0.45 so even the last IMU stays legible on a
+    # near-white surface.
+    ramp = matplotlib.colormaps["Oranges"](np.linspace(0.95, 0.45, len(found)))
+    return [Series(sid, label, t, y, "temp", tuple(ramp[k]), ls=":", lw=1.2,
+                   alpha=0.9, visible=vis, zorder=2)
+            for k, (sid, label, t, y, vis, _ok) in enumerate(found)]
+
+
 # --- the fault band ----------------------------------------------------------
 
 def _band_rows(ulog, ctx, instances):
@@ -664,6 +759,7 @@ def build_heading(ulog, ctx=None, path=""):
         return None
     series += _innovation_series(ulog, instances)
     series += _bias_series(ulog, instances)
+    series += _temp_series(ulog, ctx)
 
     rows, n_clean = _band_rows(ulog, ctx, instances)
 
@@ -699,14 +795,15 @@ def build_heading(ulog, ctx=None, path=""):
         for k in ("head", "diff", "innov", "bias", "band")]
     for a in (ax_head, ax_diff, ax_innov, ax_bias):
         a.sharex(ax_band)
+    ax_temp = ax_diff.twinx()
     ax_ratio = ax_innov.twinx()
     ax_decl = ax_bias.twinx()
-    for a in (ax_ratio, ax_decl):
+    for a in (ax_temp, ax_ratio, ax_decl):
         a.set_facecolor("none")
 
-    axis_of = {"head": ax_head, "diff": ax_diff, "innov": ax_innov,
-               "innov_mag": ax_innov, "ratio": ax_ratio, "bias": ax_bias,
-               "decl": ax_decl}
+    axis_of = {"head": ax_head, "diff": ax_diff, "temp": ax_temp,
+               "innov": ax_innov, "innov_mag": ax_innov, "ratio": ax_ratio,
+               "bias": ax_bias, "decl": ax_decl}
 
     shade_art = []
     for a in (ax_head, ax_diff, ax_innov, ax_bias, ax_band):
@@ -752,7 +849,6 @@ def build_heading(ulog, ctx=None, path=""):
     # --- axis furniture -----------------------------------------------------
     for a in (ax_head, ax_diff, ax_innov, ax_bias):
         style_time_axis(a, label=False)
-        a.tick_params(axis="x", labelbottom=False)
     style_time_axis(ax_band)
 
     ax_head.set_ylabel("heading (deg)\nNED, clockwise from north", fontsize=9)
@@ -763,12 +859,14 @@ def build_heading(ulog, ctx=None, path=""):
                      f"branch cut off the trace", transform=ax_head.transAxes,
                      ha="right", va="bottom", fontsize=7, color=C_MUTED)
     ax_diff.set_ylabel("minus published (deg)", fontsize=9)
+    ax_temp.set_ylabel("sensor temperature (degC, dotted)", fontsize=9)
     ax_innov.set_ylabel("heading innov (deg)\nmag innov (mGauss)", fontsize=9)
     ax_ratio.set_ylabel("test ratio (dashed)", fontsize=9)
     ax_bias.set_ylabel("mag bias (mGauss)", fontsize=9)
     ax_decl.set_ylabel("declination (deg)", fontsize=9)
     for a, c in ((ax_head, C_INK), (ax_diff, C_INK), (ax_innov, C_INK),
-                 (ax_bias, C_INK), (ax_ratio, C_MUTED), (ax_decl, C_MUTED)):
+                 (ax_bias, C_INK), (ax_temp, C_MUTED), (ax_ratio, C_MUTED),
+                 (ax_decl, C_MUTED)):
         _style_axis(a, c)
 
     fig.text(left, 1.0 - _f(0.30), "Heading estimation", color=C_INK,
@@ -811,8 +909,9 @@ def build_heading(ulog, ctx=None, path=""):
     def refresh():
         _rescale_heading(ax_head, [s.line for s in series if s.group == "head"],
                          center)
-        for group, a in (("diff", ax_diff), ("innov", ax_innov),
-                         ("bias", ax_bias), ("decl", ax_decl)):
+        for group, a in (("diff", ax_diff), ("temp", ax_temp),
+                         ("innov", ax_innov), ("bias", ax_bias),
+                         ("decl", ax_decl)):
             lines = [s.line for s in series
                      if s.group == group or (group == "innov"
                                              and s.group == "innov_mag")]
@@ -842,18 +941,21 @@ def build_heading(ulog, ctx=None, path=""):
 
     check_panel(fig, [0.012, cb_bot, 0.155, h], series,
                 [("head", "ALL headings"), ("diff", "ALL differences"),
+                 ("temp", "ALL temperatures"),
                  ("innov", "ALL heading innovations"),
                  ("innov_mag", "ALL mag innovations"),
                  ("ratio", "ALL test ratios"), ("bias", "ALL mag bias"),
                  ("decl", "ALL declination")],
                 extra=extra, on_change=refresh,
                 anchors={"head": _anchor("head"), "diff": _anchor("diff"),
-                         "innov": _anchor("innov"), "innov_mag": _anchor("innov"),
+                         "temp": _anchor("diff"), "innov": _anchor("innov"),
+                         "innov_mag": _anchor("innov"),
                          "ratio": _anchor("innov"), "bias": _anchor("bias"),
                          "decl": _anchor("bias")})
     refresh()
-    add_mouse_navigation(fig, [ax_head, ax_diff, ax_innov, ax_ratio, ax_bias,
-                               ax_decl, ax_band], page_scroll=ctx.page_scroll,
+    add_mouse_navigation(fig, [ax_head, ax_diff, ax_temp, ax_innov, ax_ratio,
+                               ax_bias, ax_decl, ax_band],
+                         page_scroll=ctx.page_scroll,
                          fixed_y=[ax_band], on_view=refresh)
     fig.text(left, _f(0.32), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")

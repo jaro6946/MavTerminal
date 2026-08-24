@@ -8,7 +8,8 @@ calibrated, and did the firmware ever say it wasn't?":
   2. EKF accel bias     -- what each filter thinks the sensor is off by, against
                            the exact preflight arming threshold
   3. thermal correction -- the offset TC (thermal compensation) is injecting
-  4. consistency        -- inter-IMU disagreement and vibration
+  4. consistency        -- inter-IMU disagreement, vibration, and each IMU's
+                           own temperature
   5. fault band         -- every accelerometer fault flag the firmware carries
 
 The whole figure is shaded by `estimator_selector_status.primary_instance`, so a
@@ -53,7 +54,7 @@ from ulog_common import (C_ARMED, C_BAD, C_INK, C_MUTED, C_SURFACE, PlotCtx,
                          duration_min, has_topic, inst_color, instance_key,
                          mode_changes, mode_key, nav_hint, primary_ekf,
                          primary_spans, resample_to, spans_from_bool,
-                         style_time_axis, window_values)
+                         style_time_axis, temp_ok, window_values)
 
 ACCEL_TOPICS = [
     "sensor_accel", "sensor_combined", "sensors_status_imu",
@@ -377,13 +378,34 @@ def _series_correction(ulog, ctx, dev_map):
 # --- panel 4: do the IMUs agree, and how hard are they shaking ---------------
 
 def _series_consistency(ulog, ctx, dev_map):
-    """Inter-IMU disagreement (left) and vibration metric (right).
+    """Inter-IMU disagreement (left), vibration (right), temperature (far right).
 
-    Two different questions that share an axis because they answer each other:
+    Three questions that share a panel because they answer each other:
     `accel_inconsistency_m_s_s` is each sensor's distance from the mean of all of
     them, so a single high line is one bad sensor -- but a vibration event lifts
     every line at once and means nothing about calibration.  Without the
     vibration trace next to it, the first is easy to read into the second.
+
+    Temperature is the third reading of the same rise, and the one that separates
+    a sensor from its environment.  These IMUs sit at different places on the
+    board and reach 80 degC in flight; a spread that opens as they heat and
+    closes as they cool is the thermal calibration of ONE of them being wrong at
+    temperature, which panel 3 can then be checked against.  A spread that is
+    flat across a 40 degC climb is not thermal at all, and that is worth as much
+    -- it rules out the explanation that this board's history makes tempting.
+
+    Temperature comes from vehicle_imu_status rather than sensor_correction:
+    it is the same topic and the same device as the vibration metric beside it,
+    so all three traces on this panel are the SAME sensor, coloured by the same
+    device mapping.
+
+    On most boards that is physically the same probe panel 3 plots, published by
+    a different topic -- which is why the labels here say "IMU temp" and panel
+    3's say "temp".  Duplicating the curve is the point: panel 3 reads it against
+    the offset TC is INJECTING, this panel reads it against the disagreement the
+    sensors are PRODUCING, and those are the two halves of "did the thermal
+    calibration actually work".  Comparing them across a 9-inch figure is not
+    reading, it is remembering.
     """
     series = []
     d = _get(ulog, "sensors_status_imu")
@@ -416,6 +438,31 @@ def _series_consistency(ulog, ctx, dev_map):
         series.append(Series(f"vehicle_imu_status[{m}].accel_vibration_metric",
                              f"{tag} vibration", tt, y, "vib", col, ls="--",
                              lw=1.1, alpha=0.8, visible=True))
+
+    bad = []
+    for m in _imu_multi_ids(ulog, "vehicle_imu_status"):
+        d = _get(ulog, "vehicle_imu_status", m)
+        if d is None or "temperature_accel" not in d.data:
+            continue
+        dev = int(np.asarray(d.data.get("accel_device_id", [0]))[0])
+        col, inst = _color_for_device(dev_map, dev)
+        tag = f"EKF {inst}" if inst is not None else f"IMU {m}"
+        tt, y = _clean(_time_min(ulog, d), d.data["temperature_accel"])
+        if tt.size == 0:
+            continue          # a slot the firmware declares but never fills
+        # Listed but off when it fails: see ulog_common.temp_ok.  One bad
+        # register would otherwise set the axis for every honest channel.
+        ok = temp_ok(y)
+        if not ok:
+            bad.append(f"vehicle_imu_status[{m}].temperature_accel")
+        series.append(Series(f"vehicle_imu_status[{m}].temperature_accel",
+                             f"{tag} IMU temp" + ("" if ok
+                                                  else " (NOT a temperature)"),
+                             tt, y, "ctemp", col, ls=":", lw=1.2, alpha=0.9,
+                             visible=ok))
+    if bad:
+        ctx.note(f"{len(bad)} IMU temperature channel(s) are not physically "
+                 f"temperatures and are listed but not shown: {', '.join(bad)}")
     return series
 
 
@@ -705,11 +752,17 @@ def build_accel(ulog, ctx=None, path=""):
         a.sharex(ax_band)
     ax_temp = ax_corr.twinx()
     ax_vib = ax_cons.twinx()
-    for a in (ax_temp, ax_vib):
+    # Panel 4's third scale, outboard of the vibration axis.  The offset is in
+    # points and has to clear the vibration axis's own ticks and label; `width`
+    # leaves 1.27 in of margin to the right, which fits both stacks.
+    ax_ctemp = ax_cons.twinx()
+    ax_ctemp.spines["right"].set_position(("outward", 52))
+    for a in (ax_temp, ax_vib, ax_ctemp):
         a.set_facecolor("none")
 
     axis_of = {"acc": ax_acc, "bias": ax_bias, "corr": ax_corr,
-               "temp": ax_temp, "cons": ax_cons, "vib": ax_vib}
+               "temp": ax_temp, "cons": ax_cons, "vib": ax_vib,
+               "ctemp": ax_ctemp}
 
     shade_art = []
     for a in (ax_acc, ax_bias, ax_corr, ax_cons, ax_band):
@@ -754,7 +807,6 @@ def build_accel(ulog, ctx=None, path=""):
     # --- axis furniture -----------------------------------------------------
     for a in (ax_acc, ax_bias, ax_corr, ax_cons):
         style_time_axis(a, label=False)
-        a.tick_params(axis="x", labelbottom=False)
     style_time_axis(ax_band)
 
     ax_acc.set_ylabel("specific force (m/s^2)", fontsize=9)
@@ -763,9 +815,10 @@ def build_accel(ulog, ctx=None, path=""):
     ax_temp.set_ylabel("accel temp (degC, dotted)", fontsize=9)
     ax_cons.set_ylabel("inter-IMU inconsistency (m/s^2)", fontsize=9)
     ax_vib.set_ylabel("vibration metric (dashed)", fontsize=9)
+    ax_ctemp.set_ylabel("IMU temp (degC, dotted)", fontsize=9)
     for a in (ax_acc, ax_bias, ax_corr, ax_cons):
         _style_axis(a, C_INK)
-    for a in (ax_temp, ax_vib):
+    for a in (ax_temp, ax_vib, ax_ctemp):
         _style_axis(a, C_MUTED)
 
     y_title = 1.0 - _f(0.35)
@@ -835,17 +888,19 @@ def build_accel(ulog, ctx=None, path=""):
     # which is a claim about the data.  Say instead that the log does not carry
     # them -- HITL logs have no sensor_correction at all, and a single-IMU build
     # has no inter-IMU anything.
-    for ax_e, ax_tw, groups, msg in (
-            (ax_corr, ax_temp, ("corr", "temp"),
+    for ax_e, twins, groups, msg in (
+            (ax_corr, (ax_temp,), ("corr", "temp"),
              "no sensor_correction in this log -- thermal compensation is off "
              "or not logged"),
-            (ax_cons, ax_vib, ("cons", "vib"),
+            (ax_cons, (ax_vib, ax_ctemp), ("cons", "vib", "ctemp"),
              "no sensors_status_imu or vehicle_imu_status in this log")):
         if not any(s.group in groups for s in series):
             ax_e.text(0.5, 0.5, msg, transform=ax_e.transAxes, ha="center",
                       va="center", color=C_MUTED, fontsize=9)
             ax_e.set_yticks([])
-            ax_tw.set_yticks([])
+            for ax_tw in twins:
+                ax_tw.set_yticks([])
+                ax_tw.spines["right"].set_visible(False)
 
     # Flight-mode overlay: a rule on every panel at each mode change, named on
     # ax_bias.  Toggleable, because a log that flickers between Position and
@@ -864,7 +919,8 @@ def build_accel(ulog, ctx=None, path=""):
             note.set_text(f"{n} sample(s) off-scale (ctrl+wheel to zoom out)"
                           if n else "")
         for group, a in (("corr", ax_corr), ("temp", ax_temp),
-                         ("cons", ax_cons), ("vib", ax_vib)):
+                         ("cons", ax_cons), ("vib", ax_vib),
+                         ("ctemp", ax_ctemp)):
             _rescale(a, [s.line for s in series if s.group == group])
 
     extra = []
@@ -895,14 +951,17 @@ def build_accel(ulog, ctx=None, path=""):
     check_panel(fig, [0.012, cb_bot, 0.155, h], series,
                 [("acc", "ALL accelerometer"), ("bias", "ALL bias"),
                  ("corr", "ALL thermal offset"), ("temp", "ALL temperature"),
-                 ("cons", "ALL inconsistency"), ("vib", "ALL vibration")],
+                 ("cons", "ALL inconsistency"), ("vib", "ALL vibration"),
+                 ("ctemp", "ALL IMU temperature")],
                 extra=extra, on_change=refresh,
                 anchors={"acc": _anchor("acc"), "bias": _anchor("bias"),
                          "corr": _anchor("corr"), "temp": _anchor("corr"),
-                         "cons": _anchor("cons"), "vib": _anchor("cons")})
+                         "cons": _anchor("cons"), "vib": _anchor("cons"),
+                         "ctemp": _anchor("cons")})
     refresh()
     add_mouse_navigation(fig, [ax_acc, ax_bias, ax_corr, ax_temp, ax_cons,
-                               ax_vib, ax_band], page_scroll=ctx.page_scroll,
+                               ax_vib, ax_ctemp, ax_band],
+                         page_scroll=ctx.page_scroll,
                          fixed_y=[ax_band], on_view=refresh)
     fig.text(left, _f(0.32), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")

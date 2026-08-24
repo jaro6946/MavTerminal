@@ -655,7 +655,6 @@ def build_cpu(ulog, ctx=None, path=""):
 
     for a in (ax_cpu, ax_slip, ax_log, ax_link):
         style_time_axis(a, label=False)
-        a.tick_params(axis="x", labelbottom=False)
     style_time_axis(ax_band)
 
     ax_cpu.set_ylabel("CPU / RAM used (%)", fontsize=9)
