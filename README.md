@@ -266,9 +266,9 @@ re-emit reliably, so a gate that keys off STATUSTEXT can miss a terminated board
 
 ## Plotting logs: `logGraph`
 
-`logGraph` opens a **log browser**: a library of the `.ulg` files on this machine on
-the left, and on the right every plot for the selected log, stacked in one
-scrolling page with their **time axes linked** (zoom one, they all move).
+`logGraph` opens a **log browser**: a dropdown of every `.ulg` on this machine on
+the toolbar, and below it every plot for the selected log, stacked in one
+scrolling page.
 
 ```bash
 mavTerminal -c "logGraph"                    # browse: pick a log in the GUI
@@ -280,43 +280,126 @@ so no flight controller needs to be plugged in.
 
 ### The plots
 
+Seven, all registered in `ulog_plots.py` and all drawn on the same time axis with
+armed spans shaded and an optional **flight-mode overlay** (the `nav_state`
+timeline, labelled at each transition):
+
 | Plot | What it answers |
 |---|---|
-| **Thermal / GPS** | Every temperature channel the log carries, satellite count and `fix_type`, and dT/dt for one channel. Armed stretches shaded. |
-| **Altitude estimation** | Why the vehicle thinks it is at that height: an AMSL overlay of GPS / barometer / rangefinder against the EKF's fused altitude, the **residual** of each source vs fused, the EKF's **innovations and test ratios**, and a band showing **which source it was actually fusing** and when each input was valid. |
+| **Thermal / GPS** | Every temperature channel the log carries, satellite count and `fix_type`, and dT/dt for one channel. |
+| **Altitude estimation** | Why the vehicle thinks it is at that height: an AMSL overlay of GPS / barometer / rangefinder against the EKF's fused altitude, the **residual** of each source vs fused, the EKF's **innovations and test ratios**, and a band showing which source it was actually fusing. |
+| **Local z / EKF instance** | Whose z you are looking at. PX4 publishes ONE instance's `vehicle_local_position`, and each instance anchors its **own** local origin — so a selector handover republishes z against a different datum. Overlays every instance's own z and `ref_alt` plus the selector scores. (On `SquareWaypointMission_1.ulg` the origins sat a permanent 30.25 m apart and published z stepped 89 m while the vehicle held still.) |
+| **Accelerometer / calibration** | Per-IMU accel magnitude and axes, each EKF's **bias estimate against the exact preflight arming threshold** (`estimatorCheck.cpp`'s `checkSensorBias`, reproduced including the 3-sigma term, so the threshold is a time series), the thermal-compensation offset being injected, inter-IMU consistency + vibration + temperature, and every accel fault flag. |
+| **Heading estimation** | Every **independent** witness to yaw on one axis — each EKF instance, the magnetometer-free **EKF-GSF**, an independently computed tilt-compensated compass, and GNSS course — then their disagreement with the published estimate (with mag temperature on the right-hand axis), the mag innovations, the learned bias and declination, and every yaw-source and mag fault flag. |
+| **Flight path (3D)** | Where the vehicle actually was, in 3D coloured by time, with a top-down plan view and the raw GPS fix. Each sample is **re-anchored onto one fixed origin** using the reference origin published beside it, so an EKF handover no longer puts a step in the track (22.76 m → 0.88 m on `d05a88e3`). Genuine estimator resets are *marked*, not smoothed. |
+| **Processor load / links** | Did the board run out of CPU or bandwidth, and what did it drop: CPU/RAM, the EKF's own time slip and per-IMU publish rates, SD buffer pressure and the MAVLink rate throttle, and the **companion / uXRCE-DDS bridge traffic** measured from the uORB topics the bridge writes. |
 
-The altitude plot's residual panel is the one that does the work. The sources do not
-share a datum — on a real flight the barometer sits ~84 m below fused and GPS ~10 m
-below — so on one AMSL axis a 2 m drift is a line width. Subtracting the fused
-altitude removes the flight profile and lets the axis be metres. The constant offset
-is removed and **reported in the legend**, since "baro reads 84 m low" is itself a
-finding.
+Every EKF-instance-aware plot is shaded by
+`estimator_selector_status.primary_instance`, so an excursion is always read
+against *which filter was actually steering the vehicle*. This matters for real
+gates: PX4's "High Accelerometer Bias" preflight check runs on the **primary
+instance only**, so an instance can sit above the threshold for a minute and
+never block arming — without the shading you cannot tell "this board will refuse
+to arm" from "this board is one handover away from refusing to arm".
 
-Some things are deliberately **off by default**: rangefinder-on-AMSL (it assumes flat
-ground at `ref_alt`, which can be tens of metres from the real ground) and the
-rangefinder innovation (it reaches 130 m while baro/GPS sit under a metre). Tick them
-in the panel when you want them.
+The altitude plot's residual panel is the one that does the work. The sources do
+not share a datum — on a real flight the barometer sits ~84 m below fused and GPS
+~10 m below — so on one AMSL axis a 2 m drift is a line width. Subtracting the
+fused altitude removes the flight profile and lets the axis be metres. The
+constant offset is removed and **reported in the legend**, since "baro reads 84 m
+low" is itself a finding.
+
+Some things are deliberately **off by default**: rangefinder-on-AMSL (it assumes
+flat ground at `ref_alt`), the rangefinder innovation (it reaches 130 m while
+baro/GPS sit under a metre), and the IMU temperatures on the heading plot (the
+board swings far harder than the mag, which is the causal channel there). Tick
+them in the panel when you want them — the checkbox panel beside each plot *is*
+the legend.
+
+### The library (the dropdown)
+
+Each row carries name · duration · size · date · time · corruption, in monospace
+so the columns line up, and the list is sorted newest-first.
+
+- **The date is the flight, not the file.** An `.ulg` pulled off an SD card has
+  an mtime of the *download* — measured two days out on
+  `SquareWaypointMission_1.ulg`. So the date comes from **GNSS UTC inside the
+  log** (one sample carrying both `time_utc_usec` and `timestamp` pins the whole
+  log to wall clock), falling back to a stamp in the file *or folder* name — the
+  folder matters because every HITL run writes a `FC_log.ulg` and only the run
+  folder dates it.
+- **Corruption is measured, not guessed.** pyulog only warns once per bad message
+  id and has a second, silent path, so the scan reads `ulog.file_corruption` and
+  reports corrupt bytes as a **percentage of the file**. A log flagged corrupt
+  with nothing measurable is reported as unknown rather than as `0.0%`. (2 of 9
+  logs in the local library are mid-file corrupt with `dropouts = 0` — the FC
+  wrote them fine; both were MAVLink downloads, every card copy is clean.)
+- Scans run on a worker thread and are cached in
+  `~/.config/mavterminal/log_browser.json`, re-scanned when the scanner learns a
+  new fact.
+- **Add folder…** / **Open file…** extend the library beyond the default roots
+  (`~/jacobAtGar/Log Analysis`, `$MAV_LOG_DIR`, the rotorpy run folders, cwd).
+
+### Comparing two logs' parameters
+
+**Compare params…** diffs the parameter dump of the open log against any other
+log in the library and lists every parameter that differs, filterable and
+copyable as tab-separated text. A parameter **missing** from one side counts as a
+difference and is usually the most informative one — it means the two logs are
+not even the same firmware build.
 
 ### Navigation
 
 | Gesture | Effect |
 |---|---|
 | wheel | scroll the page |
-| ctrl+wheel | zoom the time axis (all plots follow) |
-| ctrl+shift+wheel | zoom the value axes |
+| ctrl+wheel | zoom the time axis of **the plot under the pointer** |
+| ctrl+shift+wheel | zoom the value axes of the panel under the pointer |
 | drag | pan |
 | double-click | reset to the whole flight |
+
+Tick **Link time axes** to go back to every plot following one window. It is off
+by default: a page of seven plots is usually seven separate questions, and having
+them all jump when you zoom one is more often a nuisance than a feature.
+
+Zooming the time axis **refits the value axes to the visible window**, so a
+zoomed-in stretch of a flat-looking trace actually shows its structure instead of
+rendering as the same flat line. Axes you have panned or value-zoomed by hand are
+left alone from then on, and band panels (the categorical rows) are never
+value-zoomed.
+
+The 3D flight path plot has its own gestures: wheel zooms the box, drag inside it
+rotates, drag the plan view pans.
 
 In `--classic` mode there is no page to scroll, so the bare wheel zooms time as it
 always did.
 
+### Basemaps (satellite imagery under the ground track)
+
+The path plot never fetches tiles — no network dependency, and a plot that
+silently phones a tile server has no place in a flight-test loop. Instead, drop a
+georeferenced pair into `~/.logGraph/basemaps` (or `$LOGGRAPH_BASEMAP_DIR`):
+
+```
+site.png
+site.json     {"image": "site.png", "bounds": [south, west, north, east]}
+```
+
+`bounds` is in degrees, the same order Leaflet and folium use. The one whose
+bounds contain the log's origin wins; it is drawn under the plan view and on the
+floor of the 3D box. With no basemap the plan view says so and prints the
+origin's latitude and longitude — the thing you would need to go and grab a tile
+for. This works at all because the re-anchored frame is **georeferenced**: the
+origin is a real WGS84 lat/lon and every point is a known number of metres east
+and north of it.
+
 ### Renaming logs
 
-All 36 HITL logs are called `FC_log.ulg` and are told apart only by their run folder,
-so the browser can rename them: **F2**, right-click, or the Rename button. It renames
-the real file on disk in its own folder, drags any `<stem>_diag.txt` sidecar along,
-**refuses to overwrite** an existing name (plain `os.rename` would silently delete it)
-and refuses a name containing a path separator.
+All 36 HITL logs are called `FC_log.ulg` and are told apart only by their run
+folder, so the browser can rename them: **F2**, right-click, or the Rename button.
+It renames the real file on disk in its own folder, drags any `<stem>_diag.txt`
+sidecar along, **refuses to overwrite** an existing name (plain `os.rename` would
+silently delete it) and refuses a name containing a path separator.
 
 ### PDF reports
 
@@ -347,15 +430,23 @@ display — and `--pdf` doubles as the regression test for the whole plot stack.
 ### Adding a plot
 
 `ulog_plots.py` is the registry. A new plot is one `PlotSpec` entry plus a module
-exposing `build(ulog, ctx, path) -> Figure | None`; the browser, the PDF exporter and
-the topic filter list all derive from it.
+exposing `build(ulog, ctx, path) -> Figure | None`; the browser, the PDF exporter,
+the jump-to menu and the topic filter list all derive from it. One ULog parse
+serves every plot — the union of every spec's `topics` is the filter, which does
+not save wall-clock time (pyulog walks the whole file regardless) but does avoid
+materialising ~100 topics nobody plots.
 
 | File | Role |
 |---|---|
-| `ulog_common.py` | Shared vocabulary: `Series`, pyulog access helpers, `sliding_slope`, armed spans, the checkbox panel, mouse navigation |
+| `ulog_common.py` | Shared vocabulary: `Series`, pyulog access helpers, `sliding_slope`, armed spans, flight-mode overlay, temperature sanity checks, the checkbox panel, mouse navigation |
 | `ulog_plots.py` | The registry |
 | `ulog_graph.py` | The thermal plot, and the CLI front door |
-| `ulog_alt.py` | The altitude estimation plot |
+| `ulog_alt.py` | Altitude estimation |
+| `ulog_localz.py` | Local z per EKF instance |
+| `ulog_accel.py` | Accelerometer / calibration |
+| `ulog_heading.py` | Heading estimation |
+| `ulog_path.py` | 3D flight path + basemaps |
+| `ulog_cpu.py` | Processor load / links |
 | `ulog_report.py` | PDF export |
 | `log_browser.py` | The PyQt5 browser window |
 
