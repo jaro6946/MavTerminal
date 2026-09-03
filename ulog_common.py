@@ -50,6 +50,12 @@ C_SATS = "#2a78d6"   # blue
 C_FIX = "#4a3aa7"    # violet
 C_RATE = "#1baf7a"   # aqua
 C_ADD = "#e87ba4"    # magenta
+# Pre-regulator pack voltage.  Deep purple is what is LEFT once the orange ramp
+# (temperatures), blue (satellites), blue-violet (fix_type), aqua (dT/dt) and
+# light magenta (added channels) are spoken for -- and it stays clear of the red
+# reserved for faults.  Darker and far more saturated than C_ADD so the two do
+# not read as the same series on the rare log that shows both.
+C_VOLT = "#7b2d8e"   # deep purple
 C_ARMED = "#8c8c85"  # neutral -- background shading, never a data color
 C_INK = "#0b0b0b"
 C_MUTED = "#6f6e6a"

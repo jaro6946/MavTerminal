@@ -44,11 +44,14 @@ class PlotSpec:
 
 PLOTS = [
     PlotSpec(
+        # key stays "thermal": it is the browser's jump anchor and the prefix on
+        # this plot's console notes, not a display string.
         key="thermal",
-        title="Thermal / GPS",
+        title="General Correlation Chart",
         topics=ulog_graph.THERMAL_TOPICS,
         build=ulog_graph.build_thermal,
-        blurb="every temperature channel, satellite count, and dT/dt on one time axis",
+        blurb="every temperature channel, satellite count, dT/dt and the "
+              "pre-regulator pack voltage on one time axis",
         height=520,
     ),
     PlotSpec(

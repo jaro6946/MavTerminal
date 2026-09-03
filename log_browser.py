@@ -17,17 +17,22 @@ Acronyms: ULog = PX4's binary log format, HITL = hardware in the loop,
 GUI = graphical user interface, PDF = portable document format.
 """
 import contextlib
+import faulthandler
 import io
 import json
 import os
 import re
+import signal
 import sys
+import threading
 import time
+import traceback
 
 import matplotlib
 matplotlib.use("QtAgg")            # before any pyplot import, to match the shell
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from pyulog import ULog
 
@@ -83,6 +88,155 @@ def _save_state(state):
         pass                    # a browser that cannot cache still works
 
 
+# --- crash log --------------------------------------------------------------
+#
+# Three different things kill this window, and each needs its own trap:
+#
+#   * a Python exception -- PyQt5 hands it to sys.excepthook and then calls
+#     abort(), so when the browser was started from a launcher rather than a
+#     terminal the traceback goes nowhere at all;
+#   * a NATIVE crash inside Qt or matplotlib -- there is no Python exception to
+#     catch, the process simply disappears;
+#   * an out-of-memory kill -- SIGKILL, which by definition cannot be caught.
+#
+# sys.excepthook covers the first.  faulthandler covers the second: it dumps
+# the Python stack from inside a signal handler, which is why it is given a
+# real file object held open for the life of the process rather than something
+# that buffers.  Nothing can cover the third, so the breadcrumbs below cover it
+# instead -- each one carries the resident set size, so a log that stops mid-
+# parse with RSS climbing past the free memory names the cause by itself.
+
+CRASH_LOG = os.path.join(os.path.dirname(STATE_PATH), "log_browser_crash.log")
+CRASH_LOG_MAX = 512 * 1024          # bytes; rotated to .1 past this
+SESSION_MARK = "=== session "
+EXIT_MARK = "=== clean exit "
+
+_crash_fh = None
+
+
+def _rss_mb():
+    """This process's resident memory.  Cheap enough to stamp on every crumb."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / 1048576.0
+    except (OSError, ValueError, IndexError):
+        return float("nan")
+
+
+def _mem_summary():
+    """Free memory and swap at startup.
+
+    Recorded because an out-of-memory kill leaves no other trace, and this box
+    has 8 GB against ULogs that parse into hundreds of megabytes."""
+    want = ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")
+    vals = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                if key in want:
+                    vals[key] = int(rest.split()[0]) / 1048576.0
+    except (OSError, ValueError):
+        return "unknown"
+    return "  ".join(f"{k}={vals[k]:.1f}GB" for k in want if k in vals)
+
+
+def crumb(msg):
+    """Record what the browser is ABOUT to do, in case it does not survive it.
+
+    Flushed but not fsynced: a crashing process loses its Python buffer, not
+    the kernel's page cache, so flush() is all a post-mortem needs."""
+    if _crash_fh is None:
+        return
+    try:
+        _crash_fh.write(f"{time.strftime('%H:%M:%S')} "
+                        f"rss={_rss_mb():5.0f}MB  {msg}\n")
+        _crash_fh.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _previous_crash():
+    """The last session's lines, if it never wrote its clean-exit marker."""
+    try:
+        with open(CRASH_LOG, errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    starts = [i for i, ln in enumerate(lines) if ln.startswith(SESSION_MARK)]
+    if not starts:
+        return []
+    last = lines[starts[-1]:]
+    if any(ln.startswith(EXIT_MARK) for ln in last):
+        return []                   # that session shut down cleanly
+    return last
+
+
+def install_crash_log():
+    """Point every crash path at CRASH_LOG.
+
+    Returns the previous session's lines if it died without writing its clean
+    exit marker, so the browser can show them the moment it reopens."""
+    global _crash_fh
+    if _crash_fh is not None:
+        return []
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG), exist_ok=True)
+        if (os.path.exists(CRASH_LOG)
+                and os.path.getsize(CRASH_LOG) > CRASH_LOG_MAX):
+            os.replace(CRASH_LOG, CRASH_LOG + ".1")
+        earlier = _previous_crash()
+        _crash_fh = open(CRASH_LOG, "a", buffering=1, errors="replace")
+    except OSError:
+        return []                   # a browser that cannot log still runs
+
+    faulthandler.enable(file=_crash_fh, all_threads=True)
+    # SIGTERM is what a kill or a session logout sends.  SIGUSR1 is the manual
+    # one: `kill -USR1 <pid>` dumps the stacks of a browser that has HUNG
+    # rather than crashed, which none of the other traps here can see.
+    for sig in (signal.SIGTERM, signal.SIGUSR1):
+        try:
+            faulthandler.register(sig, file=_crash_fh, all_threads=True,
+                                  chain=True)
+        except (AttributeError, RuntimeError, OSError):
+            pass
+
+    def hook(etype, value, tb):
+        try:
+            _crash_fh.write(f"\n--- unhandled {etype.__name__} at "
+                            f"{time.strftime('%H:%M:%S')} ---\n")
+            traceback.print_exception(etype, value, tb, file=_crash_fh)
+            _crash_fh.flush()
+        except (OSError, ValueError):
+            pass
+        sys.__excepthook__(etype, value, tb)
+
+    sys.excepthook = hook
+    threading.excepthook = lambda arg: hook(arg.exc_type, arg.exc_value,
+                                            arg.exc_traceback)
+
+    _crash_fh.write(
+        f"\n{SESSION_MARK}{time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"pid={os.getpid()} python={sys.version.split()[0]} "
+        f"pyqt={QtCore.PYQT_VERSION_STR} qt={QtCore.QT_VERSION_STR} "
+        f"mpl={matplotlib.__version__} ===\n"
+        f"         {_mem_summary()}\n")
+    _crash_fh.flush()
+    return earlier
+
+
+def close_crash_log():
+    """Write the marker whose ABSENCE is how the next session detects a crash."""
+    if _crash_fh is None:
+        return
+    try:
+        _crash_fh.write(f"{EXIT_MARK}{time.strftime('%H:%M:%S')} ===\n")
+        _crash_fh.flush()
+    except (OSError, ValueError):
+        pass
+
+
 def _natural_key(name):
     """Digit runs compared as numbers, so log_9 sorts before log_10.
 
@@ -95,6 +249,31 @@ def _natural_key(name):
 
 def _fmt_size(n):
     return f"{n/1e6:.0f} MB" if n >= 1e6 else f"{n/1e3:.0f} kB"
+
+
+# --- notes ------------------------------------------------------------------
+# Free-text notes live in a sidecar beside the log rather than only in this
+# browser's JSON state, for three reasons: they survive a wiped config, they
+# travel with the folder when a run directory is copied off this machine, and
+# they are readable (and greppable) without opening the GUI -- the same bargain
+# FC_log_diag.txt already makes in the HITL run folders.  The rename path
+# already knows how to carry sidecars along.
+#
+# The JSON state is the fallback for logs on read-only media (a mounted card, a
+# share), so a note is never silently lost just because the folder said no.
+NOTES_SUFFIX = "_notes.txt"
+
+
+def notes_path_for(path):
+    """<folder>/<name>.ulg -> <folder>/<name>_notes.txt"""
+    stem = path[:-4] if path.lower().endswith(".ulg") else path
+    return stem + NOTES_SUFFIX
+
+
+def _first_line(text, width=90):
+    """The one-line preview shown next to a collapsed Notes header."""
+    line = next((l.strip() for l in text.splitlines() if l.strip()), "")
+    return line if len(line) <= width else line[:width - 1] + "\u2026"
 
 
 # --- the scrollable plot page -----------------------------------------------
@@ -166,6 +345,18 @@ class PlotPage(QtWidgets.QScrollArea):
             item = self._box.takeAt(0)
             w = item.widget()
             if w is not None:
+                # Every builder makes its figure with plt.figure(), and pyplot
+                # keeps a STRONG reference to each one in a global registry --
+                # plus, on the Qt backend, a hidden window to manage it.
+                # Dropping the canvas widget therefore frees NOTHING: the
+                # figure, its artists and the arrays they close over stay alive
+                # for the life of the process.  That is ~150 MB per log opened,
+                # so a browsing session walks itself into the OOM killer, which
+                # is SIGKILL and leaves no traceback.  plt.close() is what
+                # actually releases it.
+                fig = getattr(w, "figure", None)
+                if fig is not None:
+                    plt.close(fig)
                 w.setParent(None)
                 w.deleteLater()
         self._navs = []
@@ -195,6 +386,15 @@ class PlotPage(QtWidgets.QScrollArea):
             nav.on_xlim = lambda lo, hi, n=nav: self._nav_changed(n, lo, hi)
             self._navs.append(nav)
         canvas.draw_idle()
+
+    def figures(self):
+        """Every figure currently on the page (spacer items excluded)."""
+        out = []
+        for i in range(self._box.count()):
+            w = self._box.itemAt(i).widget()
+            if w is not None and getattr(w, "figure", None) is not None:
+                out.append(w.figure)
+        return out
 
     def finish(self):
         self._box.addStretch(1)
@@ -488,6 +688,11 @@ class Browser(QtWidgets.QMainWindow):
         self.state = _load_state()
         self.state.setdefault("folders", [])
         self.state.setdefault("durations", {})
+        self.state.setdefault("notes", {})        # fallback store, see notes_path_for
+        self.state.setdefault("notes_open", False)
+        self._notes_path = None       # which log the notes box currently holds
+        self._notes_dirty = False
+        self._auto_open = False       # see _toggle_notes
         self._thread = None
         self._worker = None
         self._current = None
@@ -574,6 +779,8 @@ class Browser(QtWidgets.QMainWindow):
             f"font-size: 13px; font-weight: 600; padding: 0 10px 6px 10px;")
         cv.addWidget(self.title)
 
+        cv.addWidget(self._build_notes())
+
         self.page = PlotPage()
         cv.addWidget(self.page, 1)
 
@@ -600,13 +807,176 @@ class Browser(QtWidgets.QMainWindow):
         self._debounce.setInterval(400)
         self._debounce.timeout.connect(self._load_selected)
 
+    # -- notes
+    def _build_notes(self):
+        """The collapsible free-text box that sits above the plots.
+
+        Collapsed by default so it costs no vertical space on a log you are only
+        skimming, but it opens itself for any log that already HAS a note -- a
+        note you cannot see is a note you will not read.  When it is closed the
+        header carries the first line, so the dropdown marker is not the only
+        hint that something was written here."""
+        box = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(box)
+        v.setContentsMargins(10, 0, 10, 6)
+        v.setSpacing(3)
+
+        head = QtWidgets.QHBoxLayout()
+        head.setSpacing(8)
+        self.btn_notes = QtWidgets.QToolButton()
+        self.btn_notes.setText("Notes")
+        self.btn_notes.setCheckable(True)
+        self.btn_notes.setArrowType(QtCore.Qt.RightArrow)
+        self.btn_notes.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.btn_notes.setToolTip("Free-text notes for the open log.  Saved "
+                                  "automatically, beside the .ulg.")
+        self.btn_notes.toggled.connect(self._toggle_notes)
+        head.addWidget(self.btn_notes)
+        self.lbl_notes = QtWidgets.QLabel("")
+        self.lbl_notes.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        head.addWidget(self.lbl_notes, 1)
+        v.addLayout(head)
+
+        self.notes_edit = QtWidgets.QPlainTextEdit()
+        self.notes_edit.setPlaceholderText(
+            "What you were testing, what went wrong, what to look at next\u2026")
+        self.notes_edit.setStyleSheet("font-size: 12px;")
+        self.notes_edit.setMinimumHeight(64)
+        self.notes_edit.setMaximumHeight(150)
+        self.notes_edit.setEnabled(False)
+        self.notes_edit.textChanged.connect(self._notes_changed)
+        v.addWidget(self.notes_edit)
+
+        # Autosave: a keystroke restarts the timer, so the write happens once
+        # you pause rather than once per character.  Every path that could lose
+        # the buffer (switching logs, closing the window) flushes it first.
+        self._notes_timer = QtCore.QTimer(self)
+        self._notes_timer.setSingleShot(True)
+        self._notes_timer.setInterval(700)
+        self._notes_timer.timeout.connect(self._flush_notes)
+
+        # The "saved" tick is transient; this clears it without clearing a
+        # collapsed header's preview line.
+        self._notes_ack = QtCore.QTimer(self)
+        self._notes_ack.setSingleShot(True)
+        self._notes_ack.setInterval(1600)
+        self._notes_ack.timeout.connect(self._update_notes_header)
+
+        self.btn_notes.setChecked(bool(self.state.get("notes_open")))
+        self._toggle_notes(self.btn_notes.isChecked())
+        return box
+
+    def _toggle_notes(self, on):
+        self.notes_edit.setVisible(bool(on))
+        self.btn_notes.setArrowType(QtCore.Qt.DownArrow if on
+                                    else QtCore.Qt.RightArrow)
+        # Opening the box FOR the user (a log that has a note) is not the user
+        # saying they want it open on every log, so that case does not overwrite
+        # the remembered preference.
+        if not self._auto_open:
+            self.state["notes_open"] = bool(on)
+            _save_state(self.state)
+        self._update_notes_header()
+
+    def _update_notes_header(self, status=""):
+        """Right of the header: a save acknowledgement, or the collapsed preview."""
+        if status:
+            self.lbl_notes.setText(status)
+            return
+        if self._notes_path is None:
+            self.lbl_notes.setText("")
+            return
+        text = self.notes_edit.toPlainText().strip()
+        if self.btn_notes.isChecked():
+            self.lbl_notes.setText("" if text else "nothing written yet")
+        else:
+            self.lbl_notes.setText(_first_line(text) if text
+                                   else "(none) \u2014 click to add")
+
+    def _has_note(self, path):
+        """Cheap enough to ask once per dropdown row: one stat, or a dict hit."""
+        if os.path.exists(notes_path_for(path)):
+            return True
+        return bool((self.state.get("notes") or {}).get(os.path.abspath(path)))
+
+    def _read_notes(self, path):
+        try:
+            with open(notes_path_for(path), encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return (self.state.get("notes") or {}).get(os.path.abspath(path), "")
+
+    def _write_notes(self, path, text):
+        """Sidecar first, JSON state if the folder will not take it.
+
+        An emptied note deletes the sidecar rather than leaving a 0-byte file
+        next to the log."""
+        side = notes_path_for(path)
+        key = os.path.abspath(path)
+        try:
+            if text.strip():
+                with open(side, "w", encoding="utf-8") as f:
+                    f.write(text)
+            elif os.path.exists(side):
+                os.remove(side)
+            self.state.get("notes", {}).pop(key, None)
+        except OSError as e:
+            # Read-only media, most likely.  Keep the note; say where it went,
+            # once, so it is not a surprise when the folder is copied elsewhere.
+            self.state.setdefault("notes", {})[key] = text
+            self._log(f"  notes: {os.path.basename(side)} not writable ({e.strerror}); "
+                      f"kept in {STATE_PATH}")
+        _save_state(self.state)
+
+    def _notes_changed(self):
+        self._notes_dirty = True
+        self._notes_ack.stop()
+        self._update_notes_header("unsaved\u2026")
+        self._notes_timer.start()
+
+    def _flush_notes(self):
+        """Write the buffer out if it changed.  Safe to call any number of times."""
+        self._notes_timer.stop()
+        if not self._notes_dirty or self._notes_path is None:
+            return
+        path = self._notes_path
+        self._write_notes(path, self.notes_edit.toPlainText())
+        self._notes_dirty = False
+        self._refresh_picker_row(path)      # the pencil marker may have changed
+        self._update_notes_header("saved \u2713")
+        self._notes_ack.start()
+
+    def _load_notes(self, path):
+        """Point the box at another log.  Flushes the one it was holding first."""
+        self._flush_notes()
+        self._notes_path = path
+        text = self._read_notes(path) if path else ""
+        self.notes_edit.blockSignals(True)
+        self.notes_edit.setPlainText(text)
+        self.notes_edit.blockSignals(False)
+        self.notes_edit.setEnabled(path is not None)
+        self._notes_dirty = False
+        self._notes_ack.stop()
+        if text.strip() and not self.btn_notes.isChecked():
+            self._auto_open = True
+            try:
+                self.btn_notes.setChecked(True)  # calls _toggle_notes -> header
+            finally:
+                self._auto_open = False
+        else:
+            self._update_notes_header()
+
     # -- the dropdown, projected from the tree
     def _row_text(self, item):
         """One dropdown line: the name, then the columns the tree used to show."""
         bits = [b for b in (item.text(1), item.text(2),
                             f"{item.text(3)} {item.text(4)}".strip(),
                             item.text(5)) if b and b != "—"]
-        name = item.text(0)
+        # Two columns of prefix on EVERY row, so the marked ones stand out
+        # without knocking the names out of alignment in the monospace list.
+        path = item.data(0, QtCore.Qt.UserRole)
+        mark = "✎ " if path and self._has_note(path) else "  "
+        name = mark + item.text(0)
         return f"{name}   ·   {'  ·  '.join(bits)}" if bits else name
 
     def _rebuild_picker(self):
@@ -663,6 +1033,19 @@ class Browser(QtWidgets.QMainWindow):
             self._debounce.start()
 
     # -- library
+    def report_crash(self, earlier):
+        """Show what the LAST session was doing when it died, in the console.
+
+        A crash log nobody reads is no better than no crash log, and the moment
+        the window reopens is the only moment the user is certainly looking."""
+        self._log(f"crash log: {CRASH_LOG}")
+        if not earlier:
+            return
+        self._log("  !! the previous session did not exit cleanly -- its last "
+                  "moments:")
+        for line in earlier[-16:]:
+            self._log(f"     {line}")
+
     def _log(self, msg):
         self.console.appendPlainText(msg)
         self.console.verticalScrollBar().setValue(
@@ -990,9 +1373,12 @@ class Browser(QtWidgets.QMainWindow):
         if self._thread is not None:
             return                  # a parse is already running; ignore
         self._current = path
+        self._load_notes(path)      # before the parse: notes are readable at once
         self.title.setText(f"{os.path.basename(path)}   —   reading…")
         self.busy.show()
         self._log(f"reading {path}")
+        crumb(f"parse {os.path.basename(path)} "
+              f"({os.path.getsize(path) / 1048576.0:.0f}MB)")
 
         self._thread = QtCore.QThread(self)
         self._worker = ParseWorker(path, ulog_plots.all_topics(self.ctx))
@@ -1013,6 +1399,7 @@ class Browser(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(object, str, float)
     def _on_parsed(self, ulog, path, secs):
         self._teardown_thread()
+        crumb(f"parsed in {secs:.1f}s, building plots")
         self._log(f"  parsed in {secs:.1f}s")
         mins = duration_min(ulog)
         self._remember_duration(path, mins)
@@ -1045,6 +1432,7 @@ class Browser(QtWidgets.QMainWindow):
             sub = PlotCtx(smooth=self.ctx.smooth, use_abs=self.ctx.use_abs,
                           rate_src=self.ctx.rate_src, adds=list(self.ctx.adds),
                           debias=self.ctx.debias, page_scroll=True)
+            crumb(f"build {spec.key}")
             try:
                 fig = spec.build(ulog, sub, path)
             except Exception as e:
@@ -1064,6 +1452,21 @@ class Browser(QtWidgets.QMainWindow):
                           getattr(fig, "_page_height", spec.height))
             self.jump.addItem(spec.title, spec.key)
         self.page.finish()
+        self._close_orphan_figures()
+        crumb("page ready")
+
+    def _close_orphan_figures(self):
+        """Close figures pyplot is holding that no canvas on the page shows.
+
+        The page closes the figures it displayed when the next log replaces
+        them, but a builder that creates a figure and then returns None -- the
+        "nothing plottable in this log" path, which several take -- leaves one
+        behind that nothing else will ever reach."""
+        shown = {id(f) for f in self.page.figures()}
+        for num in plt.get_fignums():
+            fig = plt.figure(num)
+            if id(fig) not in shown:
+                plt.close(fig)
 
     @QtCore.pyqtSlot(str, str)
     def _on_parse_failed(self, path, msg):
@@ -1137,7 +1540,7 @@ class Browser(QtWidgets.QMainWindow):
         moves = [(path, target)]
         old_stem = old[:-4]
         new_stem = new[:-4]
-        for suffix in ("_diag.txt", ".ulg:Zone.Identifier"):
+        for suffix in (NOTES_SUFFIX, "_diag.txt", ".ulg:Zone.Identifier"):
             src = os.path.join(folder, old_stem + suffix)
             if os.path.exists(src):
                 moves.append((src, os.path.join(folder, new_stem + suffix)))
@@ -1152,11 +1555,16 @@ class Browser(QtWidgets.QMainWindow):
         rec = self.state["durations"].pop(os.path.abspath(path), None)
         if rec:
             self.state["durations"][os.path.abspath(target)] = rec
+        note = self.state.get("notes", {}).pop(os.path.abspath(path), None)
+        if note:                    # only set for logs whose folder is read-only
+            self.state["notes"][os.path.abspath(target)] = note
         _save_state(self.state)
         for src, dst in moves:
             self._log(f"renamed {os.path.basename(src)} -> {os.path.basename(dst)}")
         if self._current == path:
             self._current = target
+        if self._notes_path == path:
+            self._notes_path = target
         self._populate()
         self._select_path(target)
 
@@ -1417,6 +1825,8 @@ class Browser(QtWidgets.QMainWindow):
                 f"the reason.")
 
     def closeEvent(self, event):
+        crumb("closing")
+        self._flush_notes()
         self._stop_library_scan()
         self._teardown_thread()
         if self._proc is not None:
@@ -1427,10 +1837,17 @@ class Browser(QtWidgets.QMainWindow):
 
 def browse(paths=(), ctx=None):
     """Open the browser.  Blocks until the window is closed."""
+    # Before the QApplication: a crash while Qt is coming up is still a crash,
+    # and it is the one with the least other evidence.
+    earlier = install_crash_log()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    crumb("qt up, building window")
     win = Browser(paths=[p for p in paths if p], ctx=ctx)
     win.show()
+    win.report_crash(earlier)
+    crumb("window shown")
     app.exec_()
+    close_crash_log()
     return win
 
 
