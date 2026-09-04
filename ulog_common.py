@@ -154,6 +154,102 @@ def parse_ref(ref):
     return m.group(1), int(m.group(2) or 0), m.group(3)
 
 
+
+# --- ad-hoc plotting support (the Report tab) -------------------------------
+
+def decimate(t, y, n_px=1200):
+    """Thin a series to about ``2 * n_px`` points WITHOUT losing its extremes.
+
+    Drawing a raw 278 Hz channel over a 40 minute flight hands matplotlib 330k
+    points for a strip a thousand pixels wide, and a report graph stacks several
+    of those across several logs -- millions of points to decide the colour of a
+    few thousand pixels.  Naive thinning (``y[::k]``) is what makes that fast and
+    is also how you lose the one-sample spike that was the entire reason you
+    opened the log.
+
+    So: split into one bin per pixel column and keep each bin's MINIMUM and
+    MAXIMUM, at their real timestamps, emitted in the order they actually
+    occurred.  Every excursion survives, because an excursion is by definition
+    the extreme of whatever bin it lands in.  The rest of the samples could not
+    have been distinguished on screen anyway.
+
+    Returns the arrays unchanged when they are already small enough, so callers
+    can decimate unconditionally.  Statistics must be computed on the FULL
+    arrays -- this is a drawing optimisation and the mean of an envelope is not
+    the mean of the data.
+    """
+    t = np.asarray(t)
+    y = np.asarray(y)
+    n = t.size
+    if n_px < 1 or n <= 2 * n_px:
+        return t, y
+
+    # Ceiling divide, so the bin count cannot overshoot the pixel budget: with
+    # a floor divide, n=1603 into 800 columns gives 801 bins rather than 800.
+    k = max(2, -(-n // n_px))           # samples per bin
+    m = max(1, n // k)                  # whole bins; the tail is handled below
+    head = y[:m * k].reshape(m, k)
+
+    base = np.arange(m) * k
+    lo = base + head.argmin(axis=1)
+    hi = base + head.argmax(axis=1)
+
+    # Interleave as (earlier, later) rather than always (min, max): a line drawn
+    # through them then still slopes the way the signal did inside the bin.
+    idx = np.empty(2 * m, dtype=np.intp)
+    idx[0::2] = np.minimum(lo, hi)
+    idx[1::2] = np.maximum(lo, hi)
+
+    if m * k < n:                       # the partial bin at the end
+        tail = y[m * k:]
+        off = m * k
+        ends = np.unique([tail.argmin(), tail.argmax()])
+        idx = np.concatenate([idx, off + ends])
+
+    return t[idx], y[idx]
+
+
+# What a field turned out to contain.  PX4 logs a great many fields it never
+# fills in for a given airframe or firmware, and they are indistinguishable from
+# useful ones by name alone -- 43% of the fields in a real log here are one of
+# the latter two.
+VARY, CONST, EMPTY = "vary", "const", "empty"
+
+
+def field_inventory(ulog):
+    """Every plottable field in the log: ``[(ref, topic, mid, name, kind)]``.
+
+    ``ref`` is the canonical "topic[i].field" that parse_ref() accepts, so an
+    inventory entry can be handed straight back to field().  ``kind`` is one of
+    VARY / CONST / EMPTY, which is what lets the picker hide the ~43% of entries
+    that cannot produce a line worth looking at.
+
+    Costs ~0.7 s on the largest log in the library, so it belongs on the parse
+    thread beside the parse itself, not in front of the user's next click.
+    """
+    out = []
+    for d in ulog.data_list:
+        for name in d.data:
+            if name == "timestamp":
+                continue
+            a = np.asarray(d.data[name])
+            if a.dtype.kind not in "fiub":
+                kind = VARY             # strings and the like: never judged flat
+            else:
+                a = a.astype(float, copy=False)
+                a = a[np.isfinite(a)]
+                if a.size == 0:
+                    kind = EMPTY
+                elif a.min() == a.max():
+                    kind = CONST
+                else:
+                    kind = VARY
+            out.append((f"{d.name}[{d.multi_id}].{name}",
+                        d.name, d.multi_id, name, kind))
+    out.sort(key=lambda r: (r[1], r[2], r[3]))
+    return out
+
+
 def primary_ekf(ulog):
     """Which EKF instance the selector was using (the log carries three).
 

@@ -33,10 +33,11 @@ matplotlib.use("QtAgg")            # before any pyplot import, to match the shel
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from pyulog import ULog
-
 import ulog_plots
+from qt_common import NotesBox, PlotCanvas
+from report_tab import ReportTab
+from ulog_cache import (LogCache, MeasuredULog, corruption_of, parse_ulog,
+                        start_epoch)
 from ulog_common import C_BAD, C_MUTED, C_SURFACE, PlotCtx, duration_min
 
 # Where logs are looked for, in order.  Each entry is (label, path, is_hitl_tree).
@@ -270,53 +271,6 @@ def notes_path_for(path):
     return stem + NOTES_SUFFIX
 
 
-def _first_line(text, width=90):
-    """The one-line preview shown next to a collapsed Notes header."""
-    line = next((l.strip() for l in text.splitlines() if l.strip()), "")
-    return line if len(line) <= width else line[:width - 1] + "\u2026"
-
-
-# --- the scrollable plot page -----------------------------------------------
-
-class PlotCanvas(FigureCanvasQTAgg):
-    """A matplotlib canvas that gives the bare mouse wheel back to the page.
-
-    Without this the canvas eats every wheel event to zoom, and once the pointer
-    is over a plot -- which is most of the window -- the scroll area is stuck.
-    Ctrl+wheel still reaches matplotlib, which is where Nav has moved zooming to.
-    """
-
-    def __init__(self, figure):
-        super().__init__(figure)
-        # Without this the canvas never takes keyboard focus, which is also why
-        # matplotlib's own modifier tracking cannot be relied on here (see below).
-        self.setFocusPolicy(QtCore.Qt.WheelFocus)
-        self._nav_mods = None
-
-    def wheelEvent(self, event):
-        mods = event.modifiers()
-        if not (mods & QtCore.Qt.ControlModifier):
-            event.ignore()          # bubbles up to the QScrollArea
-            return
-        # Hand Nav the modifiers explicitly.  matplotlib would otherwise report
-        # key=None unless this canvas happened to hold keyboard focus, so
-        # ctrl+wheel would do nothing while the log tree was focused -- i.e.
-        # almost always.
-        self._nav_mods = "ctrl+shift" if mods & QtCore.Qt.ShiftModifier else "ctrl"
-        try:
-            super().wheelEvent(event)
-        finally:
-            self._nav_mods = None
-        # ACCEPT, or the zoom happens AND the page scrolls out from under it.
-        # Qt calls ignore() on a wheel event before delivering it and walks up
-        # the parent chain until someone accepts; matplotlib's
-        # FigureCanvasQT.wheelEvent handles the event but never accepts it, so
-        # without this the QScrollArea gets it next and scrolls the page away
-        # from the plot you were zooming.  Unconditional on ctrl: this gesture
-        # belongs to the canvas whether or not the notch resolved to a step.
-        event.accept()
-
-
 class PlotPage(QtWidgets.QScrollArea):
     """The stack of plots for one log, with their time axes linked."""
 
@@ -474,64 +428,6 @@ def fmt_param(v):
 
 # --- how much of the file could not be read -----------------------------------
 
-class MeasuredULog(ULog):
-    """A ULog that also reports HOW MUCH of the file the parser threw away.
-
-    pyulog reports corruption as a single boolean (`file_corruption`), which
-    cannot tell a log that lost one record from one that lost a third of the
-    flight -- and the answer matters, because the first is ignorable and the
-    second invalidates the analysis.
-
-    The recovery path is the measurement.  On a bad record the parser seeks
-    forward for the next SYNC marker (`_find_sync`), and the distance it covers
-    is exactly the span it could not read.  Measured on log_53: 21065 bytes over
-    3 events, which lines up with the 50 ms and 201 ms holes in sensor_combined.
-
-    Counting is gated on `_file_corrupt` because `_find_sync` is ALSO how pyulog
-    skips a message type it simply does not know -- a newer firmware adding a
-    record type is not corruption, and both clean logs in the library report
-    exactly 0 with this guard in place.  A file that corrupts early and then
-    meets an unknown type can over-count; that errs toward flagging, which is the
-    right way to be wrong here.
-    """
-
-    def __init__(self, *args, **kwargs):
-        self.corrupt_bytes = 0
-        self.corrupt_events = 0
-        super().__init__(*args, **kwargs)
-
-    def _find_sync(self, last_n_bytes=-1):
-        fh = self._file_handle
-        start = fh.tell()
-        # last_n_bytes != -1 means "search backwards into the payload we just
-        # read", so the span begins before the current position.
-        base = start - last_n_bytes if last_n_bytes != -1 else start
-        was_corrupt = self._file_corrupt
-        result = super()._find_sync(last_n_bytes)
-        skipped = fh.tell() - base
-        if was_corrupt and skipped > 0:
-            self.corrupt_bytes += skipped
-            self.corrupt_events += 1
-        return result
-
-
-def corruption_of(ulog, path):
-    """{corrupt_bytes, corrupt_events, corrupt_pct} for a parsed log."""
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = 0
-    nbytes = getattr(ulog, "corrupt_bytes", 0)
-    if not nbytes and getattr(ulog, "file_corruption", False):
-        # Flagged but nothing measured: a plain ULog, or corruption found on a
-        # path that does not resync.  Report it as unknown-size rather than as
-        # clean -- "0.0%" would be a claim we cannot support.
-        return {"corrupt_bytes": -1, "corrupt_events": -1, "corrupt_pct": -1.0}
-    return {"corrupt_bytes": nbytes,
-            "corrupt_events": getattr(ulog, "corrupt_events", 0),
-            "corrupt_pct": (100.0 * nbytes / size) if size else 0.0}
-
-
 # --- when did this flight happen --------------------------------------------
 # The file's mtime answers "when was this file last written", which for a log
 # pulled off an SD card is the DOWNLOAD time, not the flight.  Measured on
@@ -566,33 +462,6 @@ def _stamp_from_name(path):
     return None
 
 
-def _start_from_parsed(ulog):
-    """Epoch seconds of the log's FIRST sample, from GNSS UTC.  None if no fix.
-
-    `time_utc_usec` is absolute (microseconds since the Unix epoch) while
-    `timestamp` is microseconds since boot, so one sample carrying both pins the
-    whole log to wall clock:
-
-        start_epoch = utc[i] - (timestamp[i] - ulog.start_timestamp)
-
-    Samples before the first fix carry 0, hence the 1e15 floor (~year 2001) --
-    without it the answer is 1970 and looks like a bug in this function rather
-    than an absent fix.
-    """
-    import numpy as np
-    for d in ulog.data_list:
-        if "time_utc_usec" not in d.data:
-            continue
-        utc = np.asarray(d.data["time_utc_usec"], dtype=np.float64)
-        ts = np.asarray(d.data["timestamp"], dtype=np.float64)
-        ok = utc > 1e15
-        if not ok.any():
-            continue
-        i = int(np.argmax(ok))
-        return float(utc[i] - (ts[i] - ulog.start_timestamp)) / 1e6
-    return None
-
-
 def scan_log(path):
     """Everything the library columns need that requires reading the file.
 
@@ -601,7 +470,7 @@ def scan_log(path):
     23 s library scan for no gain."""
     ulog = MeasuredULog(path, message_name_filter_list=GPS_TOPICS)
     facts = corruption_of(ulog, path)
-    facts["started"] = _start_from_parsed(ulog) or 0.0
+    facts["started"] = start_epoch(ulog) or 0.0
     facts["date_src"] = "gps" if facts["started"] else "none"
     return facts
 
@@ -671,7 +540,7 @@ class ParseWorker(QtCore.QObject):
     def run(self):
         try:
             t0 = time.time()
-            ulog = MeasuredULog(self.path, message_name_filter_list=self.topics)
+            ulog = parse_ulog(self.path, self.topics)
             self.done.emit(ulog, self.path, time.time() - t0)
         except Exception as e:
             self.failed.emit(self.path, f"{type(e).__name__}: {e}")
@@ -691,14 +560,15 @@ class Browser(QtWidgets.QMainWindow):
         self.state.setdefault("notes", {})        # fallback store, see notes_path_for
         self.state.setdefault("notes_open", False)
         self._notes_path = None       # which log the notes box currently holds
-        self._notes_dirty = False
-        self._auto_open = False       # see _toggle_notes
         self._thread = None
         self._worker = None
         self._current = None
         self._proc = None
         self._scan_thread = None
         self._scanner = None
+        # One cache for the whole window.  The Report tab is handed the same
+        # object, so a log opened in either tab is parsed once for both.
+        self.cache = LogCache(log=lambda m: self._log(m))
 
         self.setWindowTitle("logGraph - ULog browser")
         self.resize(1600, 950)
@@ -716,7 +586,17 @@ class Browser(QtWidgets.QMainWindow):
         # time series actually needs.
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        cv = QtWidgets.QVBoxLayout(central)
+        outer = QtWidgets.QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.tabs = QtWidgets.QTabWidget()
+        outer.addWidget(self.tabs, 1)
+
+        # Everything built below is the BROWSE tab -- one log, its seven plots.
+        # The Report tab is a separate widget, added once the library tree it
+        # reads its log list from exists.
+        browse = QtWidgets.QWidget()
+        cv = QtWidgets.QVBoxLayout(browse)
         cv.setContentsMargins(0, 0, 0, 0)
         cv.setSpacing(0)
 
@@ -784,11 +664,16 @@ class Browser(QtWidgets.QMainWindow):
         self.page = PlotPage()
         cv.addWidget(self.page, 1)
 
+        self.tabs.addTab(browse, "Browse")
+
+        # One console under BOTH tabs rather than one each: the Report tab's
+        # parses and saves are the same running commentary, and a second pane
+        # would only halve the room each of them gets.
         self.console = QtWidgets.QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setMaximumHeight(110)
         self.console.setStyleSheet("font-family: monospace; font-size: 11px;")
-        cv.addWidget(self.console)
+        outer.addWidget(self.console)
 
         # The tree is still the MODEL -- it holds one row per log with the six
         # columns, the check states and the per-cell colours, and every method
@@ -807,6 +692,30 @@ class Browser(QtWidgets.QMainWindow):
         self._debounce.setInterval(400)
         self._debounce.timeout.connect(self._load_selected)
 
+        # After the tree, because the Report tab asks it what logs exist.  It
+        # shares this window's parse cache, so a log open in one tab is already
+        # parsed for the other.
+        self.report_tab = ReportTab(self.cache, self._library_entries, self._log,
+                                    root=self._log_analysis_root())
+        self.tabs.addTab(self.report_tab, "Report")
+
+    def _library_entries(self):
+        """[(path, one-line label)] for every log the library currently lists."""
+        out = []
+        for it in self._iter_items():
+            path = it.data(0, QtCore.Qt.UserRole)
+            if path:
+                out.append((path, self._row_text(it)))
+        return out
+
+    @staticmethod
+    def _log_analysis_root():
+        """Where reports are kept: beside the logs, not in the config directory."""
+        for label, path, _ in _default_roots():
+            if label == "Log Analysis":
+                return path
+        return None
+
     # -- notes
     def _build_notes(self):
         """The collapsible free-text box that sits above the plots.
@@ -815,83 +724,45 @@ class Browser(QtWidgets.QMainWindow):
         skimming, but it opens itself for any log that already HAS a note -- a
         note you cannot see is a note you will not read.  When it is closed the
         header carries the first line, so the dropdown marker is not the only
-        hint that something was written here."""
-        box = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(box)
-        v.setContentsMargins(10, 0, 10, 6)
-        v.setSpacing(3)
+        hint that something was written here.
 
-        head = QtWidgets.QHBoxLayout()
-        head.setSpacing(8)
-        self.btn_notes = QtWidgets.QToolButton()
-        self.btn_notes.setText("Notes")
-        self.btn_notes.setCheckable(True)
-        self.btn_notes.setArrowType(QtCore.Qt.RightArrow)
-        self.btn_notes.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.btn_notes.setToolTip("Free-text notes for the open log.  Saved "
-                                  "automatically, beside the .ulg.")
-        self.btn_notes.toggled.connect(self._toggle_notes)
-        head.addWidget(self.btn_notes)
-        self.lbl_notes = QtWidgets.QLabel("")
-        self.lbl_notes.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
-        head.addWidget(self.lbl_notes, 1)
-        v.addLayout(head)
-
-        self.notes_edit = QtWidgets.QPlainTextEdit()
-        self.notes_edit.setPlaceholderText(
-            "What you were testing, what went wrong, what to look at next\u2026")
-        self.notes_edit.setStyleSheet("font-size: 12px;")
-        self.notes_edit.setMinimumHeight(64)
-        self.notes_edit.setMaximumHeight(150)
-        self.notes_edit.setEnabled(False)
-        self.notes_edit.textChanged.connect(self._notes_changed)
-        v.addWidget(self.notes_edit)
-
-        # Autosave: a keystroke restarts the timer, so the write happens once
-        # you pause rather than once per character.  Every path that could lose
-        # the buffer (switching logs, closing the window) flushes it first.
-        self._notes_timer = QtCore.QTimer(self)
-        self._notes_timer.setSingleShot(True)
-        self._notes_timer.setInterval(700)
-        self._notes_timer.timeout.connect(self._flush_notes)
-
-        # The "saved" tick is transient; this clears it without clearing a
-        # collapsed header's preview line.
-        self._notes_ack = QtCore.QTimer(self)
-        self._notes_ack.setSingleShot(True)
-        self._notes_ack.setInterval(1600)
-        self._notes_ack.timeout.connect(self._update_notes_header)
-
-        self.btn_notes.setChecked(bool(self.state.get("notes_open")))
-        self._toggle_notes(self.btn_notes.isChecked())
-        return box
-
-    def _toggle_notes(self, on):
-        self.notes_edit.setVisible(bool(on))
-        self.btn_notes.setArrowType(QtCore.Qt.DownArrow if on
-                                    else QtCore.Qt.RightArrow)
-        # Opening the box FOR the user (a log that has a note) is not the user
-        # saying they want it open on every log, so that case does not overwrite
-        # the remembered preference.
-        if not self._auto_open:
+        The behaviour lives in NotesBox now, because the Report tab wants the
+        same box twice more (once per report, once per graph) and they differ
+        only in where the text is persisted to."""
+        def remember(on):
             self.state["notes_open"] = bool(on)
             _save_state(self.state)
-        self._update_notes_header()
 
-    def _update_notes_header(self, status=""):
-        """Right of the header: a save acknowledgement, or the collapsed preview."""
-        if status:
-            self.lbl_notes.setText(status)
-            return
+        self.notes = NotesBox(
+            label="Notes",
+            placeholder="What you were testing, what went wrong, what to look "
+                        "at next\u2026",
+            tooltip="Free-text notes for the open log.  Saved automatically, "
+                    "beside the .ulg.",
+            on_save=self._save_log_notes,
+            remember=(lambda: bool(self.state.get("notes_open")), remember))
+        return self.notes
+
+    def _save_log_notes(self, text):
+        """Where this box's text goes: a sidecar beside the .ulg."""
         if self._notes_path is None:
-            self.lbl_notes.setText("")
             return
-        text = self.notes_edit.toPlainText().strip()
-        if self.btn_notes.isChecked():
-            self.lbl_notes.setText("" if text else "nothing written yet")
-        else:
-            self.lbl_notes.setText(_first_line(text) if text
-                                   else "(none) \u2014 click to add")
+        self._write_notes(self._notes_path, text)
+        self._refresh_picker_row(self._notes_path)   # the pencil may have changed
+
+    def _flush_notes(self):
+        """Write the buffer out if it changed.  Safe to call any number of times."""
+        self.notes.flush()
+
+    def _load_notes(self, path):
+        """Point the box at another log.  Flushes the one it was holding first.
+
+        Order matters: the flush has to happen while _notes_path still names the
+        log the text belongs to, or the previous log's note lands on this one."""
+        self.notes.flush()
+        self._notes_path = path
+        self.notes.set_text(self._read_notes(path) if path else "",
+                            enabled=path is not None)
 
     def _has_note(self, path):
         """Cheap enough to ask once per dropdown row: one stat, or a dict hit."""
@@ -927,44 +798,6 @@ class Browser(QtWidgets.QMainWindow):
             self._log(f"  notes: {os.path.basename(side)} not writable ({e.strerror}); "
                       f"kept in {STATE_PATH}")
         _save_state(self.state)
-
-    def _notes_changed(self):
-        self._notes_dirty = True
-        self._notes_ack.stop()
-        self._update_notes_header("unsaved\u2026")
-        self._notes_timer.start()
-
-    def _flush_notes(self):
-        """Write the buffer out if it changed.  Safe to call any number of times."""
-        self._notes_timer.stop()
-        if not self._notes_dirty or self._notes_path is None:
-            return
-        path = self._notes_path
-        self._write_notes(path, self.notes_edit.toPlainText())
-        self._notes_dirty = False
-        self._refresh_picker_row(path)      # the pencil marker may have changed
-        self._update_notes_header("saved \u2713")
-        self._notes_ack.start()
-
-    def _load_notes(self, path):
-        """Point the box at another log.  Flushes the one it was holding first."""
-        self._flush_notes()
-        self._notes_path = path
-        text = self._read_notes(path) if path else ""
-        self.notes_edit.blockSignals(True)
-        self.notes_edit.setPlainText(text)
-        self.notes_edit.blockSignals(False)
-        self.notes_edit.setEnabled(path is not None)
-        self._notes_dirty = False
-        self._notes_ack.stop()
-        if text.strip() and not self.btn_notes.isChecked():
-            self._auto_open = True
-            try:
-                self.btn_notes.setChecked(True)  # calls _toggle_notes -> header
-            finally:
-                self._auto_open = False
-        else:
-            self._update_notes_header()
 
     # -- the dropdown, projected from the tree
     def _row_text(self, item):
@@ -1143,8 +976,18 @@ class Browser(QtWidgets.QMainWindow):
         if current:
             self._select_path(current)
         self._start_library_scan()
+        self._notify_report_tab()
 
     # -- log dates, filled in behind the library
+    def _notify_report_tab(self):
+        """The library changed underneath a report -- re-resolve its logs.
+
+        Renames are the reason: a report holds basenames, and the row it points
+        at may now be called something else."""
+        tab = getattr(self, "report_tab", None)
+        if tab is not None:
+            tab._refresh_logs_ui()
+
     def _start_library_scan(self):
         """(Re)start the background scan over rows we have not read yet."""
         self._stop_library_scan()
@@ -1375,13 +1218,24 @@ class Browser(QtWidgets.QMainWindow):
         self._current = path
         self._load_notes(path)      # before the parse: notes are readable at once
         self.title.setText(f"{os.path.basename(path)}   —   reading…")
-        self.busy.show()
         self._log(f"reading {path}")
+        topics = ulog_plots.all_topics(self.ctx)
+
+        # A log the Report tab -- or a previous visit -- already read is redrawn
+        # without touching the disk.  _on_parsed is reached the same way either
+        # way, so everything downstream is unaware there was a cache at all.
+        hit = self.cache.get(path, topics)
+        if hit is not None:
+            crumb(f"cached {os.path.basename(path)}")
+            self._on_parsed(hit.ulog, path, 0.0)
+            return
+
+        self.busy.show()
         crumb(f"parse {os.path.basename(path)} "
               f"({os.path.getsize(path) / 1048576.0:.0f}MB)")
 
         self._thread = QtCore.QThread(self)
-        self._worker = ParseWorker(path, ulog_plots.all_topics(self.ctx))
+        self._worker = ParseWorker(path, topics)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_parsed)
@@ -1399,14 +1253,18 @@ class Browser(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(object, str, float)
     def _on_parsed(self, ulog, path, secs):
         self._teardown_thread()
+        if secs:
+            self.cache.put(path, ulog, ulog_plots.all_topics(self.ctx))
+            self._log(f"  parsed in {secs:.1f}s")
+        else:
+            self._log("  from cache")
         crumb(f"parsed in {secs:.1f}s, building plots")
-        self._log(f"  parsed in {secs:.1f}s")
         mins = duration_min(ulog)
         self._remember_duration(path, mins)
         # The date comes free here: this parse already asked for the GPS topics
         # (the altitude plot needs them), so re-reading the file in the scanner
         # for a log the user just opened would be pure waste.
-        started = _start_from_parsed(ulog) or 0.0
+        started = start_epoch(ulog) or 0.0
         facts = corruption_of(ulog, path)
         facts.update(started=started, date_src="gps" if started else "none",
                      scan_v=SCAN_VERSION)
@@ -1827,12 +1685,42 @@ class Browser(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         crumb("closing")
         self._flush_notes()
+        if not self._offer_to_save_report():
+            event.ignore()
+            return
         self._stop_library_scan()
         self._teardown_thread()
+        if getattr(self, "report_tab", None) is not None:
+            self.report_tab.stop()
         if self._proc is not None:
             self._proc.kill()
         _save_state(self.state)
         super().closeEvent(event)
+
+
+    def _offer_to_save_report(self):
+        """True to carry on closing, False to stay open.
+
+        Per-log notes autosave, so nothing else in this window can lose work on
+        exit; a report is a document the user assembled and has to be asked
+        about."""
+        tab = getattr(self, "report_tab", None)
+        if tab is None:
+            return True
+        tab.flush()
+        if not tab.has_unsaved():
+            return True
+        r = QtWidgets.QMessageBox.question(
+            self, "logGraph",
+            f"The report \u201c{tab.report.title or 'untitled'}\u201d has "
+            f"unsaved changes.\n\nSave it before closing?",
+            QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard
+            | QtWidgets.QMessageBox.Cancel, QtWidgets.QMessageBox.Save)
+        if r == QtWidgets.QMessageBox.Cancel:
+            return False
+        if r == QtWidgets.QMessageBox.Save:
+            tab._save_report()
+        return True
 
 
 def browse(paths=(), ctx=None):
