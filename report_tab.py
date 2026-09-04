@@ -36,116 +36,16 @@ from log_browser_crumbs import crumb
 from qt_common import NotesBox, PlotCanvas
 from report_model import (ALIGNMENTS, LogRef, Report, list_reports,
                           reports_dir)
-from ulog_cache import parse_ulog, start_epoch
-from ulog_common import (C_GRID, C_INK, C_MUTED, C_SURFACE, VARY,
-                         add_mouse_navigation, armed_spans, decimate, field,
-                         nav_hint, parse_ref, style_time_axis, window_values)
+from report_render import (DRAW_PX, STAT_COLS, assign_axes, build_figure,
+                           fit_value_axes, fmt_stat, gather_series, short_ref,
+                           stats_of)
+from ulog_cache import parse_ulog
+from ulog_common import (C_INK, C_MUTED, C_SURFACE, VARY, add_mouse_navigation,
+                         decimate, nav_hint, window_values)
 
 __all__ = ["ReportTab"]
 
-# Channel colours.  A categorical set -- these encode identity, not magnitude, so
-# they are chosen to stay apart at one-pixel line width and to survive the two
-# common colour-vision deficiencies, rather than to look like a ramp.
-SERIES_COLORS = [
-    "#2a78d6",   # blue
-    "#d2691e",   # orange
-    "#1baf7a",   # aqua
-    "#7b2d8e",   # purple
-    "#c0392b",   # red
-    "#8a7fb5",   # violet
-    "#4f7a28",   # olive
-    "#d81b7a",   # magenta
-    "#0f8f9e",   # teal
-    "#8a6d3b",   # brown
-]
-
-# Log identity.  Style rather than colour, so that "which channel" and "which
-# log" are read off two independent visual channels instead of competing for hue.
-LOG_STYLES = ["-", "--", "-.", (0, (1, 1.4))]
-
 GRAPH_HEIGHT = 430          # px of plot per card
-DRAW_PX = 1400              # decimation budget; a little over the widest canvas
-
-
-def series_color(i):
-    return SERIES_COLORS[i % len(SERIES_COLORS)]
-
-
-def log_style(i):
-    return LOG_STYLES[i % len(LOG_STYLES)]
-
-
-def short_ref(ref):
-    """'sensor_accel[0].temperature' -> 'sensor_accel.temperature' when there is
-    only one instance to speak of.  Legends are cramped enough."""
-    return ref.replace("[0]", "", 1) if "[0]" in ref else ref
-
-
-# --- time alignment ----------------------------------------------------------
-
-def align_offset(ulog, mode, epoch_base=None):
-    """Minutes to SUBTRACT from a log's own time base to line it up with others.
-
-    Returns (offset, problem).  `problem` is None when the log can satisfy the
-    requested alignment and a short phrase when it cannot -- the caller draws it
-    anyway, at offset zero, and says so on the plot.  Silently falling back would
-    put two flights on top of each other at an offset nobody chose, which is
-    worse than an ugly label.
-    """
-    if mode == "first_arm":
-        spans = armed_spans(ulog)
-        if not spans:
-            return 0.0, "never armed"
-        return float(spans[0][0]), None
-    if mode == "absolute":
-        ep = start_epoch(ulog)
-        if not ep:
-            return 0.0, "no GNSS fix"
-        if epoch_base is None:
-            return 0.0, None
-        return -(ep - epoch_base) / 60.0, None
-    return 0.0, None
-
-
-def absolute_base(ulogs):
-    """The earliest wall-clock start among these logs, or None if none is fixed."""
-    eps = [e for e in (start_epoch(u) for u in ulogs) if e]
-    return min(eps) if eps else None
-
-
-# --- statistics --------------------------------------------------------------
-
-STAT_COLS = ["n", "min", "max", "mean", "median", "std", "first", "last"]
-
-
-def stats_of(t, y, xlim=None):
-    """Summary of y over the visible window, from the FULL arrays.
-
-    Deliberately not computed from what was drawn: the drawn line is a min/max
-    envelope, whose mean and standard deviation are those of the extremes rather
-    than of the signal."""
-    if xlim is not None and t.size:
-        lo, hi = min(xlim), max(xlim)
-        a, b = np.searchsorted(t, [lo, hi])
-        y = y[a:b]
-    if y.size == 0:
-        return dict.fromkeys(STAT_COLS, None) | {"n": 0}
-    return {"n": int(y.size), "min": float(y.min()), "max": float(y.max()),
-            "mean": float(y.mean()), "median": float(np.median(y)),
-            "std": float(y.std()), "first": float(y[0]), "last": float(y[-1])}
-
-
-def fmt_stat(v):
-    if v is None:
-        return "—"
-    if isinstance(v, int):
-        return f"{v:,}"
-    if v == 0:
-        return "0"
-    a = abs(v)
-    if a >= 1e5 or a < 1e-3:
-        return f"{v:.3e}"
-    return f"{v:,.4g}"
 
 
 # --- loading -----------------------------------------------------------------
@@ -550,123 +450,24 @@ class GraphCard(QtWidgets.QFrame):
 
         crumb(f"report graph {self.graph.id}: {len(self.graph.fields)} field(s) "
               f"x {len(names)} log(s)")
-        series, problems = self._gather(names, ulogs)
+        series, problems = gather_series(self.graph, ulogs, names)
         self._draw(series, problems)
         self._fill_chosen(series)
         self.update_stats()
 
-    def _gather(self, names, ulogs):
-        """Turn the graph's (logs x fields) selection into drawable series."""
-        problems = []
-        base = (absolute_base([ulogs[n] for n in names])
-                if self.graph.align == "absolute" else None)
-        series = []
-        for li, name in enumerate(names):
-            ulog = ulogs[name]
-            off, why = align_offset(ulog, self.graph.align, base)
-            if why:
-                problems.append(f"{name}: {why}, drawn unaligned")
-            for fi, ref in enumerate(self.graph.fields):
-                try:
-                    topic, mid, fname = parse_ref(ref)
-                except ValueError:
-                    continue
-                t, y = field(ulog, topic, fname, mid)
-                if t.size == 0:
-                    problems.append(f"{name}: {short_ref(ref)} absent")
-                    continue
-                if self.graph.normalise:
-                    lo, hi = float(y.min()), float(y.max())
-                    y = (y - lo) / (hi - lo) if hi > lo else np.zeros_like(y)
-                series.append({
-                    "ref": ref, "log": name,
-                    "label": f"{short_ref(ref)} · {os.path.splitext(name)[0]}",
-                    "t": t - off, "y": y,
-                    "color": series_color(fi), "ls": log_style(li),
-                    "unaligned": bool(why)})
-        return series, problems
-
-    def _auto_axis(self, series):
-        """Split channels across two scales when their magnitudes do not mix.
-
-        Pack voltage at 15 and CPU load at 0.4 on one axis renders the second as
-        a flat line on the floor.  The decades are clustered rather than
-        thresholded so that a set of channels that genuinely belong together --
-        four temperatures, say -- is never split down the middle.
-        """
-        if self.graph.normalise or len(series) < 2:
-            return {s["ref"]: "left" for s in series}
-        decade = {}
-        for s in series:
-            y = np.abs(s["y"])
-            y = y[y > 0]
-            p95 = float(np.percentile(y, 95)) if y.size else 1.0
-            decade[s["ref"]] = int(np.floor(np.log10(p95))) if p95 > 0 else 0
-        if not decade:
-            return {}
-        vals = list(decade.values())
-        # The most populated decade holds the left axis; anything more than 1.5
-        # decades (a factor of ~30) away from it is unreadable beside it.
-        main = max(set(vals), key=vals.count)
-        return {ref: ("left" if abs(d - main) <= 1 else "right")
-                for ref, d in decade.items()}
-
     def _draw(self, series, problems):
-        auto = self._auto_axis(series)
-        for s in series:
-            s["axis"] = self.graph.axis.get(s["ref"], auto.get(s["ref"], "left"))
-        self._auto = auto
+        """Mount the figure report_render built.
 
-        # A figure built with Figure(), NOT plt.figure(): pyplot keeps a global
-        # strong reference to every figure it makes, which is how this program
-        # used to walk itself into the OOM killer one log at a time.
-        fig = Figure(figsize=(13, GRAPH_HEIGHT / 100.0), dpi=100,
-                     facecolor=C_SURFACE)
-        fig.subplots_adjust(left=0.055, right=0.945, top=0.90, bottom=0.16)
-        ax = fig.add_subplot(111)
-        ax.set_facecolor(C_SURFACE)
-        axr = None
-
-        self._full = []
-        self._lines = []
-        for s in series:
-            target = ax
-            if s["axis"] == "right":
-                if axr is None:
-                    axr = ax.twinx()
-                    axr.set_facecolor("none")
-                target = axr
-            td, yd = decimate(s["t"], s["y"], DRAW_PX)
-            (line,) = target.plot(td, yd, color=s["color"], ls=s["ls"], lw=1.3,
-                                  label=s["label"] + (" (unaligned)"
-                                                      if s["unaligned"] else ""))
-            self._lines.append((line, s))
-            self._full.append(s)
-
-        style_time_axis(ax, label=True)
-        ax.set_xlabel(f"{ALIGNMENTS.get(self.graph.align, '')}  (minutes)")
-        ax.set_title(self.graph.title or "untitled graph", loc="left",
-                     fontsize=11, color=C_INK)
-        ax.grid(True, color=C_GRID, lw=0.6)
-        if self.graph.normalise:
-            ax.set_ylabel("normalised 0–1")
-
-        if series:
-            self._legend(fig, ax, axr, series)
-        else:
-            ax.text(0.5, 0.5, "tick some logs and channels above",
-                    transform=ax.transAxes, ha="center", va="center",
-                    color=C_MUTED, fontsize=11)
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        if self.graph.xlim:
-            ax.set_xlim(*self.graph.xlim)
-
-        note = "; ".join(problems[:3])
-        if len(problems) > 3:
-            note += f"; +{len(problems) - 3} more"
-        self.lbl_warn.setText(note)
+        Everything about WHAT is drawn lives in report_render, so this card and
+        the headless exporter cannot drift apart.  What is left here is the part
+        that only makes sense with a window in front of it: navigation, the
+        problem label, and swapping the canvas."""
+        self._auto = assign_axes(self.graph, series)
+        fig, ax, axr, lines = build_figure(
+            self.graph, series, problems,
+            figsize=(13, GRAPH_HEIGHT / 100.0), auto=self._auto)
+        self._full = list(series)
+        self._lines = lines
 
         canvas = PlotCanvas(fig)
         # Same three lines PlotPage.add explains: FigureCanvasQTAgg takes its
@@ -684,6 +485,11 @@ class GraphCard(QtWidgets.QFrame):
                              on_xlim=self._xlim_changed, on_view=self._view_changed)
         fig.text(0.995, 0.008, nav_hint(True), ha="right", va="bottom",
                  fontsize=7, color=C_MUTED)
+
+        note = "; ".join(list(problems)[:3])
+        if len(problems) > 3:
+            note += f"; +{len(problems) - 3} more"
+        self.lbl_warn.setText(note)
 
         self._drop_canvas()
         self.plot_holder.addWidget(canvas)
@@ -716,32 +522,6 @@ class GraphCard(QtWidgets.QFrame):
                 fig.clear()
             w.setParent(None)
             w.deleteLater()
-
-    def _legend(self, fig, ax, axr, series):
-        """Two keys: one for colour (the channel), one for style (the log).
-
-        A single combined legend needs one entry per (log x channel) pair, which
-        is eighteen lines for three logs and six channels.  Split, it is nine."""
-        from matplotlib.lines import Line2D
-        fields, logs = [], []
-        for s in series:
-            if s["ref"] not in [f for f, _ in fields]:
-                fields.append((s["ref"], s["color"]))
-            if s["log"] not in [l for l, _ in logs]:
-                logs.append((s["log"], s["ls"]))
-        handles = [Line2D([], [], color=c, lw=2,
-                          label=short_ref(r) + (" ›" if self.graph.axis.get(
-                              r, self._auto.get(r, "left")) == "right" else ""))
-                   for r, c in fields]
-        handles += [Line2D([], [], color=C_MUTED, lw=1.6, ls=ls,
-                           label=os.path.splitext(n)[0][:34]) for n, ls in logs]
-        leg = ax.legend(handles=handles, loc="upper left",
-                        bbox_to_anchor=(0.0, -0.14), ncol=max(2, len(handles) // 2),
-                        fontsize=8, frameon=False, handlelength=2.6,
-                        columnspacing=1.4)
-        leg.set_in_layout(False)
-        if axr is not None:
-            axr.set_ylabel("right scale ›", fontsize=8, color=C_MUTED)
 
     def _fill_chosen(self, series):
         """The compact list under the picker: what is plotted, and on which scale."""
@@ -787,16 +567,8 @@ class GraphCard(QtWidgets.QFrame):
 
     def _rescale(self):
         """Fit each value axis to what is actually inside the time window."""
-        for axis in (getattr(self, "_ax", None), getattr(self, "_axr", None)):
-            if axis is None:
-                continue
-            lines = [ln for ln, _ in self._lines if ln.axes is axis]
-            v = window_values(axis, lines)
-            if v is not None and len(v):
-                lo, hi = float(np.min(v)), float(np.max(v))
-                if hi > lo:
-                    m = (hi - lo) * 0.06
-                    axis.set_ylim(lo - m, hi + m)
+        fit_value_axes([getattr(self, "_ax", None), getattr(self, "_axr", None)],
+                       self._lines, window_values_fn=window_values)
         if self._canvas is not None:
             self._canvas.draw_idle()
 
