@@ -332,8 +332,14 @@ class GraphCard(QtWidgets.QFrame):
         self.stats.verticalHeader().setVisible(False)
         self.stats.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.stats.setStyleSheet("font-family: monospace; font-size: 11px;")
-        self.stats.setMaximumHeight(150)
         self.stats.horizontalHeader().setStretchLastSection(True)
+        # No vertical scrolling: these are a handful of summary rows, and a table
+        # that scrolls hides rows behind a gesture nobody expects to need for six
+        # numbers.  _size_stats() grows the widget to fit them instead, and the
+        # page it sits in does the scrolling.
+        self.stats.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.stats.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                 QtWidgets.QSizePolicy.Fixed)
         v.addWidget(self.stats)
         self.lbl_stats = QtWidgets.QLabel("")
         self.lbl_stats.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
@@ -582,6 +588,18 @@ class GraphCard(QtWidgets.QFrame):
         if self._canvas is not None:
             self._canvas.draw_idle()
 
+    def _size_stats(self):
+        """Make the statistics table exactly as tall as its own rows.
+
+        Qt sizes an item view to whatever box it is given and scrolls the rest,
+        so the height has to be computed from the rows themselves -- header,
+        every row, and the frame -- rather than left to a constant that is right
+        for one graph and wrong for the next."""
+        h = self.stats.horizontalHeader().height() + 2 * self.stats.frameWidth()
+        for r in range(self.stats.rowCount()):
+            h += self.stats.rowHeight(r)
+        self.stats.setFixedHeight(max(h, 40))
+
     def update_stats(self):
         xlim = self._ax.get_xlim() if self._ax is not None else None
         self.stats.setRowCount(len(self._full))
@@ -598,6 +616,7 @@ class GraphCard(QtWidgets.QFrame):
                                           | QtCore.Qt.AlignVCenter)
                 self.stats.setItem(r, c, item)
         self.stats.resizeColumnsToContents()
+        self._size_stats()
         if xlim and self._full:
             self.lbl_stats.setText(
                 f"over the visible window {min(xlim):.2f} – {max(xlim):.2f} min "
