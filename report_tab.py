@@ -39,6 +39,7 @@ from report_model import (ALIGNMENTS, LogRef, Report, list_reports,
 from report_render import (DRAW_PX, STAT_COLS, assign_axes, build_figure,
                            fit_value_axes, fmt_stat, gather_series, short_ref,
                            stats_of)
+import ulog_cache
 from ulog_cache import parse_ulog
 from ulog_common import (C_INK, C_MUTED, C_SURFACE, VARY, add_mouse_navigation,
                          decimate, nav_hint, window_values)
@@ -243,6 +244,7 @@ class GraphCard(QtWidgets.QFrame):
         self._ax = None
         self._canvas = None
         self._building = False
+        self._load_tries = 0        # see refresh(): ask twice, then draw anyway
 
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.setStyleSheet(f"QFrame {{ background: {C_SURFACE}; }}")
@@ -388,6 +390,7 @@ class GraphCard(QtWidgets.QFrame):
         if self._building:
             return
         self.graph.logs = self.selected_logs()
+        self._load_tries = 0
         self.changed.emit()
         self.needs_logs.emit(self.graph.id)
 
@@ -440,9 +443,15 @@ class GraphCard(QtWidgets.QFrame):
         position and expanded topics mid-click."""
         names = self.selected_logs()
         ulogs = self.tab.loaded_ulogs(names)
-        if len(ulogs) < len(names):
-            self.needs_logs.emit(self.graph.id)      # something still to parse
+        absent = [n for n in names if n not in ulogs]
+        if absent and self._load_tries < 2:
+            # Ask once (twice at most) for the missing parses, then give up ASKING
+            # -- but never give up DRAWING.  Looping here is how a graph whose
+            # logs cannot all be resident at once stays permanently blank.
+            self._load_tries += 1
+            self.needs_logs.emit(self.graph.id)
             return
+        self._load_tries = 0
 
         if repopulate or not self.picker.refs():
             inv = {n: self.tab.inventory_of(n) for n in names}
@@ -451,6 +460,7 @@ class GraphCard(QtWidgets.QFrame):
         crumb(f"report graph {self.graph.id}: {len(self.graph.fields)} field(s) "
               f"x {len(names)} log(s)")
         series, problems = gather_series(self.graph, ulogs, names)
+        problems = ([f"{n}: not loaded (cache full?)" for n in absent] + problems)
         self._draw(series, problems)
         self._fill_chosen(series)
         self.update_stats()
@@ -744,6 +754,7 @@ class ReportTab(QtWidgets.QWidget):
         self.title.setText(self.report.title)
         self.title.blockSignals(False)
         self.notes.set_text(self.report.notes, enabled=True)
+        self._size_cache_for_report()
         for card in list(self._cards.values()):
             card.setParent(None)
             card.deleteLater()
@@ -858,9 +869,24 @@ class ReportTab(QtWidgets.QWidget):
         picked = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
                   if lst.item(i).checkState() == QtCore.Qt.Checked]
         self.report.logs = [LogRef.of(p) for p in picked]
+        self._size_cache_for_report()
         self._touch()
         self._refresh_logs_ui()
         self._reload_all()
+
+    def _size_cache_for_report(self):
+        """Let the cache hold every log this report references, simultaneously.
+
+        The default cap is 4, tuned for browsing one log at a time.  A report
+        with six logs then evicts its own earlier graphs while loading its later
+        ones, and those graphs can never be satisfied -- they ask for a reload,
+        which evicts something else, forever.  A cap below the working set is not
+        a cache, it is a treadmill.
+
+        Only the COUNT cap is raised.  The megabyte cap and the MemAvailable
+        floor are what actually protect the machine, and they still apply."""
+        want = len(self.report.logs)
+        self.cache.max_logs = max(ulog_cache.MAX_LOGS, want)
 
     def _refresh_logs_ui(self):
         known = [p for p, _ in self._list_logs()]
@@ -916,14 +942,16 @@ class ReportTab(QtWidgets.QWidget):
                     card.refresh()
             return
         if self._thread is not None:            # a load is already running
-            self._pending = list(set((self._pending or []) + list(graph_ids)))
+            self._pending = list(dict.fromkeys((self._pending or [])
+                                               + list(graph_ids)))
             return
 
         self._log(f"report: reading {len(want)} log(s)…")
         crumb(f"report parse {len(want)} log(s): "
               f"{', '.join(os.path.basename(p) for p in want)}")
         self.busy.show()
-        self._pending_ids = list(graph_ids)
+        self._pending_ids = list(dict.fromkeys(
+            list(getattr(self, "_pending_ids", [])) + list(graph_ids)))
         self._thread = QtCore.QThread(self)
         self._worker = LoadWorker(want)
         self._worker.moveToThread(self._thread)
@@ -952,14 +980,20 @@ class ReportTab(QtWidgets.QWidget):
             self._thread = None
             self._worker = None
         self.busy.hide()
-        for gid in getattr(self, "_pending_ids", []):
+        # Take the list and clear the field BEFORE refreshing anything.  A
+        # refresh can discover it still lacks a log and queue itself again
+        # through needs_logs -> _ensure_loaded, which writes _pending_ids; doing
+        # the clear afterwards threw that request away and the graph then never
+        # drew at all.
+        todo = list(getattr(self, "_pending_ids", []))
+        self._pending_ids = []
+        for gid in todo:
             card = self._cards.get(gid)
             if card is not None:
                 card.refresh()
-        self._pending_ids = []
         if self._pending:
-            todo, self._pending = self._pending, None
-            self._ensure_loaded(todo)
+            more, self._pending = self._pending, None
+            self._ensure_loaded(more)
 
     # -- graphs
     def _add_graph(self):

@@ -238,16 +238,15 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
     # figure it makes, which is how this program once walked itself into the OOM
     # killer one log at a time.
     fig = Figure(figsize=figsize, dpi=dpi, facecolor=C_SURFACE)
-    # The bottom margin has to be sized for the legend, not guessed: the key sits
-    # BELOW the axes and grows a row for every two entries, so a fixed margin
-    # silently crops the last row off the page -- which is where the log names
-    # live, i.e. the half of the key you cannot reconstruct from the plot.
-    n_keys = len({s["ref"] for s in series}) + len({s["log"] for s in series})
+    n_f = len({s["ref"] for s in series})
+    n_l = len({s["log"] for s in series})
+    # With only one channel, colour encodes nothing and a separate colour key is
+    # three legend entries describing two lines, in a grey that matches neither.
+    # Same the other way round with a single log.  So the split key appears only
+    # when BOTH dimensions actually vary.
+    n_keys = len(series) if (n_f <= 1 or n_l <= 1) else n_f + n_l
     ncol = max(2, n_keys // 2) if n_keys else 2
-    key_rows = -(-n_keys // ncol) if n_keys else 0
-    bottom = 0.13 + 0.052 * key_rows / (figsize[1] / 4.3)
-    fig.subplots_adjust(left=0.055, right=0.945, top=0.90,
-                        bottom=min(0.45, bottom))
+    fig.subplots_adjust(left=0.055, right=0.945, top=0.90, bottom=0.16)
     ax = fig.add_subplot(111)
     ax.set_facecolor(C_SURFACE)
     axr = None
@@ -275,7 +274,7 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
         ax.set_ylabel("normalised 0–1")
 
     if series:
-        _legend(ax, axr, series, graph, auto, ncol=ncol, figh=figsize[1])
+        _legend(ax, axr, series, graph, auto, ncol=ncol)
     else:
         ax.text(0.5, 0.5, "no channels selected", transform=ax.transAxes,
                 ha="center", va="center", color=C_MUTED, fontsize=11)
@@ -284,6 +283,10 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
 
     if graph.xlim:
         ax.set_xlim(*graph.xlim)
+
+    # Only now, with every label that affects the layout in place, can the room
+    # under the axes be worked out -- so it is MEASURED rather than predicted.
+    _fit_legend(fig, ax)
 
     note = "; ".join(list(problems)[:3])
     if len(problems) > 3:
@@ -294,33 +297,92 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
     return fig, ax, axr, lines
 
 
-def _legend(ax, axr, series, graph, auto, ncol=2, figh=4.3):
-    """Two keys: one for colour (the channel), one for style (the log).
+def _legend(ax, axr, series, graph, auto, ncol=2):
+    """A key that matches what is on the plot.
 
-    A single combined legend needs one entry per (log x channel) pair, which is
-    eighteen lines for three logs and six channels.  Split, it is nine."""
+    Two dimensions are encoded -- colour is the channel, line style is the log --
+    and a combined key needs one entry per (log x channel) pair, which is
+    eighteen entries for three logs and six channels.  Split into a colour block
+    and a style block, it is nine.
+
+    But that split is only worth its confusion when both dimensions actually
+    vary.  Plot one channel across two logs and the colour block becomes a third
+    entry for two lines, swatched in a grey that appears nowhere on the plot.  So
+    in that case -- and in the mirror case of one log and several channels --
+    the key reverts to one entry per LINE, drawn exactly as that line is drawn.
+    """
     fields, logs = [], []
     for s in series:
         if s["ref"] not in [f for f, _ in fields]:
             fields.append((s["ref"], s["color"]))
         if s["log"] not in [l for l, _ in logs]:
             logs.append((s["log"], s["ls"]))
-    handles = [Line2D([], [], color=c, lw=2,
-                      label=short_ref(r) + (" ›" if graph.axis.get(
-                          r, auto.get(r, "left")) == "right" else ""))
-               for r, c in fields]
-    handles += [Line2D([], [], color=C_MUTED, lw=1.6, ls=ls,
-                       label=os.path.splitext(n)[0][:34]) for n, ls in logs]
-    # Anchored in AXES fractions, so the offset has to scale with how tall the
-    # axes actually are -- the same -0.14 that clears the tick labels on a 4-inch
-    # card overlaps them on a 9-inch page.
-    leg = ax.legend(handles=handles, loc="upper left",
-                    bbox_to_anchor=(0.0, -0.62 / figh - 0.055), ncol=ncol,
-                    fontsize=8, frameon=False, handlelength=2.6,
+
+    if len(fields) <= 1 or len(logs) <= 1:
+        one_channel = len(fields) <= 1
+        handles = [Line2D([], [], color=s["color"], ls=s["ls"], lw=1.8,
+                          label=(os.path.splitext(s["log"])[0][:38] if one_channel
+                                 else short_ref(s["ref"])))
+                   for s in series]
+        # The single channel's name would otherwise be lost with its key entry.
+        if one_channel and fields and not graph.normalise:
+            ax.set_ylabel(short_ref(fields[0][0]), fontsize=9, color=C_MUTED)
+    else:
+        handles = [Line2D([], [], color=c, lw=2,
+                          label=short_ref(r) + (" ›" if graph.axis.get(
+                              r, auto.get(r, "left")) == "right" else ""))
+                   for r, c in fields]
+        # "log:" prefixed and greyed, so a style swatch is not mistaken for a
+        # series that ought to be on the plot in that colour.
+        handles += [Line2D([], [], color=C_MUTED, lw=1.6, ls=ls,
+                           label="log: " + os.path.splitext(n)[0][:34])
+                    for n, ls in logs]
+    # Anchored to the FIGURE, not the axes.  Anchored to the axes, the offset has
+    # to be expressed in axes fractions, which means it changes meaning every
+    # time the axes are resized to make room -- the guessed offset that put this
+    # key off the bottom of a 4.3-inch card while looking right on a 5-inch one.
+    # Pinned to the figure, the key stays put and _fit_legend moves the AXES
+    # instead, which is the thing that has room to give.
+    leg = ax.legend(handles=handles, loc="lower left",
+                    bbox_to_anchor=(0.055, 0.012),
+                    bbox_transform=ax.figure.transFigure,
+                    ncol=ncol, fontsize=8, frameon=False, handlelength=2.6,
                     columnspacing=1.4)
     leg.set_in_layout(False)
     if axr is not None:
         axr.set_ylabel("right scale ›", fontsize=8, color=C_MUTED)
+
+
+def _fit_legend(fig, ax, pad=0.012):
+    """Raise the axes until the legend measurably fits beneath them.
+
+    The legend's height depends on the font, the number of rows, the label
+    lengths and the figure width -- so any formula for it is a guess that holds
+    at one size and fails at another, which is exactly what happened.  Render
+    once, ask the legend and the x-axis furniture how much room they actually
+    occupy, and give them that much.
+    """
+    leg = ax.get_legend()
+    if leg is None:
+        return
+    # A figure built with Figure() carries only a FigureCanvasBase until someone
+    # attaches a real one, so there is no renderer to ask yet -- and this has to
+    # work BEFORE the Report tab wraps it in a PlotCanvas.  draw_without_rendering
+    # lays the figure out and stashes a renderer without producing any output.
+    inv = fig.transFigure.inverted()
+    try:
+        fig.draw_without_rendering()
+        key = leg.get_window_extent().transformed(inv)
+        pos = ax.get_position()
+        # How far the tick labels and the x-axis title hang below the axes.
+        furniture = max(0.0, pos.y0 - ax.get_tightbbox().transformed(inv).y0)
+    except (AttributeError, ValueError, RuntimeError):
+        return
+    want = key.y1 + furniture + pad
+    if want > pos.y0:
+        # Capped: a legend so tall it would leave no plot is a legend to shorten,
+        # not a reason to render an empty axes.
+        fig.subplots_adjust(bottom=min(0.55, want))
 
 
 def fit_value_axes(axes, lines, window_values_fn=None, pad=0.06):
