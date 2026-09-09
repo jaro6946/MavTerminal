@@ -86,6 +86,10 @@ class MeasuredULog(ULog):
     def __init__(self, *args, **kwargs):
         self.corrupt_bytes = 0
         self.corrupt_events = 0
+        # pyulog keeps no reference to where the log came from, and callers that
+        # are handed a parsed ULog (report_render, for one) then cannot get back
+        # to the file -- to date it, say, when the log carries no GNSS fix.
+        self.source_path = args[0] if args and isinstance(args[0], str) else None
         super().__init__(*args, **kwargs)
 
     def _find_sync(self, last_n_bytes=-1):

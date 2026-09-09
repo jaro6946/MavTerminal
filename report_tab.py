@@ -33,12 +33,12 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from matplotlib.figure import Figure
 
 from log_browser_crumbs import crumb
-from qt_common import NotesBox, PlotCanvas
-from report_model import (ALIGNMENTS, LogRef, Report, list_reports,
-                          reports_dir)
+from qt_common import FlowLayout, NotesBox, PlotCanvas, flow_holder
+from report_model import (ALIGNMENTS, HEIGHT_RANGE, LogRef, Report,
+                          list_reports, reports_dir)
 from report_render import (DRAW_PX, STAT_COLS, assign_axes, build_figure,
-                           fit_value_axes, fmt_stat, gather_series, short_ref,
-                           stats_of)
+                           fit_value_axes, fmt_stat, gather_series, plot_y,
+                           short_ref, stats_of)
 import ulog_cache
 from ulog_cache import parse_ulog
 from ulog_common import (C_INK, C_MUTED, C_SURFACE, VARY, add_mouse_navigation,
@@ -47,6 +47,10 @@ from ulog_common import (C_INK, C_MUTED, C_SURFACE, VARY, add_mouse_navigation,
 __all__ = ["ReportTab"]
 
 GRAPH_HEIGHT = 430          # px of plot per card
+
+# Parse threads that outlived their tab (see ReportTab.stop).  Held only so the
+# interpreter does not delete a QThread that is still inside a 275 MB parse.
+_ORPHAN_THREADS = []
 
 
 # --- loading -----------------------------------------------------------------
@@ -66,10 +70,17 @@ class LoadWorker(QtCore.QObject):
     def __init__(self, paths):
         super().__init__()
         self.paths = list(paths)
+        self.cancelled = False
 
     @QtCore.pyqtSlot()
     def run(self):
         for p in self.paths:
+            # quit() only unwinds an event loop, and this is a straight-line
+            # loop, so a window closed mid-parse would otherwise keep the thread
+            # running through every remaining log while Qt tore its QThread down
+            # underneath it -- a segfault at exit, no traceback.
+            if self.cancelled:
+                break
             try:
                 self.one.emit(p, parse_ulog(p, None))
             except Exception as e:
@@ -260,6 +271,18 @@ class GraphCard(QtWidgets.QFrame):
         self.title.setStyleSheet("font-size: 13px; font-weight: 600;")
         self.title.textChanged.connect(self._title_changed)
         row.addWidget(self.title, 1)
+        # The channel and log pickers are EDITING furniture: 600 px of it above
+        # every plot, which is why a report opened to a screenful of check boxes
+        # with the graph below the fold.  Folded away by default, so reading a
+        # report shows the graphs and editing one is a click.
+        self.btn_edit = QtWidgets.QToolButton()
+        self.btn_edit.setText("logs + channels")
+        self.btn_edit.setCheckable(True)
+        self.btn_edit.setArrowType(QtCore.Qt.RightArrow)
+        self.btn_edit.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.btn_edit.setToolTip("Show the log and channel pickers for this graph")
+        self.btn_edit.toggled.connect(self._edit_toggled)
+        row.addWidget(self.btn_edit)
         btn_del = QtWidgets.QToolButton()
         btn_del.setText("✕")
         btn_del.setToolTip("Remove this graph")
@@ -267,19 +290,28 @@ class GraphCard(QtWidgets.QFrame):
         row.addWidget(btn_del)
         v.addLayout(row)
 
+        # Everything between here and `self.editor` below goes in the fold.
+        self.editor = QtWidgets.QWidget()
+        ev = QtWidgets.QVBoxLayout(self.editor)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(5)
+        v.addWidget(self.editor)
+
         # -- which of the report's logs this graph draws
-        self.logs_row = QtWidgets.QHBoxLayout()
-        self.logs_row.setSpacing(10)
+        # FlowLayout, not QHBoxLayout: one checkbox per log in a non-wrapping
+        # row makes the card as wide as all the log names laid end to end, and
+        # the graph inside it is then drawn to that width -- which is how the
+        # plots ran off the side of the window.  See qt_common.FlowLayout.
+        self.logs_row = FlowLayout(hspacing=10)
         self.logs_row.addWidget(QtWidgets.QLabel("logs:"))
         self._log_boxes = {}
-        self._logs_holder = QtWidgets.QWidget()
-        self._logs_holder.setLayout(self.logs_row)
-        v.addWidget(self._logs_holder)
+        self._logs_holder = flow_holder(self.logs_row)
+        ev.addWidget(self._logs_holder)
 
         # -- channels
         self.picker = FieldPicker()
         self.picker.changed.connect(self._fields_changed)
-        v.addWidget(self.picker)
+        ev.addWidget(self.picker)
 
         # -- selected channels, with their axis assignment
         self.chosen = QtWidgets.QTreeWidget()
@@ -290,7 +322,7 @@ class GraphCard(QtWidgets.QFrame):
         self.chosen.setToolTip("Click a channel's axis cell to move it between "
                                "the left and right scales.")
         self.chosen.itemClicked.connect(self._axis_clicked)
-        v.addWidget(self.chosen)
+        ev.addWidget(self.chosen)
 
         # -- alignment
         row = QtWidgets.QHBoxLayout()
@@ -313,6 +345,30 @@ class GraphCard(QtWidgets.QFrame):
         self.chk_norm.setChecked(graph.normalise)
         self.chk_norm.toggled.connect(self._norm_changed)
         row.addWidget(self.chk_norm)
+        self.chk_lanes = QtWidgets.QCheckBox("lanes")
+        self.chk_lanes.setToolTip(
+            "Stack 0/1 channels on the right scale as lanes -- one level per\n"
+            "line, kept to the bottom of the frame.  Without it, every binary\n"
+            "verdict draws on the same two values and only the last is visible.")
+        self.chk_lanes.setChecked(getattr(graph, "lanes", False))
+        self.chk_lanes.toggled.connect(self._lanes_changed)
+        row.addWidget(self.chk_lanes)
+        # Height lives on the graph rather than in the window because it is a
+        # property of what is being drawn -- a lane per log runs out of room at
+        # around eight -- so the PDF has to inherit the same choice.
+        row.addWidget(QtWidgets.QLabel("height"))
+        self.spin_height = QtWidgets.QDoubleSpinBox()
+        self.spin_height.setRange(*HEIGHT_RANGE)
+        self.spin_height.setSingleStep(0.1)
+        self.spin_height.setDecimals(1)
+        self.spin_height.setSuffix(" x")
+        self.spin_height.setToolTip(
+            "Vertical room for THIS graph, as a multiple of the standard plot\n"
+            "height.  Applies to the card here and to the PDF page, so a graph\n"
+            "that needs the room keeps it wherever it is rendered.")
+        self.spin_height.setValue(getattr(graph, "height", 1.0))
+        self.spin_height.valueChanged.connect(self._height_changed)
+        row.addWidget(self.spin_height)
         self.lbl_warn = QtWidgets.QLabel("")
         self.lbl_warn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         row.addWidget(self.lbl_warn, 1)
@@ -321,10 +377,10 @@ class GraphCard(QtWidgets.QFrame):
         # -- the plot
         self.plot_holder = QtWidgets.QVBoxLayout()
         self.plot_holder.setContentsMargins(0, 0, 0, 0)
-        holder = QtWidgets.QWidget()
-        holder.setLayout(self.plot_holder)
-        holder.setFixedHeight(GRAPH_HEIGHT)
-        v.addWidget(holder)
+        self.plot_holder_w = QtWidgets.QWidget()
+        self.plot_holder_w.setLayout(self.plot_holder)
+        self.plot_holder_w.setFixedHeight(self._plot_px())
+        v.addWidget(self.plot_holder_w)
 
         # -- statistics
         self.stats = QtWidgets.QTableWidget(0, 2 + len(STAT_COLS))
@@ -354,6 +410,12 @@ class GraphCard(QtWidgets.QFrame):
         self.notes.set_text(graph.notes, enabled=True)
         v.addWidget(self.notes)
 
+        # A graph with no channels yet has nothing to look at, so for that one
+        # the pickers ARE the card -- open it rather than hiding the only thing
+        # that would make it draw something.
+        self.btn_edit.setChecked(not graph.fields)
+        self._edit_toggled(self.btn_edit.isChecked())
+
     # -- report-level changes
     def set_available_logs(self, names):
         """Rebuild the per-graph log tick boxes from the report's log list."""
@@ -366,12 +428,21 @@ class GraphCard(QtWidgets.QFrame):
                 w.deleteLater()
         self._log_boxes.clear()
         for name in names:
-            cb = QtWidgets.QCheckBox(name)
+            # Label shortened, identity kept: _log_boxes is keyed by the real
+            # basename, so what the box SAYS is free to be short.  The full name
+            # is a tooltip away, and a fourteen-log report otherwise spends four
+            # wrapped rows on ".ulg" and repeated prefixes.
+            label = os.path.splitext(name)[0]
+            if len(label) > 30:
+                label = label[:14] + "…" + label[-15:]
+            cb = QtWidgets.QCheckBox(label)
+            cb.setToolTip(name)
             cb.setChecked(name in self.graph.logs)
             cb.toggled.connect(self._logs_changed)
             self.logs_row.addWidget(cb)
             self._log_boxes[name] = cb
-        self.logs_row.addStretch(1)
+        # No addStretch: a flow layout packs left and wraps, so a stretch item
+        # would just be an invisible box competing for a row.
         # Drop references to logs the report no longer has.
         self.graph.logs = [n for n in self.graph.logs if n in names]
         self._building = False
@@ -428,6 +499,26 @@ class GraphCard(QtWidgets.QFrame):
         self.changed.emit()
         self.refresh(repopulate=False)
 
+    def _edit_toggled(self, on):
+        self.editor.setVisible(bool(on))
+        self.btn_edit.setArrowType(QtCore.Qt.DownArrow if on
+                                   else QtCore.Qt.RightArrow)
+
+    def _plot_px(self):
+        """Card plot height in pixels, honouring Graph.height."""
+        return int(round(GRAPH_HEIGHT * getattr(self.graph, "height", 1.0)))
+
+    def _height_changed(self, value):
+        self.graph.height = float(value)
+        self.plot_holder_w.setFixedHeight(self._plot_px())
+        self.changed.emit()
+        self.refresh(repopulate=False)
+
+    def _lanes_changed(self, on):
+        self.graph.lanes = bool(on)
+        self.changed.emit()
+        self.refresh(repopulate=False)
+
     def _axis_clicked(self, item, col):
         ref = item.data(0, QtCore.Qt.UserRole)
         if col != 1 or not ref:
@@ -466,7 +557,19 @@ class GraphCard(QtWidgets.QFrame):
         crumb(f"report graph {self.graph.id}: {len(self.graph.fields)} field(s) "
               f"x {len(names)} log(s)")
         series, problems = gather_series(self.graph, ulogs, names)
-        problems = ([f"{n}: not loaded (cache full?)" for n in absent] + problems)
+        if absent:
+            # One line, not one per log: with a dozen logs the per-log form ran
+            # three names and a "+9 more" across the top of the figure.  And it
+            # says WHICH cap, because "cache full?" left the reader guessing at
+            # the one thing the program already knows.
+            st = self.tab.cache.stats()
+            need = self._graph_mb(self.graph)
+            problems = ([f"{len(absent)} of {len(names)} log(s) not drawn: "
+                         f"{', '.join(os.path.splitext(n)[0] for n in absent[:2])}"
+                         + (f" +{len(absent) - 2}" if len(absent) > 2 else "")
+                         + f" — this graph needs {need:.0f} MB, cache holds "
+                           f"{self.tab.cache.max_mb} MB, "
+                           f"{st['avail_mb']:.0f} MB free"] + problems)
         self._draw(series, problems)
         self._fill_chosen(series)
         self.update_stats()
@@ -479,9 +582,10 @@ class GraphCard(QtWidgets.QFrame):
         that only makes sense with a window in front of it: navigation, the
         problem label, and swapping the canvas."""
         self._auto = assign_axes(self.graph, series)
+        px = self._plot_px()
         fig, ax, axr, lines = build_figure(
             self.graph, series, problems,
-            figsize=(13, GRAPH_HEIGHT / 100.0), auto=self._auto)
+            figsize=(13, px / 100.0), auto=self._auto)
         self._full = list(series)
         self._lines = lines
 
@@ -492,7 +596,7 @@ class GraphCard(QtWidgets.QFrame):
         # viewport instead.  And show() because a widget added to a layout after
         # its parent is already visible stays hidden otherwise -- which is the
         # whole plot.
-        canvas.setFixedHeight(GRAPH_HEIGHT)
+        canvas.setFixedHeight(px)
         canvas.setMinimumWidth(320)
         canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                              QtWidgets.QSizePolicy.Fixed)
@@ -573,7 +677,10 @@ class GraphCard(QtWidgets.QFrame):
         # window would depend on HOW you zoomed rather than on where you ended up.
         self.graph.xlim = (float(lo), float(hi))
         for line, s in self._lines:
-            t, y = s["t"], s["y"]
+            # plot_y, not s["y"]: a lane series is drawn at its own level, and
+            # reading the raw channel here would drop it back onto 0/1 the first
+            # time anyone zoomed.
+            t, y = s["t"], plot_y(s)
             a, b = np.searchsorted(t, [min(lo, hi), max(lo, hi)])
             a, b = max(0, a - 1), min(t.size, b + 1)
             td, yd = decimate(t[a:b], y[a:b], DRAW_PX)
@@ -642,12 +749,57 @@ class ReportTab(QtWidgets.QWidget):
         self._worker = None
         self._pending = None
         self._dirty = False
+        self._disk = None           # (mtime, size) of the file as we last knew it
 
         self._build_ui()
         self._sync_reports()
         self._refresh_logs_ui()
 
+        # A report is a plain JSON file in a shared folder, and report_cli
+        # writes the same files this tab does -- so the copy on disk can move
+        # under an open window.  Left undetected that ends one of two bad ways:
+        # the close-time "unsaved changes, save?" prompt silently overwrites the
+        # newer file with this window's stale copy, or the user answers Discard
+        # and loses their own edits without ever being told the two versions
+        # differed.  Polling mtime is enough here (one small file, 2 s) and
+        # avoids a QFileSystemWatcher's editor-rename blind spot -- Report.save
+        # writes to .tmp and renames, which drops a watcher off the inode.
+        self._watch = QtCore.QTimer(self)
+        self._watch.setInterval(2000)
+        self._watch.timeout.connect(self._check_disk)
+        self._watch.start()
+
     # -- construction
+    def _build_disk_bar(self):
+        """The strip that appears when the file and the window disagree.
+
+        Deliberately a banner and not a dialog: it turns up because something
+        ELSE wrote the file, at a moment the user did not choose, and a modal
+        box then steals a keystroke and forces an answer before they have read
+        what happened.  The banner states which version is which and leaves both
+        doors open."""
+        self.disk_bar = QtWidgets.QFrame()
+        self.disk_bar.setStyleSheet(
+            "QFrame { background: #fdf3d8; border: 1px solid #e0c97f; }")
+        h = QtWidgets.QHBoxLayout(self.disk_bar)
+        h.setContentsMargins(10, 4, 10, 4)
+        self.lbl_disk = QtWidgets.QLabel("")
+        self.lbl_disk.setWordWrap(True)
+        self.lbl_disk.setStyleSheet("color: #4a3b00; font-size: 11px; border: 0;")
+        h.addWidget(self.lbl_disk, 1)
+        self.btn_disk_reload = QtWidgets.QPushButton("Reload from disk")
+        self.btn_disk_reload.setToolTip(
+            "Throw away this window's edits and show the file as it now is.")
+        self.btn_disk_reload.clicked.connect(lambda: self._reload_from_disk())
+        h.addWidget(self.btn_disk_reload)
+        self.btn_disk_keep = QtWidgets.QPushButton("Keep my version")
+        self.btn_disk_keep.setToolTip(
+            "Leave this window as it is.  Saving will then overwrite the file.")
+        self.btn_disk_keep.clicked.connect(self._keep_mine)
+        h.addWidget(self.btn_disk_keep)
+        self.disk_bar.hide()
+        return self.disk_bar
+
     def _build_ui(self):
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -668,7 +820,11 @@ class ReportTab(QtWidgets.QWidget):
                 ("Delete…", self._delete_report, "Delete this report file")):
             b = QtWidgets.QPushButton(label)
             b.setToolTip(tip)
-            b.clicked.connect(slot)
+            # lambda, not the bound method: QPushButton.clicked carries a
+            # `checked` bool, and PyQt hands it to any slot that will take an
+            # argument -- so connecting _save_report directly called it with
+            # path=False and Save died in os.path.dirname(False).
+            b.clicked.connect(lambda _checked=False, fn=slot: fn())
             bh.addWidget(b)
         self.busy = QtWidgets.QProgressBar()
         self.busy.setRange(0, 0)
@@ -676,6 +832,7 @@ class ReportTab(QtWidgets.QWidget):
         self.busy.hide()
         bh.addWidget(self.busy)
         v.addWidget(bar)
+        v.addWidget(self._build_disk_bar())
 
         row = QtWidgets.QWidget()
         rh = QtWidgets.QHBoxLayout(row)
@@ -782,14 +939,21 @@ class ReportTab(QtWidgets.QWidget):
             self._mount_card(g)
         self._refresh_logs_ui()
         self._dirty = False
+        self._disk = self._disk_stamp()
+        self.disk_bar.hide()
         self._show_state()
         self._reload_all()
 
     def _confirm_discard(self):
         if not self._dirty:
             return True
+        where = os.path.basename(self.report.path) if self.report.path else None
         r = QtWidgets.QMessageBox.question(
-            self, "Report", "This report has unsaved changes. Discard them?",
+            self, "Report",
+            (f"Edits made here have not been written to "
+             f"{where}." if where else
+             "This report has never been saved.")
+            + "\n\nDiscard them?",
             QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel)
         return r == QtWidgets.QMessageBox.Discard
 
@@ -797,6 +961,18 @@ class ReportTab(QtWidgets.QWidget):
         self.notes.flush()
         for card in self._cards.values():
             card.notes.flush()
+        if path is False:               # a stray clicked(checked) argument
+            path = None
+        if path in (None, self.report.path) and not self._disk_agrees():
+            r = QtWidgets.QMessageBox.question(
+                self, "Report",
+                f"{os.path.basename(self.report.path or '')} has changed on "
+                f"disk since this window opened it — another tool wrote it.\n\n"
+                f"Overwrite that file with the version in this window?",
+                QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel)
+            if r != QtWidgets.QMessageBox.Save:
+                return
         if not self.report.title.strip():
             self.report.title = "untitled report"
             self.title.setText(self.report.title)
@@ -806,6 +982,8 @@ class ReportTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Report", f"Could not save:\n{e}")
             return
         self._dirty = False
+        self._disk = self._disk_stamp()
+        self.disk_bar.hide()
         self._log(f"report: saved {p}")
         self._sync_reports(keep=p)
         self._show_state()
@@ -858,6 +1036,85 @@ class ReportTab(QtWidgets.QWidget):
         self.lbl_state.setText(f"{where}{' — modified' if self._dirty else ''}   "
                                f"{len(self.report.graphs)} graph(s)")
 
+    # -- the file underneath
+    def _disk_stamp(self, path=None):
+        """(mtime, size) of the report's file, or None if there isn't one.
+
+        Size as well as mtime because a rewrite within the same filesystem
+        timestamp tick is exactly what a scripted edit does."""
+        path = path or self.report.path
+        if not path:
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _disk_agrees(self):
+        """True when the file is as this window last saw it (or isn't there)."""
+        if not self.report.path or self._disk is None:
+            return True
+        return self._disk_stamp() == self._disk
+
+    def _check_disk(self):
+        """Poll for someone else writing this report, and say so plainly."""
+        if not self.report.path:
+            return
+        now = self._disk_stamp()
+        if now == self._disk:
+            return
+        self._disk = now
+        name = os.path.basename(self.report.path)
+        if now is None:
+            self._log(f"report: {name} disappeared from disk")
+            self._show_disk_bar(f"{name} is no longer on disk. Save to write "
+                                f"this window's version back.", reload_ok=False)
+            return
+        # Push the notes editors out first: their autosave runs 700 ms behind
+        # the keystroke, so without this a reload can land in that gap and take
+        # a sentence with it while _dirty still reads False.
+        self.flush()
+        if not self._dirty:
+            self._reload_from_disk(quiet=True)
+            return
+        self._show_disk_bar(
+            f"{name} was rewritten on disk by another tool, and this window has "
+            f"edits of its own. Reload to take the file's version, or keep this "
+            f"one and overwrite it when you save.")
+
+    def _show_disk_bar(self, text, reload_ok=True):
+        self.lbl_disk.setText(text)
+        self.btn_disk_reload.setVisible(reload_ok)
+        self.disk_bar.show()
+
+    def _keep_mine(self):
+        """Dismiss the banner and accept this window's version as the future.
+
+        Adopting the current stamp is the point: the user has now been told the
+        file moved and chosen, so Save must not stop to ask the same question."""
+        self._disk = self._disk_stamp()
+        self.disk_bar.hide()
+        self._touch()
+
+    def _reload_from_disk(self, quiet=False):
+        path = self.report.path
+        if not path:
+            return
+        try:
+            self.report = Report.load(path)
+        except (OSError, ValueError) as e:
+            QtWidgets.QMessageBox.warning(self, "Report",
+                                          f"Could not re-read it:\n{e}")
+            return
+        name = os.path.basename(path)
+        self._log(f"report: reloaded {name} (changed on disk"
+                  + (")" if quiet else ", this window's edits dropped)"))
+        self._load_into_ui()            # clears _dirty, re-stamps, hides the bar
+        if quiet:
+            self.lbl_state.setText(f"{name} — reloaded, changed on disk   "
+                                   f"{len(self.report.graphs)} graph(s)")
+
     # -- logs
     def _choose_logs(self):
         """Tick the logs this report is about, out of the library."""
@@ -893,19 +1150,42 @@ class ReportTab(QtWidgets.QWidget):
         self._refresh_logs_ui()
         self._reload_all()
 
+    def _graph_mb(self, graph):
+        """Megabytes of log file one graph needs resident at the same time."""
+        total = 0.0
+        for name in graph.logs:
+            p = self.path_for(name)
+            try:
+                total += os.path.getsize(p) / 1048576.0
+            except (OSError, TypeError):
+                pass
+        return total
+
     def _size_cache_for_report(self):
-        """Let the cache hold every log this report references, simultaneously.
+        """Let the cache hold, simultaneously, whatever one graph needs.
 
-        The default cap is 4, tuned for browsing one log at a time.  A report
-        with six logs then evicts its own earlier graphs while loading its later
-        ones, and those graphs can never be satisfied -- they ask for a reload,
-        which evicts something else, forever.  A cap below the working set is not
-        a cache, it is a treadmill.
+        The default cap is 4 logs / 1200 MB, tuned for browsing one log at a
+        time.  A report with six logs then evicts its own earlier graphs while
+        loading its later ones, and those graphs can never be satisfied -- they
+        ask for a reload, which evicts something else, forever.  A cap below the
+        working set is not a cache, it is a treadmill.
 
-        Only the COUNT cap is raised.  The megabyte cap and the MemAvailable
-        floor are what actually protect the machine, and they still apply."""
+        BOTH caps have to move, which is what this first got wrong: raising only
+        the count left the megabyte cap at 1200, and a twelve-log graph totalling
+        1207 MB quietly lost its oldest lane on every redraw -- a graph drawing
+        eleven of twelve logs, with the twelfth reported as a cache miss rather
+        than as the cap it actually was.  The working set is ONE GRAPH's logs,
+        not the whole report's, because only one graph's logs must be resident
+        together; 5% of headroom covers the parse being a little larger than
+        the file.
+
+        The MemAvailable floor is NOT raised, and it is the cap that actually
+        protects the machine: if the box genuinely cannot hold the working set,
+        eviction still happens and the graph still says what it is missing."""
         want = len(self.report.logs)
         self.cache.max_logs = max(ulog_cache.MAX_LOGS, want)
+        need = max([self._graph_mb(g) for g in self.report.graphs] or [0.0])
+        self.cache.max_mb = max(ulog_cache.MAX_MB, int(need * 1.05) + 1)
 
     def _refresh_logs_ui(self):
         known = [p for p, _ in self._list_logs()]
@@ -1043,10 +1323,17 @@ class ReportTab(QtWidgets.QWidget):
     def stop(self):
         """Stop the parse thread.  Without this the window closes and the process
         then hangs waiting on a QThread nobody asked to quit."""
+        self._watch.stop()
         self._pending = None
         if self._thread is not None:
+            if self._worker is not None:
+                self._worker.cancelled = True
             self._thread.quit()
-            self._thread.wait(5000)
+            if not self._thread.wait(5000):
+                # Still inside one big parse.  Dropping the last reference now
+                # frees a QThread that is still running, which is the crash this
+                # is avoiding; parking it costs one dead object per session.
+                _ORPHAN_THREADS.append((self._thread, self._worker))
             self._thread = None
             self._worker = None
 

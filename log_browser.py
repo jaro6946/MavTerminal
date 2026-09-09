@@ -1710,10 +1710,20 @@ class Browser(QtWidgets.QMainWindow):
         tab.flush()
         if not tab.has_unsaved():
             return True
+        where = os.path.basename(tab.report.path) if tab.report.path else None
+        # Which way the overwrite would go is the whole question here, so say
+        # it: the report file is shared with report_cli, and "unsaved changes"
+        # alone does not tell you whether Save preserves work or destroys it.
+        msg = (f"The report \u201c{tab.report.title or 'untitled'}\u201d has "
+               f"changes that are not in "
+               + (where or "any file") + ".\n\n")
+        if where and not tab._disk_agrees():
+            msg += (f"{where} has ALSO been rewritten on disk since this window "
+                    f"opened it. Saving replaces that newer file with this "
+                    f"window's version; discarding keeps it.\n\n")
+        msg += "Save it before closing?"
         r = QtWidgets.QMessageBox.question(
-            self, "logGraph",
-            f"The report \u201c{tab.report.title or 'untitled'}\u201d has "
-            f"unsaved changes.\n\nSave it before closing?",
+            self, "logGraph", msg,
             QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard
             | QtWidgets.QMessageBox.Cancel, QtWidgets.QMessageBox.Save)
         if r == QtWidgets.QMessageBox.Cancel:

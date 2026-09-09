@@ -152,13 +152,28 @@ def cmd_validate(args):
 
 # --- render ------------------------------------------------------------------
 
+PAGE_LINES = 70             # what fits under the heading at 8.5 pt on this page
+
+
 def _text_page(pdf, title, lines):
-    fig = Figure(figsize=PAGE)
-    fig.text(0.06, 0.94, title, fontsize=15, weight="bold", color=C_INK)
-    fig.text(0.06, 0.90, "\n".join(lines[:70]), fontsize=8.5, va="top",
-             family="monospace", color=C_INK)
-    pdf.savefig(fig)
-    fig.clear()
+    """A monospace page of text, SPILLING onto continuation pages.
+
+    It used to render `lines[:70]` and stop, which is the worst way to run out
+    of room: the tail of a graph's note -- reliably the conclusions, since they
+    are written last -- vanished from the PDF with nothing to show it had, and
+    the only way to find out was to count the lines yourself.  Returns the
+    number of pages written so the run can report a true page count."""
+    chunks = [lines[i:i + PAGE_LINES]
+              for i in range(0, len(lines), PAGE_LINES)] or [[]]
+    for n, chunk in enumerate(chunks):
+        fig = Figure(figsize=PAGE)
+        fig.text(0.06, 0.94, title if n == 0 else f"{title}  (continued)",
+                 fontsize=15, weight="bold", color=C_INK)
+        fig.text(0.06, 0.90, "\n".join(chunk), fontsize=8.5, va="top",
+                 family="monospace", color=C_INK)
+        pdf.savefig(fig)
+        fig.clear()
+    return len(chunks)
 
 
 def cmd_render(args):
@@ -176,13 +191,17 @@ def cmd_render(args):
         head += ["", f"graphs ({len(report.graphs)}):"]
         head += [f"    {i+1}. {g.title or '(untitled)'}"
                  for i, g in enumerate(report.graphs)]
-        _text_page(pdf, report.title or "Untitled report", head)
+        pages = _text_page(pdf, report.title or "Untitled report", head)
 
         for g in report.graphs:
             series, problems = gather_series(g, ulogs)
             auto = assign_axes(g, series)
+            # Graph.height scales the PAGE, not the axes inside a fixed page:
+            # a taller axis with the same margins is what "give this graph more
+            # room" means, and PdfPages is happy to hold pages of mixed size.
+            page = (PAGE[0], PAGE[1] * getattr(g, "height", 1.0))
             fig, ax, axr, lines = build_figure(g, series, problems,
-                                               figsize=PAGE, auto=auto)
+                                               figsize=page, auto=auto)
             if not g.xlim:
                 span = window_of(series)
                 if span:
@@ -190,6 +209,7 @@ def cmd_render(args):
             fit_value_axes([ax, axr], lines)
             pdf.savefig(fig)
             fig.clear()
+            pages += 1
 
             xlim = g.xlim or window_of(series)
             rows = [f"{'log':<26} {'channel':<34} " +
@@ -205,11 +225,11 @@ def cmd_render(args):
                                           g.notes.strip().splitlines()]
             if problems:
                 rows += ["", "problems:"] + ["    " + p for p in problems]
-            _text_page(pdf, f"{g.title or '(untitled)'} — statistics"
-                            + ("" if not xlim else
-                               f"  ({xlim[0]:.2f} – {xlim[1]:.2f} min)"), rows)
-    print(f"wrote {out}  ({len(report.graphs)} graph(s), "
-          f"{len(report.graphs) * 2 + 1} pages)")
+            pages += _text_page(
+                pdf, f"{g.title or '(untitled)'} — statistics"
+                     + ("" if not xlim else
+                        f"  ({xlim[0]:.2f} – {xlim[1]:.2f} min)"), rows)
+    print(f"wrote {out}  ({len(report.graphs)} graph(s), {pages} pages)")
     return 0
 
 

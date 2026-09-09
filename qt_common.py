@@ -12,7 +12,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from ulog_common import C_MUTED
 
-__all__ = ["PlotCanvas", "NotesBox", "first_line"]
+__all__ = ["PlotCanvas", "NotesBox", "FlowLayout", "first_line"]
 
 
 class PlotCanvas(FigureCanvasQTAgg):
@@ -52,6 +52,99 @@ class PlotCanvas(FigureCanvasQTAgg):
         # from the plot you were zooming.  Unconditional on ctrl: this gesture
         # belongs to the canvas whether or not the notch resolved to a step.
         event.accept()
+
+
+class FlowLayout(QtWidgets.QLayout):
+    """A left-to-right layout that WRAPS instead of growing forever.
+
+    QHBoxLayout has no wrap: a row of one checkbox per log reports a minimum
+    width of however wide all of them are side by side -- 5,047 px for a
+    fourteen-log report -- and a QScrollArea honours that by giving its content
+    that width.  Everything downstream then inherits it, so the graphs (which
+    expand to the card) were drawn four screens wide and the whole page scrolled
+    sideways.  A flow layout's minimum is its WIDEST SINGLE ITEM, so the card
+    fits any window and the row grows downwards instead.
+
+    The standard Qt flow-layout shape: heightForWidth reports the height the
+    items need at a given width, and _lay does double duty as measurement (dry
+    run) and placement.
+    """
+
+    def __init__(self, parent=None, margin=0, hspacing=8, vspacing=4):
+        super().__init__(parent)
+        self._items = []
+        self._h, self._v = hspacing, vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    # -- QLayout plumbing.  Qt calls takeAt until it returns None on teardown.
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return QtCore.Qt.Orientations(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._lay(QtCore.QRect(0, 0, width, 0), measure=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._lay(rect, measure=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QtCore.QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QtCore.QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _lay(self, rect, measure):
+        """Place (or just measure) the items; returns the height used."""
+        m = self.contentsMargins()
+        x, y = rect.x() + m.left(), rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_h = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            if line_h and x + hint.width() > right:
+                x = rect.x() + m.left()
+                y += line_h + self._v
+                line_h = 0
+            if not measure:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            x += hint.width() + self._h
+            line_h = max(line_h, hint.height())
+        return y + line_h + m.bottom() - rect.y()
+
+
+def flow_holder(layout):
+    """A widget carrying a FlowLayout that actually reports its wrapped height.
+
+    A layout's heightForWidth only reaches the parent layout if the WIDGET's
+    size policy says it has one -- otherwise the row is measured at its
+    single-line height and the wrapped rows are drawn over whatever sits below.
+    """
+    w = QtWidgets.QWidget()
+    w.setLayout(layout)
+    policy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                                   QtWidgets.QSizePolicy.Minimum)
+    policy.setHeightForWidth(True)
+    w.setSizePolicy(policy)
+    return w
 
 
 def first_line(text, width=90):

@@ -19,7 +19,9 @@ import re
 import time
 
 __all__ = ["Report", "Graph", "LogRef", "reports_dir", "list_reports",
-           "slugify", "ALIGNMENTS", "DEFAULT_ALIGN"]
+           "slugify", "ALIGNMENTS", "DEFAULT_ALIGN", "COLOR_BY",
+           "DEFAULT_COLOR_BY", "HEIGHT_RANGE",
+           "DEFAULT_HEIGHT", "clamp_height"]
 
 SCHEMA = 1
 REPORT_EXT = ".json"
@@ -33,6 +35,28 @@ ALIGNMENTS = {
     "absolute": "absolute clock",
 }
 DEFAULT_ALIGN = "log_start"
+
+# What colour means on a graph; line style always carries the other dimension.
+COLOR_BY = {"channel": "colour = channel, dash = log",
+            "log": "colour = log, dash = channel"}
+DEFAULT_COLOR_BY = "channel"
+
+# Per-graph vertical room, as a multiple of whatever the caller's standard plot
+# height is.  Bounded because both consumers size a real surface from it: below
+# ~0.6 the axis labels collide, and above 3 a Report-tab card no longer fits on
+# a screen at all, which is a worse failure than a cramped one.
+HEIGHT_RANGE = (0.6, 3.0)
+DEFAULT_HEIGHT = 1.0
+
+
+def clamp_height(h):
+    """A graph height multiplier, or the default when it is not a number."""
+    try:
+        h = float(h)
+    except (TypeError, ValueError):
+        return DEFAULT_HEIGHT
+    lo, hi = HEIGHT_RANGE
+    return min(max(h, lo), hi)
 
 DEFAULT_ROOT = os.path.expanduser("~/jacobAtGar/Log Analysis")
 
@@ -146,7 +170,8 @@ class Graph:
 
     def __init__(self, gid, title="", logs=None, fields=None,
                  align=DEFAULT_ALIGN, axis=None, normalise=False, xlim=None,
-                 notes=""):
+                 notes="", color_by=DEFAULT_COLOR_BY, lanes=False,
+                 height=DEFAULT_HEIGHT):
         self.id = gid
         self.title = title
         # Basenames, not paths: the graph's log subset has to survive the same
@@ -158,20 +183,46 @@ class Graph:
         self.normalise = bool(normalise)
         self.xlim = tuple(xlim) if xlim else None
         self.notes = notes
+        # Which dimension colour encodes. "channel" (the default) colours by
+        # channel and dashes by log, which is right when several channels are
+        # compared across a couple of logs. "log" swaps them, which is right
+        # when each LOG is the subject and its channels are a solid/dashed pair
+        # -- reading "this log, both of its traces" then costs no cross-
+        # referencing. Per graph, because both readings are legitimate.
+        self.color_by = color_by if color_by in COLOR_BY else DEFAULT_COLOR_BY
+        # Draw 0/1 channels on the right axis as stacked LANES -- the first at
+        # level 1, the next at 2, and so on -- instead of every one of them
+        # square-waving between the same two values.  Six logs' worth of binary
+        # verdicts on one 0-1 axis is six lines that are only ever on top of
+        # each other; given a lane each they read at a glance.  The lane stack
+        # is then pinned to the bottom third of the axis so it annotates the
+        # continuous channels rather than covering them.  See report_render.
+        self.lanes = bool(lanes)
+        # Vertical room, as a MULTIPLE of the standard plot height rather than
+        # a pixel or inch count: the Report tab draws at ~430 px and the PDF at
+        # 9 in, so anything absolute would mean one of the two.  A graph that
+        # stacks a lane per log outgrows the default the moment there are more
+        # than a handful of logs -- the lanes are pinned to the bottom third of
+        # the frame, so their spacing shrinks with every log added -- and that
+        # is a property of the GRAPH, not of the window it happens to be in.
+        self.height = clamp_height(height)
 
     def to_dict(self):
         return {"id": self.id, "title": self.title, "logs": self.logs,
                 "fields": self.fields, "align": self.align, "axis": self.axis,
                 "normalise": self.normalise,
                 "xlim": list(self.xlim) if self.xlim else None,
-                "notes": self.notes}
+                "notes": self.notes, "color_by": self.color_by,
+                "lanes": self.lanes, "height": self.height}
 
     @classmethod
     def from_dict(cls, d):
         return cls(d.get("id") or f"g{int(time.time() * 1000) % 10 ** 9}",
                    d.get("title", ""), d.get("logs"), d.get("fields"),
                    d.get("align", DEFAULT_ALIGN), d.get("axis"),
-                   d.get("normalise", False), d.get("xlim"), d.get("notes", ""))
+                   d.get("normalise", False), d.get("xlim"), d.get("notes", ""),
+                   d.get("color_by", DEFAULT_COLOR_BY), d.get("lanes", False),
+                   d.get("height", DEFAULT_HEIGHT))
 
 
 class Report:
