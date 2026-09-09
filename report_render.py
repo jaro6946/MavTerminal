@@ -31,7 +31,8 @@ __all__ = ["SERIES_COLORS", "LOG_STYLES", "STAT_COLS", "DRAW_PX",
            "series_color", "log_style", "short_ref", "align_offset",
            "absolute_base", "stats_of", "fmt_stat", "gather_series",
            "auto_axis", "assign_axes", "build_figure", "fit_value_axes",
-           "window_of", "plot_y", "log_date", "LANE_ON", "LANE_FRAC"]
+           "window_of", "plot_y", "log_date", "LANE_ON", "LANE_FRAC",
+           "scatter_points", "spearman"]
 
 # Channel colours.  A categorical set -- these encode identity, not magnitude, so
 # they are chosen to stay apart at one-pixel line width and to survive the two
@@ -323,6 +324,140 @@ def assign_axes(graph, series):
 
 # --- figure ------------------------------------------------------------------
 
+def spearman(a, b):
+    """Rank correlation, ties averaged.  None when there is nothing to correlate.
+
+    Rank rather than Pearson because the claim being tested is "more of this
+    goes with more of that", not "they are proportional" -- and because one log
+    at ten times the exposure of the rest would otherwise set the answer on its
+    own."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    ok = np.isfinite(a) & np.isfinite(b)
+    if ok.sum() < 3:
+        return None
+    def rank(x):
+        o = np.argsort(x); r = np.empty(len(x)); r[o] = np.arange(1, len(x) + 1)
+        for v in np.unique(x):
+            m = x == v
+            if m.sum() > 1:
+                r[m] = r[m].mean()
+        return r
+    a, b = rank(a[ok]), rank(b[ok])
+    if a.std() == 0 or b.std() == 0:
+        return None
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def scatter_points(graph, series):
+    """[(log, x, y)] -- one point per log, from the first two channels.
+
+    Each axis is the log's MEAN of that channel.  For the rate channels this is
+    the natural summary (mean of a sliding-window rate over the log is the log's
+    rate), and NaN-aware, so the window's undefined first seconds do not drag a
+    log's value down.
+    """
+    if len(graph.fields) < 2:
+        return []
+    xr, yr = graph.fields[0], graph.fields[1]
+    by_log = {}
+    for s in series:
+        by_log.setdefault(s["log"], {})[s["ref"]] = s
+    out = []
+    for name, d in by_log.items():
+        sx, sy = d.get(xr), d.get(yr)
+        if sx is None or sy is None:
+            continue
+        span = _common_span(sx, sy)
+        if span is None:
+            continue
+        x, y = _mean_over(sx, span), _mean_over(sy, span)
+        if np.isfinite(x) and np.isfinite(y):
+            out.append((name, float(x), float(y), sx.get("date", "")))
+    out.sort(key=lambda r: r[1])
+    return out
+
+
+def _finite_span(s):
+    """(first, last) time at which this series has a finite value, or None."""
+    t, y = s["t"], s["y"]
+    ok = np.isfinite(y)
+    if not t.size or not ok.any():
+        return None
+    i = np.nonzero(ok)[0]
+    return float(t[i[0]]), float(t[i[-1]])
+
+
+def _common_span(sx, sy):
+    """The time both channels actually cover.  None if they never overlap.
+
+    Averaging each channel over its OWN extent compares unlike things, and on
+    the graph this was written for it does so in the worst possible direction:
+    offboard_control_mode exists only while the companion is publishing, but
+    the accelerometer error counter runs for the whole log -- so a log where
+    the companion joined at minute 28 of 43 had its x measured over 15 minutes
+    and its y over 43, diluting y by the very quantity the graph is about.
+    Both are therefore reduced over the intersection.
+    """
+    a, b = _finite_span(sx), _finite_span(sy)
+    if a is None or b is None:
+        return None
+    lo, hi = max(a[0], b[0]), min(a[1], b[1])
+    return (lo, hi) if hi > lo else None
+
+
+def _mean_over(s, span):
+    """Mean of this channel inside `span`, NaN-aware.
+
+    Falls back to the channel's whole finite mean when no SAMPLE lands inside
+    the window.  That is not a fudge: a channel sampled more sparsely than the
+    window still has a value throughout it, and the case that forced this is
+    the honest one -- a log with no companion carries offboard_rate as two
+    points, at the log's first and last instant, and a window trimmed by even a
+    tenth of a second to the other channel's extent then contains neither of
+    them.  Dropping those logs would have silently deleted every control from
+    the graph.
+    """
+    lo, hi = span
+    m = (s["t"] >= lo) & (s["t"] <= hi)
+    v = s["y"][m]
+    v = v[np.isfinite(v)]
+    if v.size:
+        return float(v.mean())
+    all_v = s["y"][np.isfinite(s["y"])]
+    return float(all_v.mean()) if all_v.size else np.nan
+
+
+def _scatter_figure(graph, series, fig, ax):
+    """Draw the one-point-per-log form.  Returns the legend handles."""
+    pts = scatter_points(graph, series)
+    handles = []
+    for i, (name, x, y, when) in enumerate(pts):
+        c = series_color(i)
+        ax.plot([x], [y], marker="o", ms=8, mfc=c, mec=C_SURFACE, mew=1.2,
+                ls="none")
+        stem = os.path.splitext(name)[0]
+        if len(stem) > 34:
+            stem = stem[:33] + "\u2026"
+        handles.append(Line2D([], [], color=c, marker="o", ms=7, ls="none",
+                              label=f"{stem} ({when})" if when else stem))
+    if len(graph.fields) >= 2:
+        ax.set_xlabel(short_ref(graph.fields[0]), fontsize=9, color=C_MUTED)
+        ax.set_ylabel(short_ref(graph.fields[1]), fontsize=9, color=C_MUTED)
+    if pts:
+        xs = [p[1] for p in pts]; ys = [p[2] for p in pts]
+        def pad(lo, hi):
+            m = (hi - lo) * 0.10 or max(abs(hi), 1.0) * 0.10
+            return lo - m, hi + m
+        ax.set_xlim(*pad(min(xs), max(xs)))
+        ax.set_ylim(*pad(min(ys), max(ys)))
+        r = spearman(xs, ys)
+        if r is not None:
+            ax.text(0.985, 0.04, f"Spearman \u03c1 = {r:+.2f}   n = {len(pts)}",
+                    transform=ax.transAxes, ha="right", va="bottom",
+                    fontsize=9, color=C_MUTED)
+    return handles
+
+
 def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
                  auto=None):
     """The graph, exactly as both the tab and the exporter draw it.
@@ -361,6 +496,29 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
     ax = fig.add_subplot(111)
     ax.set_facecolor(C_SURFACE)
     axr = None
+
+    if getattr(graph, "kind", "series") == "scatter":
+        # A different picture entirely: no time axis, no right axis, no lines to
+        # decimate or refit.  Returning lines=[] is what keeps every caller's
+        # window-fitting machinery from touching it -- fit_value_axes finds
+        # nothing of its own on the axis and leaves the limits set here.
+        handles = _scatter_figure(graph, series, fig, ax)
+        ax.set_title(graph.title or "untitled graph", loc="left", fontsize=11,
+                     color=C_INK)
+        ax.grid(True, color=C_GRID, lw=0.6)
+        if handles:
+            leg = ax.legend(handles=handles, loc="lower left",
+                            bbox_to_anchor=(0.055, 0.012),
+                            bbox_transform=fig.transFigure,
+                            ncol=max(1, min(3, (len(handles) + 5) // 6)),
+                            fontsize=8, frameon=False, handlelength=1.2,
+                            columnspacing=1.4)
+            leg.set_in_layout(False)
+            _fit_legend(fig, ax)
+        note = "; ".join(list(problems)[:3])
+        if note:
+            _problem_note(fig, note)
+        return fig, ax, None, []
 
     lines = []
     for s in series:

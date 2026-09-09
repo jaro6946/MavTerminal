@@ -21,7 +21,7 @@ import time
 __all__ = ["Report", "Graph", "LogRef", "reports_dir", "list_reports",
            "slugify", "ALIGNMENTS", "DEFAULT_ALIGN", "COLOR_BY",
            "DEFAULT_COLOR_BY", "HEIGHT_RANGE",
-           "DEFAULT_HEIGHT", "clamp_height"]
+           "DEFAULT_HEIGHT", "clamp_height", "KINDS", "DEFAULT_KIND"]
 
 SCHEMA = 1
 REPORT_EXT = ".json"
@@ -40,6 +40,16 @@ DEFAULT_ALIGN = "log_start"
 COLOR_BY = {"channel": "colour = channel, dash = log",
             "log": "colour = log, dash = channel"}
 DEFAULT_COLOR_BY = "channel"
+
+# What a graph IS.  "series" is every channel against time, which is what a log
+# viewer draws and what every graph here was until now.  "scatter" is one MARKER
+# PER LOG -- the mean of the first channel against the mean of the second --
+# which is the only way to show a relationship that exists ACROSS logs rather
+# than within one.  A dose-response is exactly that shape: the quantity on each
+# axis is a property of the whole log, and time is not on the picture at all.
+KINDS = {"series": "channels against time",
+         "scatter": "one point per log: mean of channel 1 vs mean of channel 2"}
+DEFAULT_KIND = "series"
 
 # Per-graph vertical room, as a multiple of whatever the caller's standard plot
 # height is.  Bounded because both consumers size a real surface from it: below
@@ -171,7 +181,7 @@ class Graph:
     def __init__(self, gid, title="", logs=None, fields=None,
                  align=DEFAULT_ALIGN, axis=None, normalise=False, xlim=None,
                  notes="", color_by=DEFAULT_COLOR_BY, lanes=False,
-                 height=DEFAULT_HEIGHT):
+                 height=DEFAULT_HEIGHT, kind=DEFAULT_KIND):
         self.id = gid
         self.title = title
         # Basenames, not paths: the graph's log subset has to survive the same
@@ -206,6 +216,7 @@ class Graph:
         # the frame, so their spacing shrinks with every log added -- and that
         # is a property of the GRAPH, not of the window it happens to be in.
         self.height = clamp_height(height)
+        self.kind = kind if kind in KINDS else DEFAULT_KIND
 
     def to_dict(self):
         return {"id": self.id, "title": self.title, "logs": self.logs,
@@ -213,7 +224,8 @@ class Graph:
                 "normalise": self.normalise,
                 "xlim": list(self.xlim) if self.xlim else None,
                 "notes": self.notes, "color_by": self.color_by,
-                "lanes": self.lanes, "height": self.height}
+                "lanes": self.lanes, "height": self.height,
+                "kind": self.kind}
 
     @classmethod
     def from_dict(cls, d):
@@ -222,7 +234,8 @@ class Graph:
                    d.get("align", DEFAULT_ALIGN), d.get("axis"),
                    d.get("normalise", False), d.get("xlim"), d.get("notes", ""),
                    d.get("color_by", DEFAULT_COLOR_BY), d.get("lanes", False),
-                   d.get("height", DEFAULT_HEIGHT))
+                   d.get("height", DEFAULT_HEIGHT),
+                   d.get("kind", DEFAULT_KIND))
 
 
 class Report:

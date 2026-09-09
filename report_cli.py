@@ -202,7 +202,10 @@ def cmd_render(args):
             page = (PAGE[0], PAGE[1] * getattr(g, "height", 1.0))
             fig, ax, axr, lines = build_figure(g, series, problems,
                                                figsize=page, auto=auto)
-            if not g.xlim:
+            scatter = getattr(g, "kind", "series") == "scatter"
+            if not g.xlim and not scatter:
+                # A scatter's x axis is a measured quantity, not a clock, and
+                # build_figure has already fitted it to the points.
                 span = window_of(series)
                 if span:
                     ax.set_xlim(*span)
@@ -211,7 +214,7 @@ def cmd_render(args):
             fig.clear()
             pages += 1
 
-            xlim = g.xlim or window_of(series)
+            xlim = None if scatter else (g.xlim or window_of(series))
             rows = [f"{'log':<26} {'channel':<34} " +
                     " ".join(f"{c:>12}" for c in STAT_COLS),
                     "-" * (26 + 34 + 13 * len(STAT_COLS))]

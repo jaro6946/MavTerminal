@@ -671,6 +671,11 @@ class GraphCard(QtWidgets.QFrame):
         the plot gets emptier the closer you look."""
         if self._ax is None:
             return
+        if getattr(self.graph, "kind", "series") == "scatter":
+            # A scatter has no time axis and no lines to re-decimate, and its
+            # x limits are a fit to the points -- saving them as `xlim` would
+            # mark the report modified for a pan that means nothing.
+            return
         lo, hi = self._ax.get_xlim()
         # Recorded here as well as in _xlim_changed: Nav reports a view change
         # through two callbacks and not every gesture fires both, so the saved
