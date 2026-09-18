@@ -31,8 +31,9 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
 from report_model import (ALIGNMENTS, Report, list_reports, reports_dir)
-from report_render import (STAT_COLS, assign_axes, build_figure, fit_value_axes,
-                           fmt_stat, gather_series, short_ref, stats_of,
+from report_render import (STAT_COLS, _percent_scale, assign_axes,
+                           build_figure, fit_value_axes, fmt_stat,
+                           gather_series, scatter_points, short_ref, stats_of,
                            window_of)
 from ulog_cache import parse_ulog
 from ulog_common import C_INK, VARY, field_inventory, parse_ref
@@ -152,7 +153,12 @@ def cmd_validate(args):
 
 # --- render ------------------------------------------------------------------
 
-PAGE_LINES = 70             # what fits under the heading at 8.5 pt on this page
+# What fits under the heading: _text_page starts the text at 0.90 of the page
+# height and runs it down one line per ~1.2 x its 8.5 pt size.  This was a flat
+# 70, which is ~13 lines more than the 9 in page holds -- the overflow was drawn
+# off the bottom edge, so every FULL page silently lost its last dozen lines
+# and the spill only picked up after them.  Derived from the page instead.
+PAGE_LINES = int((0.90 - 0.03) * PAGE[1] * 72 / (1.2 * 8.5))
 
 
 def _text_page(pdf, title, lines):
@@ -174,6 +180,30 @@ def _text_page(pdf, title, lines):
         pdf.savefig(fig)
         fig.clear()
     return len(chunks)
+
+
+def _scatter_rows(g, series):
+    """The statistics page of a scatter: the number each marker stands for.
+
+    The per-channel table the time-series graphs get is the wrong summary here.
+    Its mean is a SAMPLE mean over each channel's own extent, and the marker is
+    a TIME-weighted mean over the span both channels share -- on the accel-bias
+    verdict those differ by up to seven points, so the page would contradict
+    the figure above it.  These are the TRUE values, before any marker was
+    shifted sideways to keep it visible."""
+    if len(g.fields) < 2:
+        return ["(a scatter needs two channels)"]
+    (kx, lx), (ky, ly) = _percent_scale(g.fields[0]), _percent_scale(g.fields[1])
+    rows = ["one marker per log; x and y are time-weighted means over the span "
+            "both channels cover",
+            f"  x = {lx}", f"  y = {ly}", "",
+            f"{'#':>3}  {'log':<56} {'date':<12} {'x':>12} {'y':>12}",
+            "-" * (3 + 2 + 56 + 1 + 12 + 1 + 12 + 1 + 12)]
+    for i, (name, x, y, when) in enumerate(scatter_points(g, series)):
+        rows.append(f"{i + 1:>3}  {os.path.splitext(name)[0][:55]:<56} "
+                    f"{when or '':<12} {fmt_stat(x * kx):>12} "
+                    f"{fmt_stat(y * ky):>12}")
+    return rows
 
 
 def cmd_render(args):
@@ -215,14 +245,18 @@ def cmd_render(args):
             pages += 1
 
             xlim = None if scatter else (g.xlim or window_of(series))
-            rows = [f"{'log':<26} {'channel':<34} " +
-                    " ".join(f"{c:>12}" for c in STAT_COLS),
-                    "-" * (26 + 34 + 13 * len(STAT_COLS))]
-            for s in series:
-                st = stats_of(s["t"], s["y"], xlim)
-                rows.append(f"{os.path.splitext(s['log'])[0][:25]:<26} "
-                            f"{short_ref(s['ref'])[:33]:<34} " +
-                            " ".join(f"{fmt_stat(st[c]):>12}" for c in STAT_COLS))
+            if scatter:
+                rows = _scatter_rows(g, series)
+            else:
+                rows = [f"{'log':<26} {'channel':<34} " +
+                        " ".join(f"{c:>12}" for c in STAT_COLS),
+                        "-" * (26 + 34 + 13 * len(STAT_COLS))]
+                for s in series:
+                    st = stats_of(s["t"], s["y"], xlim)
+                    rows.append(f"{os.path.splitext(s['log'])[0][:25]:<26} "
+                                f"{short_ref(s['ref'])[:33]:<34} " +
+                                " ".join(f"{fmt_stat(st[c]):>12}"
+                                         for c in STAT_COLS))
             if g.notes.strip():
                 rows += ["", "notes:"] + ["    " + l for l in
                                           g.notes.strip().splitlines()]

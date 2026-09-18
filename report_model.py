@@ -21,7 +21,7 @@ import time
 __all__ = ["Report", "Graph", "LogRef", "reports_dir", "list_reports",
            "slugify", "ALIGNMENTS", "DEFAULT_ALIGN", "COLOR_BY",
            "DEFAULT_COLOR_BY", "HEIGHT_RANGE",
-           "DEFAULT_HEIGHT", "clamp_height", "KINDS", "DEFAULT_KIND"]
+           "DEFAULT_HEIGHT", "clamp_height", "KINDS", "DEFAULT_KIND", "clamp_frac"]
 
 SCHEMA = 1
 REPORT_EXT = ".json"
@@ -57,6 +57,20 @@ DEFAULT_KIND = "series"
 # a screen at all, which is a worse failure than a cramped one.
 HEIGHT_RANGE = (0.6, 3.0)
 DEFAULT_HEIGHT = 1.0
+
+
+def clamp_frac(f):
+    """A fraction of the frame, or 1.0 (the whole of it) when it is not a number.
+
+    Floored at 0.10: a band thinner than a tenth of the frame is a line, not a
+    trace, and the channel in it can no longer be read at all -- which defeats
+    the point of drawing it.
+    """
+    try:
+        f = float(f)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(f, 0.10), 1.0)
 
 
 def clamp_height(h):
@@ -181,7 +195,8 @@ class Graph:
     def __init__(self, gid, title="", logs=None, fields=None,
                  align=DEFAULT_ALIGN, axis=None, normalise=False, xlim=None,
                  notes="", color_by=DEFAULT_COLOR_BY, lanes=False,
-                 height=DEFAULT_HEIGHT, kind=DEFAULT_KIND):
+                 height=DEFAULT_HEIGHT, kind=DEFAULT_KIND,
+                 right_frac=1.0):
         self.id = gid
         self.title = title
         # Basenames, not paths: the graph's log subset has to survive the same
@@ -217,6 +232,15 @@ class Graph:
         # is a property of the GRAPH, not of the window it happens to be in.
         self.height = clamp_height(height)
         self.kind = kind if kind in KINDS else DEFAULT_KIND
+        # How much of the frame's HEIGHT the right-hand scale may use, measured
+        # from the bottom.  1.0 is the old behaviour: both scales fill the frame
+        # and a right-axis channel is free to be drawn straight through the left
+        # one.  Anything less confines the right axis to a band along the
+        # bottom, so it annotates the left channels instead of competing with
+        # them -- the same idea as `lanes`, but for a continuous channel rather
+        # than a stack of binaries.  Per graph, because whether the right
+        # channel is the subject or the context is a per-graph question.
+        self.right_frac = clamp_frac(right_frac)
 
     def to_dict(self):
         return {"id": self.id, "title": self.title, "logs": self.logs,
@@ -225,7 +249,7 @@ class Graph:
                 "xlim": list(self.xlim) if self.xlim else None,
                 "notes": self.notes, "color_by": self.color_by,
                 "lanes": self.lanes, "height": self.height,
-                "kind": self.kind}
+                "kind": self.kind, "right_frac": self.right_frac}
 
     @classmethod
     def from_dict(cls, d):
@@ -235,7 +259,8 @@ class Graph:
                    d.get("normalise", False), d.get("xlim"), d.get("notes", ""),
                    d.get("color_by", DEFAULT_COLOR_BY), d.get("lanes", False),
                    d.get("height", DEFAULT_HEIGHT),
-                   d.get("kind", DEFAULT_KIND))
+                   d.get("kind", DEFAULT_KIND),
+                   d.get("right_frac", 1.0))
 
 
 class Report:

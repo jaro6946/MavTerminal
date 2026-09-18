@@ -19,6 +19,7 @@ from typing import Callable, List
 import ulog_accel
 import ulog_alt
 import ulog_cpu
+import ulog_faults
 import ulog_graph
 import ulog_heading
 import ulog_localz
@@ -43,6 +44,21 @@ class PlotSpec:
 
 
 PLOTS = [
+    PlotSpec(
+        # First on the page: "what went wrong, and when" is the question a log
+        # is usually opened to answer.  In the browser this entry is replaced by
+        # log_browser.FaultPanel, which puts a fault picker above the figure;
+        # the PDF and CLI get this overview (one row per fault).
+        key="faults",
+        title="Faults over time",
+        topics=ulog_faults.FAULT_TOPICS,
+        build=ulog_faults.build_faults,
+        blurb="every warning/error message, failsafe flag, EKF fault or "
+              "rejection, sensor driver error and GPS spoofing/jamming state "
+              "that occurred, each on its own row against time",
+        # Fallback only: build_faults sizes its own figure from the row count.
+        height=900,
+    ),
     PlotSpec(
         # key stays "thermal": it is the browser's jump anchor and the prefix on
         # this plot's console notes, not a display string.

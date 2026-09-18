@@ -33,6 +33,7 @@ matplotlib.use("QtAgg")            # before any pyplot import, to match the shel
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 import matplotlib.pyplot as plt
+import ulog_faults
 import ulog_plots
 from qt_common import NotesBox, PlotCanvas
 from report_tab import ReportTab
@@ -333,13 +334,31 @@ class PlotPage(QtWidgets.QScrollArea):
         self._box.addWidget(canvas)
         canvas.show()           # widgets added after the parent is shown stay hidden
         self._anchors[key] = canvas
+        self.adopt_nav(fig)
+        canvas.draw_idle()
+
+    def add_widget(self, key, widget):
+        """A widget that manages its own figure(s) -- the fault panel.  It must
+        expose `.figure` (so clear() closes it) and call adopt_nav/drop_nav when
+        it swaps figures, so time linking keeps following it."""
+        self._box.addWidget(widget)
+        widget.show()
+        self._anchors[key] = widget
+
+    def adopt_nav(self, fig):
         nav = getattr(fig, "_nav", None)
         if nav is not None:
             # Bound per-nav so the page knows WHICH plot moved, not just that
             # something did -- that is what set_link_time adopts the window of.
             nav.on_xlim = lambda lo, hi, n=nav: self._nav_changed(n, lo, hi)
             self._navs.append(nav)
-        canvas.draw_idle()
+
+    def drop_nav(self, fig):
+        nav = getattr(fig, "_nav", None)
+        if nav in self._navs:
+            self._navs.remove(nav)
+        if self._last_nav is nav:
+            self._last_nav = None
 
     def figures(self):
         """Every figure currently on the page (spacer items excluded)."""
@@ -394,6 +413,120 @@ class PlotPage(QtWidgets.QScrollArea):
                     nav.set_xlim(lo, hi)
         finally:
             self._syncing = False
+
+
+class FaultPanel(QtWidgets.QWidget):
+    """Pick a fault from THIS log's list, see its occurrences over time.
+
+    The dropdown lists only faults that actually occurred (ulog_faults does the
+    finding), grouped by source and busiest first, each with its count and first
+    time so the list is useful before anything is picked.  The first entry is
+    the all-faults overview.  The pick is remembered across logs by fault key,
+    so stepping through a series of logs keeps showing the same fault.
+    """
+
+    OVERVIEW = "__overview__"
+    HEADER_PX = 40
+
+    def __init__(self, ulog, path, page, make_ctx, remembered=None,
+                 on_pick=None, parent=None):
+        super().__init__(parent)
+        self.ulog, self.path, self.page = ulog, path, page
+        self._make_ctx = make_ctx
+        self._on_pick = on_pick
+        self.faults = ulog_faults.collect_faults(ulog)
+        self.canvas = None
+        self.setStyleSheet(f"background: {C_SURFACE};")
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(10, 6, 10, 4)
+        row.addWidget(QtWidgets.QLabel(f"fault ({len(self.faults)} in this log):"))
+        self.combo = QtWidgets.QComboBox()
+        self.combo.setStyleSheet("font-family: monospace;")
+        self.combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLength)
+        self.combo.setMinimumContentsLength(60)
+        self.combo.setMaxVisibleItems(30)
+        self.combo.addItem("All faults (overview)", self.OVERVIEW)
+        last_src = None
+        for f in self.faults:
+            if f.source != last_src:
+                self.combo.insertSeparator(self.combo.count())
+                last_src = f.source
+            on = f.onsets
+            self.combo.addItem(
+                f"[{ulog_faults.SOURCE_NAME[f.source]}] {f.label}   "
+                f"{f.count}x, first {ulog_faults.fmt_clock(on[0])}", f.key)
+            self.combo.setItemData(self.combo.count() - 1, f.summary(),
+                                   QtCore.Qt.ToolTipRole)
+        row.addWidget(self.combo, 1)
+        for label, step in (("◀", -1), ("▶", 1)):
+            b = QtWidgets.QPushButton(label)
+            b.setFixedWidth(34)
+            b.setToolTip("previous fault" if step < 0 else "next fault")
+            b.clicked.connect(lambda _c, s=step: self._step(s))
+            row.addWidget(b)
+        lay.addLayout(row)
+        self._lay = lay
+
+        idx = self.combo.findData(remembered) if remembered else -1
+        self.combo.setCurrentIndex(idx if idx > 0 else 0)
+        self.combo.currentIndexChanged.connect(self._show_current)
+        self._show_current()
+
+    @property
+    def figure(self):
+        return self.canvas.figure if self.canvas is not None else None
+
+    def _step(self, d):
+        i = self.combo.currentIndex()
+        n = self.combo.count()
+        j = i + d
+        # Separators have no data -- skip over them.
+        while 0 <= j < n and self.combo.itemData(j) is None:
+            j += d
+        if 0 <= j < n:
+            self.combo.setCurrentIndex(j)
+
+    def _show_current(self, *_):
+        key = self.combo.currentData()
+        if key is None:
+            return
+        ctx = self._make_ctx()
+        try:
+            if key == self.OVERVIEW:
+                fig = ulog_faults.build_faults(self.ulog, ctx, self.path,
+                                               faults=self.faults)
+            else:
+                fault = next(f for f in self.faults if f.key == key)
+                fig = ulog_faults.build_fault_detail(self.ulog, fault, ctx,
+                                                     self.path)
+        except Exception as e:           # never take the page down with it
+            QtWidgets.QMessageBox.warning(self, "Fault plot failed",
+                                          f"{type(e).__name__}: {e}")
+            return
+        old = self.canvas
+        if old is not None:
+            self.page.drop_nav(old.figure)
+            self._lay.removeWidget(old)
+            plt.close(old.figure)        # see PlotPage.clear: pyplot holds it
+            old.setParent(None)
+            old.deleteLater()
+        h = getattr(fig, "_page_height", 700)
+        self.canvas = PlotCanvas(fig)
+        self.canvas.setFixedHeight(h)
+        self.canvas.setMinimumWidth(320)
+        self.canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                  QtWidgets.QSizePolicy.Fixed)
+        self._lay.addWidget(self.canvas)
+        self.setFixedHeight(h + self.HEADER_PX)
+        self.page.adopt_nav(fig)
+        self.canvas.draw_idle()
+        if self._on_pick:
+            self._on_pick(key)
 
 
 # --- parameters ---------------------------------------------------------------
@@ -592,7 +725,7 @@ class Browser(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         outer.addWidget(self.tabs, 1)
 
-        # Everything built below is the BROWSE tab -- one log, its seven plots.
+        # Everything built below is the BROWSE tab -- one log, its plots.
         # The Report tab is a separate widget, added once the library tree it
         # reads its log list from exists.
         browse = QtWidgets.QWidget()
@@ -1291,6 +1424,20 @@ class Browser(QtWidgets.QMainWindow):
                           rate_src=self.ctx.rate_src, adds=list(self.ctx.adds),
                           debias=self.ctx.debias, page_scroll=True)
             crumb(f"build {spec.key}")
+            if spec.key == "faults":
+                try:
+                    panel = FaultPanel(
+                        ulog, path, self.page,
+                        make_ctx=lambda: PlotCtx(page_scroll=True),
+                        remembered=self.state.get("fault_pick"),
+                        on_pick=self._remember_fault_pick)
+                except Exception as e:
+                    self._log(f"  !! {spec.title}: {type(e).__name__}: {e}")
+                    continue
+                self._log(f"  {len(panel.faults)} distinct faults in this log")
+                self.page.add_widget(spec.key, panel)
+                self.jump.addItem(spec.title, spec.key)
+                continue
             try:
                 fig = spec.build(ulog, sub, path)
             except Exception as e:
@@ -1312,6 +1459,10 @@ class Browser(QtWidgets.QMainWindow):
         self.page.finish()
         self._close_orphan_figures()
         crumb("page ready")
+
+    def _remember_fault_pick(self, key):
+        self.state["fault_pick"] = key
+        _save_state(self.state)
 
     def _close_orphan_figures(self):
         """Close figures pyplot is holding that no canvas on the page shows.

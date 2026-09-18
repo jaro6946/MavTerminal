@@ -23,7 +23,7 @@ from matplotlib.lines import Line2D
 
 from report_model import ALIGNMENTS
 from ulog_cache import start_epoch
-from ulog_derived import derived_field, is_derived
+from ulog_derived import derived_field, derived_units, is_derived
 from ulog_common import (C_GRID, C_INK, C_MUTED, C_SURFACE, armed_spans,
                          decimate, field, parse_ref, style_time_axis)
 
@@ -32,7 +32,7 @@ __all__ = ["SERIES_COLORS", "LOG_STYLES", "STAT_COLS", "DRAW_PX",
            "absolute_base", "stats_of", "fmt_stat", "gather_series",
            "auto_axis", "assign_axes", "build_figure", "fit_value_axes",
            "window_of", "plot_y", "log_date", "LANE_ON", "LANE_FRAC",
-           "scatter_points", "spearman"]
+           "scatter_points", "spearman", "axis_label", "log_epoch"]
 
 # Channel colours.  A categorical set -- these encode identity, not magnitude, so
 # they are chosen to stay apart at one-pixel line width and to survive the two
@@ -85,6 +85,19 @@ def series_color(i):
 
 def log_style(i):
     return LOG_STYLES[i % len(LOG_STYLES)]
+
+
+def log_epoch(ulog):
+    """Sortable start time for a log: GNSS epoch, else the file's mtime, else
+    +inf (undated logs sort last).  The same fallback chain as log_date, so an
+    order built from this agrees with the dates printed beside it."""
+    ep = start_epoch(ulog)
+    if ep:
+        return float(ep)
+    try:
+        return float(os.path.getmtime(getattr(ulog, "source_path", None)))
+    except (OSError, TypeError):
+        return float("inf")
 
 
 def log_date(ulog):
@@ -158,6 +171,10 @@ def stats_of(t, y, xlim=None):
         lo, hi = min(xlim), max(xlim)
         a, b = np.searchsorted(t, [lo, hi])
         y = y[a:b]
+    # Finite samples only.  Computed channels use NaN for "not defined here" --
+    # a rate before its window has filled, a heading check on the ground -- and
+    # one NaN would otherwise make every statistic in the row read nan.
+    y = y[np.isfinite(y)]
     if y.size == 0:
         return dict.fromkeys(STAT_COLS, None) | {"n": 0}
     return {"n": int(y.size), "min": float(y.min()), "max": float(y.max()),
@@ -205,6 +222,7 @@ def gather_series(graph, ulogs, names=None):
     for li, name in enumerate(names):
         ulog = ulogs[name]
         when = log_date(ulog)
+        epoch = log_epoch(ulog)
         off, why = align_offset(ulog, graph.align, base)
         if why:
             problems.append(f"{name}: {why}, drawn unaligned")
@@ -230,7 +248,7 @@ def gather_series(graph, ulogs, names=None):
             # graph's choice (see Graph.color_by).
             ci, si = (li, fi) if by_log else (fi, li)
             series.append({
-                "ref": ref, "log": name, "date": when,
+                "ref": ref, "log": name, "date": when, "epoch": epoch,
                 "label": f"{short_ref(ref)} · {os.path.splitext(name)[0]}",
                 "t": t - off, "y": y,
                 "color": series_color(ci), "ls": log_style(si),
@@ -351,10 +369,12 @@ def spearman(a, b):
 def scatter_points(graph, series):
     """[(log, x, y)] -- one point per log, from the first two channels.
 
-    Each axis is the log's MEAN of that channel.  For the rate channels this is
-    the natural summary (mean of a sliding-window rate over the log is the log's
-    rate), and NaN-aware, so the window's undefined first seconds do not drag a
-    log's value down.
+    Each axis is the log's TIME-weighted MEAN of that channel (see _mean_over).
+    For the rate channels this is the natural summary (mean of a sliding-window
+    rate over the log is the log's rate); for a 0/1 verdict it is the fraction
+    of the log spent at 1.  NaN-aware, so a window's undefined first seconds do
+    not drag a log's value down.  Values are in the channel's own units -- any
+    percentage scaling is the figure's business, not this function's.
     """
     if len(graph.fields) < 2:
         return []
@@ -372,9 +392,15 @@ def scatter_points(graph, series):
             continue
         x, y = _mean_over(sx, span), _mean_over(sy, span)
         if np.isfinite(x) and np.isfinite(y):
-            out.append((name, float(x), float(y), sx.get("date", "")))
-    out.sort(key=lambda r: r[1])
-    return out
+            out.append((name, float(x), float(y), sx.get("date", ""),
+                        sx.get("epoch", float("inf"))))
+    # DATE order, oldest first: the marker numbers and the legend follow this,
+    # and a legend read top to bottom is then the test campaign in sequence.
+    # (Number-by-x was tried first; with twenty logs it made the legend a
+    # shuffle of dates that answered nothing.)  Same-day logs keep their
+    # time-of-day order because the key is the full epoch, not the date text.
+    out.sort(key=lambda r: (r[4], r[0]))
+    return [r[:4] for r in out]
 
 
 def _finite_span(s):
@@ -406,7 +432,17 @@ def _common_span(sx, sy):
 
 
 def _mean_over(s, span):
-    """Mean of this channel inside `span`, NaN-aware.
+    """TIME-weighted mean of this channel inside `span`, NaN-aware.
+
+    Each sample holds its value until the next one (the same zero-order hold
+    the plot draws), so a sample stands for as much of the log as it covers.
+    A plain sample mean is wrong whenever a topic's logging rate varies, and
+    the one this was written for varies a lot: `estimator_sensor_bias` logs
+    far faster while the filter converges, so averaging SAMPLES of the
+    accel-bias verdict said LandingTest_Accel_Bias_001 failed 78.2% of the
+    time when it failed 70.8% of it, and Flight Endurance Test 1 6.1% when it
+    was 0.9%.  Intervals that start on a NaN are "not defined here" and are
+    dropped from both numerator and denominator.
 
     Falls back to the channel's whole finite mean when no SAMPLE lands inside
     the window.  That is not a fudge: a channel sampled more sparsely than the
@@ -419,43 +455,227 @@ def _mean_over(s, span):
     """
     lo, hi = span
     m = (s["t"] >= lo) & (s["t"] <= hi)
-    v = s["y"][m]
-    v = v[np.isfinite(v)]
-    if v.size:
-        return float(v.mean())
+    t, v = s["t"][m], s["y"][m]
+    if t.size:
+        # The last sample holds to the end of the window.
+        dt = np.diff(np.append(t, hi))
+        ok = np.isfinite(v) & (dt > 0)
+        if ok.any():
+            return float((v[ok] * dt[ok]).sum() / dt[ok].sum())
+        fin = v[np.isfinite(v)]
+        if fin.size:            # samples all at one instant: nothing to weight
+            return float(fin.mean())
     all_v = s["y"][np.isfinite(s["y"])]
     return float(all_v.mean()) if all_v.size else np.nan
 
 
+def _percent_scale(ref):
+    """(factor, label) for one scatter axis.
+
+    A 0/1 verdict averaged over time is the FRACTION of time it read 1, and
+    "0.708" on an axis labelled 0/1 reads like a verdict that is 71% true.
+    Shown as a percentage and labelled as one, it says what it is.  Anything
+    else is drawn in its own units."""
+    try:
+        topic, _mid, name = parse_ref(ref)
+    except ValueError:
+        return 1.0, axis_label([ref], "left")
+    if derived_units(topic, name) == "0/1":
+        return 100.0, f"{short_ref(ref)}  (% of time at 1)"
+    return 1.0, axis_label([ref], "left")
+
+
+SCATTER_MS = 13             # marker diameter, points -- room for a 2-digit number
+SCATTER_GAP_PX = 2.0        # clear space kept between neighbouring markers
+
+
+def _dodge_px(px, py, diam):
+    """Display x positions moved just far enough that no two markers touch.
+
+    Only x moves, and only by the minimum that clears the overlap: two markers
+    whose centres are dy apart vertically need a horizontal separation of
+    sqrt(d^2 - dy^2), no more.  Nothing is spread by a fixed step, so a point
+    with room around it is drawn exactly where it measured, and a crowded group
+    opens up by about one marker width rather than a share of the axis.
+
+    An earlier version fanned only EXACT ties, on the grounds that a tolerance
+    moves points that genuinely differ.  That is still true of a tolerance in
+    DATA units; a tolerance of one marker diameter in PIXELS is different --
+    it moves only what the reader could not otherwise see.
+
+    Order is preserved (a marker never hops over its neighbour), and exact ties
+    open symmetrically, in log order, about their shared value."""
+    n = len(px)
+    q = np.array(px, dtype=float)
+    need = diam + SCATTER_GAP_PX
+    order = sorted(range(n), key=lambda i: (px[i], i))
+    rank = {i: k for k, i in enumerate(order)}
+    for _ in range(400):
+        moved = False
+        for a in range(n):
+            for b in range(a + 1, n):
+                dy = abs(py[a] - py[b])
+                if dy >= need:
+                    continue
+                want = float(np.sqrt(need * need - dy * dy))
+                i, j = (a, b) if rank[a] < rank[b] else (b, a)
+                gap = q[j] - q[i]
+                if gap < want - 1e-6:
+                    push = (want - gap) / 2.0
+                    q[i] -= push
+                    q[j] += push
+                    moved = True
+        if not moved:
+            break
+    return q
+
+
 def _scatter_figure(graph, series, fig, ax):
-    """Draw the one-point-per-log form.  Returns the legend handles."""
+    """Set up the one-point-per-log form: axes, limits, legend handles.
+
+    The MARKERS are not drawn here.  Keeping them apart is a question about
+    pixels, and the pixels are not settled until the legend and any problem
+    note have moved the axes -- `_scatter_markers` draws them afterwards.
+    Returns (handles, state) for it."""
     pts = scatter_points(graph, series)
     handles = []
+    if len(graph.fields) < 2:
+        return handles, None
+    kx, lx = _percent_scale(graph.fields[0])
+    ky, ly = _percent_scale(graph.fields[1])
+    pts = [(name, x * kx, y * ky, when) for name, x, y, when in pts]
     for i, (name, x, y, when) in enumerate(pts):
-        c = series_color(i)
-        ax.plot([x], [y], marker="o", ms=8, mfc=c, mec=C_SURFACE, mew=1.2,
-                ls="none")
         stem = os.path.splitext(name)[0]
         if len(stem) > 34:
-            stem = stem[:33] + "\u2026"
-        handles.append(Line2D([], [], color=c, marker="o", ms=7, ls="none",
-                              label=f"{stem} ({when})" if when else stem))
-    if len(graph.fields) >= 2:
-        ax.set_xlabel(short_ref(graph.fields[0]), fontsize=9, color=C_MUTED)
-        ax.set_ylabel(short_ref(graph.fields[1]), fontsize=9, color=C_MUTED)
+            stem = stem[:33] + "…"
+        label = f"{i + 1}  {stem}" + (f" ({when})" if when else "")
+        handles.append(Line2D([], [], color=series_color(i), marker="o", ms=7,
+                              ls="none", label=label))
+    ax.set_xlabel(lx, fontsize=9, color=C_MUTED)
+    ax.set_ylabel(ly, fontsize=9, color=C_MUTED)
     if pts:
         xs = [p[1] for p in pts]; ys = [p[2] for p in pts]
-        def pad(lo, hi):
-            m = (hi - lo) * 0.10 or max(abs(hi), 1.0) * 0.10
+        def pad(lo, hi, frac=0.10):
+            m = (hi - lo) * frac or max(abs(hi), 1.0) * frac
             return lo - m, hi + m
         ax.set_xlim(*pad(min(xs), max(xs)))
-        ax.set_ylim(*pad(min(ys), max(ys)))
+        ax.set_ylim(*pad(min(ys), max(ys), 0.12))
+    return handles, {"pts": pts}
+
+
+def _scatter_markers(fig, ax, state):
+    """Draw the numbered markers, dodged in pixels, plus the on-figure caption.
+
+    A marker moved further than its own radius keeps a thin line back to a tick
+    at its TRUE x, so the reader can see both that it moved and where it
+    belongs.  A smaller nudge leaves the true x inside the marker, where a line
+    would be hidden anyway.  The statistics page lists the unshifted numbers."""
+    if not state or not state["pts"]:
+        return
+    pts = state["pts"]
+    xs = np.array([p[1] for p in pts]); ys = np.array([p[2] for p in pts])
+    diam = SCATTER_MS * fig.dpi / 72.0
+
+    def layout():
+        for _ in range(3):
+            disp = ax.transData.transform(np.column_stack([xs, ys]))
+            qx = _dodge_px(disp[:, 0], disp[:, 1], diam)
+            box = ax.get_window_extent()
+            lo, hi = qx.min() - diam, qx.max() + diam
+            if lo >= box.x0 and hi <= box.x1:
+                break
+            # A dodge pushed a marker past the frame: widen x and dodge again
+            # (the pixel scale changed, so the old answer no longer holds).
+            inv = ax.transData.inverted()
+            ax.set_xlim(inv.transform((min(lo, box.x0), 0))[0],
+                        inv.transform((max(hi, box.x1), 0))[0])
+        return qx, disp
+
+    def caption(moved):
+        bits = []
         r = spearman(xs, ys)
         if r is not None:
-            ax.text(0.985, 0.04, f"Spearman \u03c1 = {r:+.2f}   n = {len(pts)}",
-                    transform=ax.transAxes, ha="right", va="bottom",
-                    fontsize=9, color=C_MUTED)
-    return handles
+            bits.append(f"Spearman \u03c1 = {r:+.2f}   n = {len(pts)}")
+        if moved.any():
+            # Said on the figure, not only in the notes: a reader who does not
+            # know the markers were moved will read the offset as data.
+            # WHICH markers, with the value each really has, not a count: a
+            # count tells the reader something moved but not what to discount.
+            items = [f"{i + 1} ({xs[i]:.4g})" for i in np.nonzero(moved)[0]]
+            rows = [", ".join(items[k:k + 8]) for k in range(0, len(items), 8)]
+            bits.append("nudged sideways so none overlap -- marker (true x): "
+                        + rows[0])
+            bits.extend(rows[1:])
+        return "\n".join(bits)
+
+    qx, disp = layout()
+    moved = np.abs(qx - disp[:, 0]) > 0.5
+    text = caption(moved)
+    if text:
+        hits, art = _scatter_caption(fig, ax, text, qx, disp[:, 1], diam)
+        if hits:
+            # Every corner has data in it.  Make room rather than cover a
+            # marker: raise the top of the y scale until the highest marker
+            # sits below the caption, then redo the dodge on the new scale.
+            box = ax.get_window_extent()
+            cap = art.get_window_extent().height + 0.03 * box.height
+            art.remove()
+            lo, hi = ax.get_ylim()
+            room = box.height - cap - diam
+            if room > 0.3 * box.height:
+                ax.set_ylim(lo, max(hi, lo + (ys.max() - lo) * box.height / room))
+                qx, disp = layout()
+                moved = np.abs(qx - disp[:, 0]) > 0.5
+            ax.text(0.985, 0.97, caption(moved), transform=ax.transAxes,
+                    ha="right", va="top", fontsize=9, color=C_MUTED,
+                    linespacing=1.6, zorder=5)
+
+    shifted_x = ax.transData.inverted().transform(
+        np.column_stack([qx, disp[:, 1]]))[:, 0]
+    far = np.abs(qx - disp[:, 0]) > diam / 2.0
+    for i, (name, x, y, _when) in enumerate(pts):
+        c = series_color(i)
+        if far[i]:
+            ax.plot([x, shifted_x[i]], [y, y], color=C_MUTED, lw=0.8, zorder=2)
+            ax.plot([x], [y], marker="|", ms=7, mew=1.2, color=C_MUTED,
+                    ls="none", zorder=2)
+        ax.plot([shifted_x[i]], [y], marker="o", ms=SCATTER_MS, mfc=c,
+                mec=C_SURFACE, mew=1.2, ls="none", zorder=3)
+        ax.text(shifted_x[i], y, str(i + 1), ha="center", va="center",
+                fontsize=6.5 if i >= 9 else 7.5, weight="bold",
+                color="white", zorder=4)
+
+
+def _scatter_caption(fig, ax, text, qx, qy, diam):
+    """Put the caption in whichever corner of the frame covers fewest markers.
+
+    A fixed corner is a guess about where the data is not; on the temperature
+    graph the bottom right is clear and the top left is full, and on the
+    companion graph it is the other way round.  Returns (markers covered, the
+    text artist) so the caller can make room when no corner is clear."""
+    corners = [(0.985, 0.03, "right", "bottom"), (0.985, 0.97, "right", "top"),
+               (0.015, 0.97, "left", "top"), (0.015, 0.03, "left", "bottom")]
+    best = None
+    r = diam / 2.0
+    for x, y, ha, va in corners:
+        t = ax.text(x, y, text, transform=ax.transAxes, ha=ha, va=va,
+                    fontsize=9, color=C_MUTED, linespacing=1.6, zorder=5)
+        try:
+            fig.draw_without_rendering()
+            bb = t.get_window_extent()
+            hits = int(np.sum((qx + r > bb.x0) & (qx - r < bb.x1)
+                              & (qy + r > bb.y0) & (qy - r < bb.y1)))
+        except (AttributeError, ValueError, RuntimeError):
+            hits = 0
+        if best is None or hits < best[0]:
+            if best is not None:
+                best[1].remove()
+            best = (hits, t)
+        else:
+            t.remove()
+        if hits == 0:
+            break
+    return best
 
 
 def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
@@ -502,7 +722,7 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
         # decimate or refit.  Returning lines=[] is what keeps every caller's
         # window-fitting machinery from touching it -- fit_value_axes finds
         # nothing of its own on the axis and leaves the limits set here.
-        handles = _scatter_figure(graph, series, fig, ax)
+        handles, state = _scatter_figure(graph, series, fig, ax)
         ax.set_title(graph.title or "untitled graph", loc="left", fontsize=11,
                      color=C_INK)
         ax.grid(True, color=C_GRID, lw=0.6)
@@ -518,6 +738,9 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
         note = "; ".join(list(problems)[:3])
         if note:
             _problem_note(fig, note)
+        # Last: both calls above move the axes, and the markers are kept apart
+        # in PIXELS, so they can only be placed once the frame stops moving.
+        _scatter_markers(fig, ax, state)
         return fig, ax, None, []
 
     lines = []
@@ -527,6 +750,9 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
             if axr is None:
                 axr = ax.twinx()
                 axr.set_facecolor("none")
+                # Read by fit_value_axes, which is where the band has to be
+                # applied -- see Graph.right_frac.
+                axr._band_frac = getattr(graph, "right_frac", 1.0)
             target = axr
         td, yd = decimate(s["t"], plot_y(s), DRAW_PX)
         (line,) = target.plot(td, yd, color=s["color"], ls=s["ls"], lw=1.3,
@@ -571,12 +797,24 @@ def _lane_axis(axr, series):
     """Turn the right axis into a lane rack: one tick per lane, stack at the
     bottom, and a faint baseline under each lane so "off" is a line rather than
     an absence.  The scale is FIXED -- lanes are positions, not measurements, so
-    there is nothing for an autoscale to fit (fit_value_axes honours this)."""
+    there is nothing for an autoscale to fit (fit_value_axes honours this).
+
+    With nothing on the LEFT axis the stack has nothing to annotate, so it takes
+    the whole frame rather than its bottom third, and the empty left scale is
+    hidden -- a graph made only of verdicts (which magnetometer, which check
+    tripped) otherwise spends two thirds of its height on a blank 0-1 axis."""
     lanes = sorted({s["lane"] for s in series if s.get("lane")})
     if axr is None or not lanes:
         return
     n = max(lanes)
-    lo, hi = lane_ylim(n)
+    if any(s.get("axis", "left") == "left" for s in series):
+        lo, hi = lane_ylim(n)
+    else:
+        lo, hi = 1.0 - LANE_PAD[0], n + LANE_ON + LANE_PAD[1]
+        # build_figure makes exactly two axes, the frame and its twin.
+        for a in axr.figure.axes:
+            if a is not axr:
+                a.set_yticks([])
     axr.set_ylim(lo, hi)
     axr.set_yticks(list(lanes))
     axr.set_yticklabels([str(k) for k in lanes], fontsize=8, color=C_MUTED)
@@ -624,13 +862,14 @@ def _legend(ax, axr, series, graph, auto, ncol=2):
 
     if len(fields) <= 1 or len(logs) <= 1:
         one_channel = len(fields) <= 1
+        # Numbered to match the right-hand ticks when the lines ARE lanes -- the
+        # same reason as the colour-by-log key below: the key is then the only
+        # thing that says which lane is which.
         handles = [Line2D([], [], color=s["color"], ls=s["ls"], lw=1.8,
-                          label=(log_label(s["log"]) if one_channel
-                                 else short_ref(s["ref"])))
+                          label=(f"{s['lane']} · " if s.get("lane") else "")
+                                + (log_label(s["log"]) if one_channel
+                                   else short_ref(s["ref"])))
                    for s in series]
-        # The single channel's name would otherwise be lost with its key entry.
-        if one_channel and fields and not graph.normalise:
-            ax.set_ylabel(short_ref(fields[0][0]), fontsize=9, color=C_MUTED)
     elif by_log:
         # Colour is the log, so the log block carries the swatches and the
         # channel block is the greyed one.  With lanes on, the key is also the
@@ -690,8 +929,50 @@ def _legend(ax, axr, series, graph, auto, ncol=2):
             break
         ncol -= 1
         leg = place(ncol)
-    if axr is not None:
-        axr.set_ylabel("right scale ›", fontsize=8, color=C_MUTED)
+    _label_axes(ax, axr, series, graph)
+
+
+def axis_label(refs, side):
+    """The name for a value scale: the channels on it, with their units.
+
+    Every graph used to be labelled only in the special case of a single
+    channel, and the right-hand scale got the placeholder "right scale ›" --
+    which names the side of the frame it is on and nothing about what is
+    plotted.  On a graph whose two scales are errors per minute and hertz that
+    is not a label, it is a direction.
+
+    Several channels on one scale are joined rather than dropped: they share the
+    scale, so the reader needs to know that both are on it.
+    """
+    seen, parts = set(), []
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        try:
+            topic, _mid, name = parse_ref(ref)
+            unit = derived_units(topic, name)
+        except ValueError:
+            unit = ""
+        parts.append(short_ref(ref) + (f"  ({unit})" if unit else ""))
+    text = "   ·   ".join(parts)
+    if len(text) > 78:                  # a label taller than the plot helps no one
+        text = text[:77] + "\u2026"
+    return text + ("  ›" if side == "right" else "")
+
+
+def _label_axes(ax, axr, series, graph):
+    """Name both value scales from what was actually drawn on them."""
+    if graph.normalise:
+        return                          # already labelled "normalised 0-1"
+    left = [s["ref"] for s in series if s.get("axis", "left") == "left"]
+    right = [s["ref"] for s in series if s.get("axis") == "right"]
+    if left:
+        ax.set_ylabel(axis_label(left, "left"), fontsize=9, color=C_MUTED)
+    if axr is not None and right and getattr(axr, "_lane_ylim", None) is None:
+        # A lane rack is labelled by _lane_axis instead: its scale is positions
+        # on a stack, and naming the channel there would be a category error.
+        axr.set_ylabel(axis_label(right, "right"), fontsize=9, color=C_MUTED)
 
 
 def _fit_legend(fig, ax, pad=0.012):
@@ -754,6 +1035,41 @@ def _problem_note(fig, note):
     fig.text(0.055, 1.0 - 0.25 * h, note, fontsize=NOTE_PT, color=C_MUTED,
              va="top")
 
+def _fit_one(axis, lines, window_values_fn=None, pad=0.06):
+    """Fit ONE value axis to the data inside the current time window.
+
+    Split out of fit_value_axes so the banded case can reuse it: a band is an
+    ordinary fit followed by a stretch, and duplicating the fit to say so is how
+    two copies of a calculation start disagreeing.  Returns False when the axis
+    owns nothing to fit to.
+    """
+    mine = [ln for ln, _ in lines if ln.axes is axis]
+    if not mine:
+        return False
+    if window_values_fn is not None:
+        v = window_values_fn(axis, mine)
+    else:
+        lo_x, hi_x = axis.get_xlim()
+        chunks = []
+        for ln in mine:
+            t = np.asarray(ln.get_xdata())
+            y = np.asarray(ln.get_ydata())
+            if t.size:
+                m = (t >= min(lo_x, hi_x)) & (t <= max(lo_x, hi_x))
+                chunks.append(y[m])
+        v = np.concatenate(chunks) if chunks else np.array([])
+    if v is None or not len(v):
+        return False
+    v = v[np.isfinite(v)]
+    if not v.size:
+        return False
+    lo, hi = float(np.min(v)), float(np.max(v))
+    if hi <= lo:
+        return False
+    m = (hi - lo) * pad
+    axis.set_ylim(lo - m, hi + m)
+    return True
+
 
 def fit_value_axes(axes, lines, window_values_fn=None, pad=0.06):
     """Fit each value axis to what is inside the current time window.
@@ -771,27 +1087,15 @@ def fit_value_axes(axes, lines, window_values_fn=None, pad=0.06):
             # first zoom -- which is exactly what the lanes were keeping it off.
             axis.set_ylim(*fixed)
             continue
-        mine = [ln for ln, _ in lines if ln.axes is axis]
-        if not mine:
+        if not _fit_one(axis, lines, window_values_fn, pad):
             continue
-        if window_values_fn is not None:
-            v = window_values_fn(axis, mine)
-        else:
-            lo_x, hi_x = axis.get_xlim()
-            chunks = []
-            for ln in mine:
-                t = np.asarray(ln.get_xdata())
-                y = np.asarray(ln.get_ydata())
-                if t.size:
-                    m = (t >= min(lo_x, hi_x)) & (t <= max(lo_x, hi_x))
-                    chunks.append(y[m])
-            v = np.concatenate(chunks) if chunks else np.array([])
-        if v is None or not len(v):
-            continue
-        v = v[np.isfinite(v)]
-        if not v.size:
-            continue
-        lo, hi = float(np.min(v)), float(np.max(v))
-        if hi > lo:
-            m = (hi - lo) * pad
-            axis.set_ylim(lo - m, hi + m)
+        band = getattr(axis, "_band_frac", 1.0)
+        if band < 1.0:
+            # Graph.right_frac: an ordinary fit, then stretch the SCALE so the
+            # data occupies only that fraction of the frame, measured from the
+            # bottom.  Done here rather than once in build_figure because the
+            # interactive host refits on every zoom, and a band applied once
+            # would spring back to full height the moment anyone looked closer.
+            lo, hi = axis.get_ylim()
+            if hi > lo:
+                axis.set_ylim(lo, lo + (hi - lo) / band)
