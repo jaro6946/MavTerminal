@@ -809,26 +809,20 @@ def draw_band_rows(ax, rows, ylabel="", empty_msg="nothing to show",
         # characters and as tick labels they extend left into the checkbox panel
         # and get clipped by the figure edge.  Anchored in axes coordinates they
         # also survive a time-axis zoom, which data coordinates would not.
-        row_spans = [sp for spans, _c in lanes for sp in spans]
-        covered = sum(b - a for a, b in row_spans) / span_x
-        # A dense row (armed, "fusing GPS") has no free side, so leave it on the
-        # left where every other plot already puts it.  A sparse row gets the
-        # emptier third: its handful of bars are the only thing on the row, and
-        # the label's background box would hide them.
-        if covered < 0.2 and row_spans:
-            def _in(lo, hi):
-                return sum(max(0.0, min(b, hi) - max(a, lo)) for a, b in row_spans)
-            third = span_x / 3.0
-            right = _in(t_hi - third, t_hi) < _in(t_lo, t_lo + third)
-        else:
-            right = False
+        # ALWAYS the left edge.  This used to migrate to whichever third of the
+        # row was emptier, so a sparse row's label box would not sit on its few
+        # bars -- but a name that is sometimes left and sometimes right cannot be
+        # SCANNED: reading the panel means finding each label before reading it,
+        # and the eye has to sweep the full width per row to do that.  One fixed
+        # edge makes the labels a column, which is how this panel is actually
+        # read; the box stays translucent so a bar beneath still shows through.
         # Just clear of its own top lane, NOT centred in the gap: at the halfway
         # point a title is equidistant from the lanes above and below it and
         # reads as belonging to either.
-        ax.text(0.996 if right else 0.004, y if n == 1 else y + row_h / 2 + 0.11,
+        ax.text(0.004, y if n == 1 else y + row_h / 2 + 0.11,
                 label, transform=ax.get_yaxis_transform(which="grid"),
                 fontsize=7, color=label_color or C_MUTED, va="center",
-                ha="right" if right else "left", zorder=5,
+                ha="left", zorder=5,
                 bbox=dict(facecolor=C_SURFACE, edgecolor="none", pad=1.0,
                           alpha=0.75))
     ax.set_yticks([])

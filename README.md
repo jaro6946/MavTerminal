@@ -267,8 +267,14 @@ re-emit reliably, so a gate that keys off STATUSTEXT can miss a terminated board
 ## Plotting logs: `logGraph`
 
 `logGraph` opens a **log browser**: a dropdown of every `.ulg` on this machine on
-the toolbar, and below it every plot for the selected log, stacked in one
-scrolling page.
+the toolbar, a **Load graphs** button next to it, and below them every plot for
+the loaded log, stacked in one scrolling page.
+
+Picking a log in the dropdown does **not** draw it. It titles the window, opens
+that log's notes and clears whatever was on screen; the parse happens when you
+press **Load graphs** (or Ctrl+L, or Enter). Drawing a log is ~14 figures and
+several seconds, and the most common errand in this window — renaming three or
+four logs so they are not all called `FC_log.ulg` — needs none of them.
 
 ```bash
 mavTerminal -c "logGraph"                    # browse: pick a log in the GUI
@@ -321,8 +327,17 @@ the legend.
 
 ### The library (the dropdown)
 
-Each row carries name · duration · size · date · time · corruption, in monospace
-so the columns line up, and the list is sorted newest-first.
+Each row carries **MTL number** · name · duration · size · date · time ·
+corruption, in monospace so the columns line up, and the list is sorted
+newest-first.
+
+- **Every log gets a permanent `MTLnnn` number** (MavTerminal Log) the first time
+  this window sees it, kept in `log_browser.json`. It is a handle that outlives
+  the filename: the number follows the log through a rename, so "MTL042" is
+  something you can write in a note, a commit message or a report and still
+  resolve in a month, which `FC_log.ulg` is not. Numbers are handed out
+  oldest-flight-first within each batch of new files and are never reused or
+  reassigned.
 
 - **The date is the flight, not the file.** An `.ulg` pulled off an SD card has
   an mtime of the *download* — measured two days out on

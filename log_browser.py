@@ -692,6 +692,9 @@ class Browser(QtWidgets.QMainWindow):
         self.state.setdefault("durations", {})
         self.state.setdefault("notes", {})        # fallback store, see notes_path_for
         self.state.setdefault("notes_open", False)
+        # MavTerminal Log numbers: a short stable handle per log, see _assign_mtl.
+        self.state.setdefault("mtl", {})          # abspath -> int
+        self.state.setdefault("mtl_next", 1)      # next number to hand out
         self._notes_path = None       # which log the notes box currently holds
         self._thread = None
         self._worker = None
@@ -707,8 +710,12 @@ class Browser(QtWidgets.QMainWindow):
         self.resize(1600, 950)
         self._build_ui()
         self._populate(extra=list(paths))
-        if paths:
-            self._select_path(paths[0])
+        if paths and self._select_path(paths[0]):
+            # Same state as if the user had picked it: titled, notes open, Load
+            # armed -- but NOT parsed.  Opening on a path is how the HITL runner
+            # hands a log over, and it should not cost 20 s before the window is
+            # usable.
+            self._picked(self.picker.currentIndex())
 
     # -- construction
     def _build_ui(self):
@@ -747,6 +754,25 @@ class Browser(QtWidgets.QMainWindow):
         self.picker.setMinimumContentsLength(48)
         self.picker.activated.connect(self._picked)
         bh.addWidget(self.picker, 1)
+
+        # THE button.  Picking a log no longer draws it -- selecting is cheap,
+        # drawing is ~14 figures and several seconds, and the common errand here
+        # is renaming three or four logs, which needs the dropdown and nothing
+        # else.  So the parse is explicit, it is the first control after the
+        # dropdown, and it is the only coloured thing on the bar.
+        self.btn_load = QtWidgets.QPushButton("▶  Load graphs")
+        self.btn_load.setToolTip("Parse the selected log and draw every plot "
+                                 "(Ctrl+L, or Enter)")
+        self.btn_load.setShortcut("Ctrl+L")
+        self.btn_load.setMinimumWidth(130)
+        self.btn_load.setEnabled(False)
+        self.btn_load.clicked.connect(self._load_selected)
+        bh.addWidget(self.btn_load)
+        self._set_load_pending(False)
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.VLine)
+        sep.setFrameShadow(QtWidgets.QFrame.Sunken)
+        bh.addWidget(sep)
 
         for label, slot in (("Open file…", self._open_file),
                             ("Add folder…", self._add_folder),
@@ -816,14 +842,6 @@ class Browser(QtWidgets.QMainWindow):
         # combo box that cannot express any of it.
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setColumnCount(6)
-
-        # A selection change starts a 400 ms timer rather than loading at once,
-        # so keyboard-scrolling the dropdown doesn't kick off a parse per
-        # keystroke and leave the one you want behind a queue.
-        self._debounce = QtCore.QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(400)
-        self._debounce.timeout.connect(self._load_selected)
 
         # After the tree, because the Report tab asks it what logs exist.  It
         # shares this window's parse cache, so a log open in one tab is already
@@ -932,6 +950,50 @@ class Browser(QtWidgets.QMainWindow):
                       f"kept in {STATE_PATH}")
         _save_state(self.state)
 
+    # -- MavTerminal Log numbers
+    def _assign_mtl(self):
+        """Give every library log a permanent MTLnnn number.
+
+        The point is a handle that does NOT change: these logs are called
+        FC_log.ulg or a UUID, renaming them is a routine errand in this window,
+        and "the heading one" is not something you can say to a script or write
+        in a note.  So the number is handed out ONCE, on the first sight of a
+        file, and nothing afterwards -- rename, re-parse, a changed flight date,
+        a folder removed and re-added -- renumbers it.
+
+        Oldest flight gets the lowest number, so on a library that already exists
+        the numbering reads chronologically and every log flown from now on
+        appends to the end.  Order only applies WITHIN one batch of new files;
+        stability beats keeping the sequence sorted forever.
+        """
+        fresh = []
+        for it in self._iter_items():
+            path = it.data(0, QtCore.Qt.UserRole)
+            if not path:
+                continue
+            key = os.path.abspath(path)
+            if key in self.state["mtl"]:
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            fresh.append((self._log_date(path, st)[0], key))
+        if not fresh:
+            return
+        fresh.sort()
+        n = int(self.state.get("mtl_next", 1))
+        for _when, key in fresh:
+            self.state["mtl"][key] = n
+            n += 1
+        self.state["mtl_next"] = n
+        _save_state(self.state)
+
+    def _mtl_label(self, path):
+        """"MTL014" for `path`, or six spaces so the dropdown stays in column."""
+        n = self.state["mtl"].get(os.path.abspath(path)) if path else None
+        return f"MTL{n:03d}" if n else "      "
+
     # -- the dropdown, projected from the tree
     def _row_text(self, item):
         """One dropdown line: the name, then the columns the tree used to show."""
@@ -942,7 +1004,7 @@ class Browser(QtWidgets.QMainWindow):
         # without knocking the names out of alignment in the monospace list.
         path = item.data(0, QtCore.Qt.UserRole)
         mark = "✎ " if path and self._has_note(path) else "  "
-        name = mark + item.text(0)
+        name = f"{self._mtl_label(path)}  {mark}{item.text(0)}"
         return f"{name}   ·   {'  ·  '.join(bits)}" if bits else name
 
     def _rebuild_picker(self):
@@ -972,6 +1034,7 @@ class Browser(QtWidgets.QMainWindow):
             self.picker.setCurrentIndex(-1)
         elif not keep:
             self.picker.setCurrentIndex(-1)
+        self._sync_load_button()
         # The popup is free to be wider than the closed combo, and these lines
         # run past 90 characters.
         self.picker.view().setMinimumWidth(
@@ -995,8 +1058,57 @@ class Browser(QtWidgets.QMainWindow):
         return self.picker.itemData(i, QtCore.Qt.UserRole) if i >= 0 else None
 
     def _picked(self, _index):
-        if self._picker_path():
-            self._debounce.start()
+        """A new selection: drop what is on screen, arm the Load button.
+
+        Clearing here is the whole point of the explicit Load.  The previous
+        log's ~14 canvases and their figures go at once, so the window is
+        honest about showing nothing, the rename/notes controls are usable
+        immediately, and the ~150 MB those figures hold is released rather than
+        waiting for the next parse to finish."""
+        path = self._picker_path()
+        if not path:
+            return
+        self._current = None        # nothing drawn -> Load has work to do
+        self.page.clear()
+        self._close_orphan_figures()
+        self.jump.clear()
+        self.jump.addItem("jump to plot…")
+        self.btn_params.setEnabled(False)   # comparing needs the params parsed
+        self._load_notes(path)      # readable, and editable, without any parse
+        try:
+            mins = self._cached_duration(path, os.stat(path))
+        except OSError:
+            mins = None
+        dur = f"{mins:.1f} min   —   " if mins is not None else ""
+        self.title.setText(f"{self._mtl_label(path)}   {os.path.basename(path)}"
+                           f"   —   {dur}press Load graphs")
+        self._sync_load_button()
+
+    def _sync_load_button(self):
+        """Enabled when something is selected, coloured when it is not drawn."""
+        if not hasattr(self, "btn_load"):
+            return                  # still building the toolbar
+        path = self._picker_path()
+        drawn = bool(path and self._current
+                     and os.path.abspath(path) == os.path.abspath(self._current))
+        self.btn_load.setEnabled(bool(path) and self._thread is None)
+        self._set_load_pending(bool(path) and not drawn)
+
+    def _set_load_pending(self, pending):
+        """Colour the Load button while the selected log is not drawn yet.
+
+        A button that looks the same whether or not it has anything to do is a
+        button you have to think about; this one answers "am I looking at this
+        log, or just pointing at it" without reading the title."""
+        if pending:
+            self.btn_load.setStyleSheet(
+                "QPushButton { font-weight: 600; padding: 4px 10px;"
+                " background: #1baf7a; color: white; border: 1px solid #158b61;"
+                " border-radius: 3px; }"
+                "QPushButton:hover { background: #17c086; }")
+        else:
+            self.btn_load.setStyleSheet(
+                "QPushButton { font-weight: 600; padding: 4px 10px; }")
 
     # -- library
     def report_crash(self, earlier):
@@ -1105,6 +1217,7 @@ class Browser(QtWidgets.QMainWindow):
                 self._add_row(node, os.path.basename(p), p, checked)
             node.setExpanded(True)
 
+        self._assign_mtl()          # before the projection: the rows show the number
         self._rebuild_picker()
         if current:
             self._select_path(current)
@@ -1337,21 +1450,24 @@ class Browser(QtWidgets.QMainWindow):
                 self.picker.blockSignals(True)
                 self.picker.setCurrentIndex(k)
                 self.picker.blockSignals(False)
+                self._sync_load_button()
                 return True
         return False
 
     # -- loading
     def _load_selected(self):
-        self._debounce.stop()
+        """Parse the selected log and draw every plot.  The Load button's slot."""
         path = self._selected_path()
         if not path or path == self._current:
-            return
+            return                  # nothing selected, or already on screen
         if self._thread is not None:
             return                  # a parse is already running; ignore
         self._current = path
         self._load_notes(path)      # before the parse: notes are readable at once
-        self.title.setText(f"{os.path.basename(path)}   —   reading…")
-        self._log(f"reading {path}")
+        self.title.setText(f"{self._mtl_label(path)}   "
+                           f"{os.path.basename(path)}   —   reading…")
+        self._set_load_pending(False)
+        self._log(f"reading {self._mtl_label(path).strip()}: {path}")
         topics = ulog_plots.all_topics(self.ctx)
 
         # A log the Report tab -- or a previous visit -- already read is redrawn
@@ -1374,6 +1490,7 @@ class Browser(QtWidgets.QMainWindow):
         self._worker.done.connect(self._on_parsed)
         self._worker.failed.connect(self._on_parse_failed)
         self._thread.start()
+        self.btn_load.setEnabled(False)      # one parse at a time
 
     def _teardown_thread(self):
         if self._thread is not None:
@@ -1382,6 +1499,7 @@ class Browser(QtWidgets.QMainWindow):
             self._thread = None
             self._worker = None
         self.busy.hide()
+        self._sync_load_button()
 
     @QtCore.pyqtSlot(object, str, float)
     def _on_parsed(self, ulog, path, secs):
@@ -1417,7 +1535,8 @@ class Browser(QtWidgets.QMainWindow):
         self.page.link_time = self.chk_link.isChecked()
         self.jump.clear()
         self.jump.addItem("jump to plot…")
-        self.title.setText(f"{os.path.basename(path)}   —   {mins:.1f} min")
+        self.title.setText(f"{self._mtl_label(path)}   {os.path.basename(path)}"
+                           f"   —   {mins:.1f} min")
 
         for spec in ulog_plots.PLOTS:
             sub = PlotCtx(smooth=self.ctx.smooth, use_abs=self.ctx.use_abs,
@@ -1481,7 +1600,9 @@ class Browser(QtWidgets.QMainWindow):
     def _on_parse_failed(self, path, msg):
         self._teardown_thread()
         self._current = None
-        self.title.setText(f"{os.path.basename(path)}   —   failed")
+        self.title.setText(f"{self._mtl_label(path)}   "
+                           f"{os.path.basename(path)}   —   failed")
+        self._set_load_pending(True)     # it is still what is selected
         self._log(f"  !! {msg}")
         QtWidgets.QMessageBox.warning(self, "Could not read log",
                                       f"{os.path.basename(path)}\n\n{msg}")
@@ -1513,6 +1634,10 @@ class Browser(QtWidgets.QMainWindow):
         if event.key() == QtCore.Qt.Key_F2:
             self._rename_selected()
             return
+        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            if self.btn_load.isEnabled():
+                self._load_selected()
+            return
         super().keyPressEvent(event)
 
     def _rename_selected(self):
@@ -1521,7 +1646,8 @@ class Browser(QtWidgets.QMainWindow):
             return
         folder, old = os.path.split(path)
         new, ok = QtWidgets.QInputDialog.getText(
-            self, "Rename log", f"New name (in {folder}):",
+            self, f"Rename {self._mtl_label(path).strip()}",
+            f"New name (in {folder}):",
             QtWidgets.QLineEdit.Normal, old)
         if not ok:
             return
@@ -1564,6 +1690,11 @@ class Browser(QtWidgets.QMainWindow):
         rec = self.state["durations"].pop(os.path.abspath(path), None)
         if rec:
             self.state["durations"][os.path.abspath(target)] = rec
+        # The number belongs to the LOG, not to its name -- carrying it across is
+        # what makes MTLnnn worth quoting in a note that outlives the filename.
+        mtl = self.state["mtl"].pop(os.path.abspath(path), None)
+        if mtl:
+            self.state["mtl"][os.path.abspath(target)] = mtl
         note = self.state.get("notes", {}).pop(os.path.abspath(path), None)
         if note:                    # only set for logs whose folder is read-only
             self.state["notes"][os.path.abspath(target)] = note
