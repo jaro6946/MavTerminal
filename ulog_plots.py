@@ -18,6 +18,7 @@ from typing import Callable, List
 
 import ulog_accel
 import ulog_alt
+import ulog_commands
 import ulog_cpu
 import ulog_faults
 import ulog_graph
@@ -123,6 +124,37 @@ PLOTS = [
               "frame that survives an EKF handover",
         # Fallback only: build_path sets fig._page_height.
         height=860,
+    ),
+    PlotSpec(
+        # Directly under the path: "what was it asked to do along that track".
+        key="commands",
+        title="Commands: throttle / roll / pitch / yaw",
+        topics=ulog_commands.COMMAND_TOPICS,
+        build=ulog_commands.build_commands,
+        blurb="collective throttle command, and commanded vs actual roll, "
+              "pitch and yaw, with the mixer's torque command and per-motor "
+              "output available to switch on",
+        height=1000,
+    ),
+    PlotSpec(
+        key="speed",
+        title="Speed",
+        topics=ulog_commands.SPEED_TOPICS,
+        build=ulog_commands.build_speed,
+        blurb="speed magnitude -- 3D and ground speed from the estimate, the "
+              "commanded speed, and the raw GPS receiver speed -- plus velocity "
+              "resolved forward / right / up along the vehicle's heading",
+        height=880,
+    ),
+    PlotSpec(
+        key="motors",
+        title="Motors / vibration spectrum",
+        topics=ulog_commands.MOTORS_TOPICS,
+        build=ulog_commands.build_motors,
+        blurb="each motor's command over time, above PX4's onboard gyro FFT "
+              "peaks -- the frame's vibration frequencies, an indirect "
+              "rotor-speed witness while no ESC telemetry is wired",
+        height=880,
     ),
     PlotSpec(
         key="cpu",

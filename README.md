@@ -292,6 +292,9 @@ timeline, labelled at each transition):
 | **Accelerometer / calibration** | Per-IMU accel magnitude and axes, each EKF's **bias estimate against the exact preflight arming threshold** (`estimatorCheck.cpp`'s `checkSensorBias`, reproduced including the 3-sigma term, so the threshold is a time series), the thermal-compensation offset being injected, inter-IMU consistency + vibration + temperature, and every accel fault flag. |
 | **Heading estimation** | Every **independent** witness to yaw on one axis — each EKF instance, the magnetometer-free **EKF-GSF**, an independently computed tilt-compensated compass, and GNSS course — then their disagreement with the published estimate (with mag temperature on the right-hand axis), the mag innovations, the learned bias and declination, and every yaw-source and mag fault flag. |
 | **Flight path (3D)** | Where the vehicle actually was, in 3D coloured by time, with a top-down plan view and the raw GPS fix. Each sample is **re-anchored onto one fixed origin** using the reference origin published beside it, so an EKF handover no longer puts a step in the track (22.76 m → 0.88 m on `d05a88e3`). Genuine estimator resets are *marked*, not smoothed. |
+| **Commands: throttle / roll / pitch / yaw** | What the vehicle was *told* to do: the collective throttle command, and commanded (dashed magenta) vs actual (solid black) roll, pitch and yaw from the quaternions `q_d` / `q`. The mixer's normalised torque command per axis (right-hand axis) and per-motor output are there to switch on, for spotting saturation. Lines are broken across logging holes rather than bridged. |
+| **Speed** | Speed with no direction: 3D and horizontal ground speed from the estimate, the commanded speed (only finite in velocity-controlled modes), and the raw GPS receiver speed as an EKF-independent witness. A second panel resolves velocity into the **heading frame** — forward / right / up along the nose, levelled (follows yaw, not tilt), actual vs commanded — so pitch and roll show up as the speed they produce. Signs follow PX4 FRD: +right, the opposite of rotorpy's {V} frame. |
+| **Motors / vibration spectrum** | Each motor's command (`actuator_motors`) over time, above PX4's **onboard gyro FFT** peaks (`sensor_gyro_fft`, run on the raw ~2 kHz gyro) as frequency vs time coloured by SNR. With no ESC telemetry wired this is the only rotor-speed evidence in the log — indirect and not labelled by motor. An offline spectrogram of `sensor_combined` is *not* offered: at ~190 Hz its Nyquist (~95 Hz) sits right on the ~100 Hz rotor line. |
 | **Processor load / links** | Did the board run out of CPU or bandwidth, and what did it drop: CPU/RAM, the EKF's own time slip and per-IMU publish rates, SD buffer pressure and the MAVLink rate throttle, and the **companion / uXRCE-DDS bridge traffic** measured from the uORB topics the bridge writes. |
 
 Every EKF-instance-aware plot is shaded by
@@ -446,6 +449,7 @@ materialising ~100 topics nobody plots.
 | `ulog_accel.py` | Accelerometer / calibration |
 | `ulog_heading.py` | Heading estimation |
 | `ulog_path.py` | 3D flight path + basemaps |
+| `ulog_commands.py` | Commands (throttle / attitude), speed, motors + onboard FFT |
 | `ulog_cpu.py` | Processor load / links |
 | `ulog_report.py` | PDF export |
 | `log_browser.py` | The PyQt5 browser window |
