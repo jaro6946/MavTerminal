@@ -30,6 +30,26 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.setFocusPolicy(QtCore.Qt.WheelFocus)
         self._nav_mods = None
 
+    def _draw_idle(self):
+        """Only render a canvas someone can see.
+
+        matplotlib queues a full Agg draw on every resize, visible or not, and a
+        log's page is a dozen tall figures of which two fit on screen -- so the
+        first layout after Load rendered all twelve, ~5 s on the GUI thread with
+        the busy bar frozen.  A canvas scrolled out of view just keeps its draw
+        PENDING (which also makes further draw_idle calls no-ops); Qt only sends
+        paintEvent to a widget once it is exposed, and paintEvent calls straight
+        back into here, so it renders the moment it scrolls into view.
+
+        Overrides a private matplotlib hook (backend_qt FigureCanvasQT._draw_idle,
+        called by both draw_idle's timer and paintEvent); if a future matplotlib
+        renames it, this simply stops being called and every canvas draws eagerly
+        again, which is slow but correct.
+        """
+        if getattr(self, "_draw_pending", False) and self.visibleRegion().isEmpty():
+            return
+        super()._draw_idle()
+
     def wheelEvent(self, event):
         mods = event.modifiers()
         if not (mods & QtCore.Qt.ControlModifier):

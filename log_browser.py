@@ -706,6 +706,8 @@ class Browser(QtWidgets.QMainWindow):
         self._thread = None
         self._worker = None
         self._current = None
+        self._build = None            # the page build in flight, see _on_parsed
+        self._build_gen = 0
         self._proc = None
         self._scan_thread = None
         self._scanner = None
@@ -1186,6 +1188,7 @@ class Browser(QtWidgets.QMainWindow):
         if not path:
             return
         self._current = None        # nothing drawn -> Load has work to do
+        self._cancel_build()        # before clear: a queued step must not add
         self.page.clear()
         self._close_orphan_figures()
         self.jump.clear()
@@ -1208,7 +1211,8 @@ class Browser(QtWidgets.QMainWindow):
         path = self._picker_path()
         drawn = bool(path and self._current
                      and os.path.abspath(path) == os.path.abspath(self._current))
-        self.btn_load.setEnabled(bool(path) and self._thread is None)
+        self.btn_load.setEnabled(bool(path) and self._thread is None
+                                 and self._build is None)
         self._set_load_pending(bool(path) and not drawn)
 
     def _set_load_pending(self, pending):
@@ -1578,8 +1582,8 @@ class Browser(QtWidgets.QMainWindow):
         path = self._selected_path()
         if not path or path == self._current:
             return                  # nothing selected, or already on screen
-        if self._thread is not None:
-            return                  # a parse is already running; ignore
+        if self._thread is not None or self._build is not None:
+            return                  # a parse or page build is running; ignore
         self._current = path
         self._load_notes(path)      # before the parse: notes are readable at once
         self.title.setText(f"{self._mtl_label(path)}   "
@@ -1653,49 +1657,100 @@ class Browser(QtWidgets.QMainWindow):
         self.page.link_time = self.chk_link.isChecked()
         self.jump.clear()
         self.jump.addItem("jump to plot…")
-        self.title.setText(f"{self._mtl_label(path)}   {os.path.basename(path)}"
-                           f"   —   {mins:.1f} min")
+        # The plots are built ONE PER EVENT-LOOP TURN rather than in one loop.
+        # Figures have to be made on this (GUI) thread, and the whole set takes
+        # seconds; done in one go, the window -- busy bar included -- froze
+        # solid from "parsed" until the last plot was up.  Yielding between
+        # plots lets the bar animate and the window repaint, and the plots
+        # appear top-down as they are made.  The generation number cancels a
+        # build in flight when another log is picked or the window closes.
+        self._build_gen += 1
+        self._build = dict(gen=self._build_gen, ulog=ulog, path=path,
+                           head=f"{self._mtl_label(path)}   "
+                                f"{os.path.basename(path)}   —   {mins:.1f} min",
+                           i=0)
+        self.busy.show()
+        self._sync_load_button()
+        self._title_building()
+        QtCore.QTimer.singleShot(0, lambda g=self._build_gen: self._build_next(g))
 
-        for spec in ulog_plots.PLOTS:
-            sub = PlotCtx(smooth=self.ctx.smooth, use_abs=self.ctx.use_abs,
-                          rate_src=self.ctx.rate_src, adds=list(self.ctx.adds),
-                          debias=self.ctx.debias, page_scroll=True)
-            crumb(f"build {spec.key}")
-            if spec.key == "faults":
-                try:
-                    panel = FaultPanel(
-                        ulog, path, self.page,
-                        make_ctx=lambda: PlotCtx(page_scroll=True),
-                        remembered=self.state.get("fault_pick"),
-                        on_pick=self._remember_fault_pick)
-                except Exception as e:
-                    self._log(f"  !! {spec.title}: {type(e).__name__}: {e}")
-                    continue
-                self._log(f"  {len(panel.faults)} distinct faults in this log")
-                self.page.add_widget(spec.key, panel)
-                self.jump.addItem(spec.title, spec.key)
-                continue
+    def _build_next(self, gen):
+        """Build plot number i of the page, then queue the next one."""
+        b = self._build
+        if b is None or b["gen"] != gen:
+            return                  # cancelled: another log, or window closing
+        specs = ulog_plots.PLOTS
+        if b["i"] >= len(specs):
+            self._finish_build()
+            return
+        self._build_one(specs[b["i"]], b["ulog"], b["path"])
+        b["i"] += 1
+        self._title_building()
+        QtCore.QTimer.singleShot(0, lambda: self._build_next(gen))
+
+    def _title_building(self):
+        """Name the plot ABOUT to be built: the title only repaints between
+        steps, so naming the one being built would always show the last one."""
+        b, specs = self._build, ulog_plots.PLOTS
+        if b["i"] < len(specs):
+            self.title.setText(f"{b['head']}   —   drawing {b['i'] + 1}/"
+                               f"{len(specs)}: {specs[b['i']].title}…")
+
+    def _build_one(self, spec, ulog, path):
+        sub = PlotCtx(smooth=self.ctx.smooth, use_abs=self.ctx.use_abs,
+                      rate_src=self.ctx.rate_src, adds=list(self.ctx.adds),
+                      debias=self.ctx.debias, page_scroll=True)
+        crumb(f"build {spec.key}")
+        if spec.key == "faults":
             try:
-                fig = spec.build(ulog, sub, path)
+                panel = FaultPanel(
+                    ulog, path, self.page,
+                    make_ctx=lambda: PlotCtx(page_scroll=True),
+                    remembered=self.state.get("fault_pick"),
+                    on_pick=self._remember_fault_pick)
             except Exception as e:
-                # A plot that cannot render this log must not take the others
-                # (and the whole window) down with it.
                 self._log(f"  !! {spec.title}: {type(e).__name__}: {e}")
-                continue
-            for n in sub.notes:
-                self._log(f"  note [{spec.key}]: {n}")
-            if fig is None:
-                self._log(f"  {spec.title}: nothing plottable in this log")
-                continue
-            # A builder whose figure height depends on the log (the accel
-            # plot's fault band is sized to its row count) states the pixels it
-            # wants; spec.height is the fallback for the fixed-layout plots.
-            self.page.add(spec.key, fig,
-                          getattr(fig, "_page_height", spec.height))
+                return
+            self._log(f"  {len(panel.faults)} distinct faults in this log")
+            self.page.add_widget(spec.key, panel)
             self.jump.addItem(spec.title, spec.key)
+            return
+        try:
+            fig = spec.build(ulog, sub, path)
+        except Exception as e:
+            # A plot that cannot render this log must not take the others
+            # (and the whole window) down with it.
+            self._log(f"  !! {spec.title}: {type(e).__name__}: {e}")
+            return
+        for n in sub.notes:
+            self._log(f"  note [{spec.key}]: {n}")
+        if fig is None:
+            self._log(f"  {spec.title}: nothing plottable in this log")
+            return
+        # A builder whose figure height depends on the log (the accel
+        # plot's fault band is sized to its row count) states the pixels it
+        # wants; spec.height is the fallback for the fixed-layout plots.
+        self.page.add(spec.key, fig,
+                      getattr(fig, "_page_height", spec.height))
+        self.jump.addItem(spec.title, spec.key)
+
+    def _finish_build(self):
+        head = self._build["head"]
+        self._build = None
         self.page.finish()
         self._close_orphan_figures()
+        self.title.setText(head)
+        self.busy.hide()
+        self._sync_load_button()
         crumb("page ready")
+
+    def _cancel_build(self):
+        """Abandon a build in flight; what it already added is the caller's to
+        clear.  Safe to call when nothing is building."""
+        if self._build is not None:
+            self._build = None
+            self._build_gen += 1
+            self.busy.hide()
 
     def _remember_fault_pick(self, key):
         self.state["fault_pick"] = key
@@ -1827,6 +1882,16 @@ class Browser(QtWidgets.QMainWindow):
             self._current = target
         if self._notes_path == path:
             self._notes_path = target
+        # The title line names the file, whatever state it is in (selected,
+        # reading, drawing, drawn, failed) -- swap the name and keep the state.
+        # A build in flight restores its own header when it finishes, so that
+        # copy is renamed too or the old name comes back a second later.
+        old_head = f"{self._mtl_label(target)}   {old}"
+        new_head = f"{self._mtl_label(target)}   {new}"
+        self.title.setText(self.title.text().replace(old_head, new_head, 1))
+        if self._build is not None and self._build["path"] == path:
+            self._build["path"] = target
+            self._build["head"] = self._build["head"].replace(old_head, new_head, 1)
         self._populate()
         self._select_path(target)
 
@@ -2094,6 +2159,7 @@ class Browser(QtWidgets.QMainWindow):
             return
         self._stop_library_scan()
         self._teardown_thread()
+        self._cancel_build()
         if getattr(self, "report_tab", None) is not None:
             self.report_tab.stop()
         if self._proc is not None:

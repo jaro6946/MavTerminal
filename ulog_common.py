@@ -801,10 +801,22 @@ def draw_band_rows(ax, rows, ylabel="", empty_msg="nothing to show",
             if track:
                 ax.barh(ly, span_x, left=t_lo, height=lane_h * 0.88,
                         color=C_GRID, alpha=0.9, lw=0, zorder=1)
-            for a, b in spans:
-                ax.barh(ly, max(b - a, min_width, 1e-6), left=a,
-                        height=lane_h * 0.88, color=color, alpha=0.9, lw=0,
-                        zorder=3)
+            # ONE collection per lane, not one barh per span.  A barh is a full
+            # Rectangle artist with its own transforms and a data-limit update;
+            # a busy log's mode/validity rows have ~9,000 spans, and drawing
+            # them one at a time took 12.7 s of the altitude plot's 13.5 s --
+            # all of it on the GUI thread, freezing the window.  broken_barh is
+            # the same rectangles in a single PolyCollection.
+            if spans:
+                h = lane_h * 0.88
+                coll = ax.broken_barh([(a, max(b - a, min_width, 1e-6))
+                                       for a, b in spans],
+                                      (ly - h / 2, h), facecolors=color,
+                                      alpha=0.9, lw=0, zorder=3)
+                # barh made each bar's left edge "sticky", which is what kept
+                # autoscale from padding the time axis out past t=0.  Only the
+                # smallest left can ever bind, so that one is enough.
+                coll.sticky_edges.x.append(min(a for a, _b in spans))
         # Labels go INSIDE the axes, not on the y ticks: these names run to ~22
         # characters and as tick labels they extend left into the checkbox panel
         # and get clipped by the figure edge.  Anchored in axes coordinates they

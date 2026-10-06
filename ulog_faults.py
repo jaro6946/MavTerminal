@@ -433,9 +433,12 @@ def build_fault_detail(ulog, fault, ctx=None, path=""):
             int(re.sub(r"\D", "", lane) or 0))
         ax.barh(yy, dur, left=0, height=0.7, color=C_GRID, alpha=0.6, lw=0,
                 zorder=1)
-        for a, b in spans:
-            ax.barh(yy, max(b - a, dur * MIN_EVENT_FRAC), left=a, height=0.7,
-                    color=c, alpha=0.85, lw=0, zorder=3)
+        # One collection, not one barh per span -- see draw_band_rows.
+        if spans:
+            coll = ax.broken_barh([(a, max(b - a, dur * MIN_EVENT_FRAC))
+                                   for a, b in spans], (yy - 0.35, 0.7),
+                                  facecolors=c, alpha=0.85, lw=0, zorder=3)
+            coll.sticky_edges.x.append(min(a for a, _b in spans))
         # A tick at every onset even on a state fault: a flag that flickers
         # on/off at 10 Hz is one solid bar otherwise, and the ticks show it.
         ax.vlines(onsets, yy - 0.38, yy + 0.38, color=c if not spans else C_INK,
