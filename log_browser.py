@@ -35,6 +35,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import matplotlib.pyplot as plt
 import ulog_faults
 import ulog_plots
+from log_tags import (TAGS_SUFFIX, TagBar, TagFilter, merge_tags,
+                      tags_path_for)
 from qt_common import NotesBox, PlotCanvas
 from report_tab import ReportTab
 from ulog_cache import (LogCache, MeasuredULog, corruption_of, parse_ulog,
@@ -695,6 +697,11 @@ class Browser(QtWidgets.QMainWindow):
         # MavTerminal Log numbers: a short stable handle per log, see _assign_mtl.
         self.state.setdefault("mtl", {})          # abspath -> int
         self.state.setdefault("mtl_next", 1)      # next number to hand out
+        # Tags: per-log sidecars (see log_tags), this dict only for read-only
+        # folders; the vocabulary is every tag ever applied, for re-use.
+        self.state.setdefault("tags", {})         # abspath -> [tag], fallback
+        self.state.setdefault("tag_vocab", [])
+        self._tag_cache = {}          # abspath -> [tag]; dropped on _populate
         self._notes_path = None       # which log the notes box currently holds
         self._thread = None
         self._worker = None
@@ -813,10 +820,23 @@ class Browser(QtWidgets.QMainWindow):
         bh.addWidget(self.busy)
         cv.addWidget(bar)
 
+        # The dropdown's filter sits right under the dropdown it narrows.
+        # Closed every launch, and the selection is not persisted: a filter
+        # left on from last week is a library that looks like it lost logs.
+        self.tag_filter = TagFilter(on_change=self._tag_filter_changed,
+                                    on_forget=self._forget_tag)
+        cv.addWidget(self.tag_filter)
+
         self.title = QtWidgets.QLabel("no log loaded")
         self.title.setStyleSheet(
             f"font-size: 13px; font-weight: 600; padding: 0 10px 6px 10px;")
         cv.addWidget(self.title)
+
+        # Tags above the notes and the plots (so above Faults over time), and
+        # filled on SELECTION, not on Load -- they need no parse.
+        self.tag_bar = TagBar(on_change=self._set_log_tags,
+                              vocabulary=self._tag_vocabulary)
+        cv.addWidget(self.tag_bar)
 
         cv.addWidget(self._build_notes())
 
@@ -914,6 +934,8 @@ class Browser(QtWidgets.QMainWindow):
         self._notes_path = path
         self.notes.set_text(self._read_notes(path) if path else "",
                             enabled=path is not None)
+        self.tag_bar.set_tags(self._tags_of(path) if path else [],
+                              enabled=path is not None)
 
     def _has_note(self, path):
         """Cheap enough to ask once per dropdown row: one stat, or a dict hit."""
@@ -949,6 +971,79 @@ class Browser(QtWidgets.QMainWindow):
             self._log(f"  notes: {os.path.basename(side)} not writable ({e.strerror}); "
                       f"kept in {STATE_PATH}")
         _save_state(self.state)
+
+    # -- tags
+    def _tags_of(self, path):
+        """The log's tags: sidecar, else the JSON fallback.  Cached per populate."""
+        key = os.path.abspath(path)
+        if key not in self._tag_cache:
+            try:
+                with open(tags_path_for(path), encoding="utf-8") as f:
+                    tags = f.read().splitlines()
+            except OSError:
+                tags = (self.state.get("tags") or {}).get(key, [])
+            self._tag_cache[key] = merge_tags(tags)
+        return self._tag_cache[key]
+
+    def _set_log_tags(self, tags):
+        """TagBar callback: write the open log's tags, learn any new ones."""
+        path = self._notes_path      # the log the notes/tags rows are showing
+        if path is None:
+            return
+        key = os.path.abspath(path)
+        side = tags_path_for(path)
+        try:
+            if tags:
+                with open(side, "w", encoding="utf-8") as f:
+                    f.write("\n".join(tags) + "\n")
+            elif os.path.exists(side):
+                os.remove(side)         # no 0-byte sidecars, same as notes
+            self.state["tags"].pop(key, None)
+        except OSError as e:
+            self.state["tags"][key] = list(tags)
+            self._log(f"  tags: {os.path.basename(side)} not writable "
+                      f"({e.strerror}); kept in {STATE_PATH}")
+        self._tag_cache[key] = merge_tags(tags)
+        self.state["tag_vocab"] = merge_tags(self.state["tag_vocab"], tags)
+        _save_state(self.state)
+        # The row text carries the tags and the filter may now include or
+        # exclude this log, so the whole projection is redone.
+        self._rebuild_picker()
+
+    def _tag_vocabulary(self):
+        """Every tag known: the remembered vocabulary plus any found on disk
+        (a sidecar copied in from another machine teaches its tags here)."""
+        return merge_tags(self.state["tag_vocab"],
+                          *(self._tags_of(p) for p in self._library_paths()))
+
+    def _library_paths(self):
+        if not hasattr(self, "tree"):
+            return []               # still building the UI
+        return [it.data(0, QtCore.Qt.UserRole) for it in self._iter_items()
+                if it.data(0, QtCore.Qt.UserRole)]
+
+    def _forget_tag(self, tag):
+        """Drop an unused tag (a typo, usually) from the vocabulary."""
+        fold = tag.casefold()
+        self.state["tag_vocab"] = [t for t in self.state["tag_vocab"]
+                                   if t.casefold() != fold]
+        _save_state(self.state)
+        self._log(f"  tag '{tag}' removed from the tag list")
+        self._rebuild_picker()
+        self.tag_bar.refresh_vocabulary()
+
+    def _tag_filter_changed(self):
+        if hasattr(self, "picker") and hasattr(self, "tag_filter"):
+            self._rebuild_picker()
+
+    def _refresh_tag_filter(self, shown, total):
+        """Pills (with per-tag counts) and the header summary."""
+        counts = {}
+        for p in self._library_paths():
+            for t in self._tags_of(p):
+                counts[t.casefold()] = counts.get(t.casefold(), 0) + 1
+        self.tag_filter.set_vocabulary(self._tag_vocabulary(), counts)
+        self.tag_filter.set_summary(shown, total)
 
     # -- MavTerminal Log numbers
     def _assign_mtl(self):
@@ -1005,6 +1100,8 @@ class Browser(QtWidgets.QMainWindow):
         path = item.data(0, QtCore.Qt.UserRole)
         mark = "✎ " if path and self._has_note(path) else "  "
         name = f"{self._mtl_label(path)}  {mark}{item.text(0)}"
+        if path and self._tags_of(path):
+            bits.append("[" + ", ".join(self._tags_of(path)) + "]")
         return f"{name}   ·   {'  ·  '.join(bits)}" if bits else name
 
     def _rebuild_picker(self):
@@ -1013,23 +1110,43 @@ class Browser(QtWidgets.QMainWindow):
         self.picker.blockSignals(True)
         self.picker.clear()
         model = self.picker.model()
+        filt = getattr(self, "tag_filter", None)
+        keep_abs = os.path.abspath(keep) if keep else None
+        shown = total = 0
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
             if not top.childCount():
                 continue
+            # The tag filter.  The log currently selected is never hidden, so
+            # the dropdown cannot go blank under a page still showing its plots.
+            kids = []
+            for j in range(top.childCount()):
+                child = top.child(j)
+                p = child.data(0, QtCore.Qt.UserRole)
+                total += 1
+                if (filt is None or not p or filt.matches(self._tags_of(p))
+                        or os.path.abspath(p) == keep_abs):
+                    kids.append(child)
+            shown += len(kids)
+            if not kids:
+                continue
             # Group headers stay as unselectable rows: the roots (Log Analysis /
             # HITL run folders / current directory) are how you know which
             # library a log came from, and a flat list of 46 entries loses that.
-            self.picker.addItem(f"── {top.text(0)} ──")
+            head = top.text(0)
+            if filt is not None and filt.active():
+                head += f"  — {len(kids)} match"
+            self.picker.addItem(f"── {head} ──")
             row = model.item(self.picker.count() - 1)
             row.setFlags(row.flags() & ~QtCore.Qt.ItemIsEnabled)
-            for j in range(top.childCount()):
-                child = top.child(j)
+            for child in kids:
                 self.picker.addItem(self._row_text(child))
                 self.picker.setItemData(self.picker.count() - 1,
                                         child.data(0, QtCore.Qt.UserRole),
                                         QtCore.Qt.UserRole)
         self.picker.blockSignals(False)
+        if filt is not None:
+            self._refresh_tag_filter(shown, total)
         if keep and not self._select_path(keep):
             self.picker.setCurrentIndex(-1)
         elif not keep:
@@ -1184,6 +1301,7 @@ class Browser(QtWidgets.QMainWindow):
         checked = self._checked_paths()
         current = self._selected_path()
         self.tree.clear()
+        self._tag_cache.clear()     # sidecars may have changed behind our back
         seen = set()
 
         roots = _default_roots() + [(os.path.basename(p.rstrip("/")) or p, p, False)
@@ -1675,7 +1793,8 @@ class Browser(QtWidgets.QMainWindow):
         moves = [(path, target)]
         old_stem = old[:-4]
         new_stem = new[:-4]
-        for suffix in (NOTES_SUFFIX, "_diag.txt", ".ulg:Zone.Identifier"):
+        for suffix in (NOTES_SUFFIX, TAGS_SUFFIX, "_diag.txt",
+                       ".ulg:Zone.Identifier"):
             src = os.path.join(folder, old_stem + suffix)
             if os.path.exists(src):
                 moves.append((src, os.path.join(folder, new_stem + suffix)))
@@ -1698,6 +1817,9 @@ class Browser(QtWidgets.QMainWindow):
         note = self.state.get("notes", {}).pop(os.path.abspath(path), None)
         if note:                    # only set for logs whose folder is read-only
             self.state["notes"][os.path.abspath(target)] = note
+        tags = self.state["tags"].pop(os.path.abspath(path), None)
+        if tags:                    # likewise, read-only folders only
+            self.state["tags"][os.path.abspath(target)] = tags
         _save_state(self.state)
         for src, dst in moves:
             self._log(f"renamed {os.path.basename(src)} -> {os.path.basename(dst)}")
