@@ -25,6 +25,7 @@ import ulog_graph
 import ulog_heading
 import ulog_localz
 import ulog_path
+import ulog_atrest
 from ulog_common import PlotCtx  # re-exported: callers build one and pass it on
 
 __all__ = ["PlotSpec", "PLOTS", "PlotCtx", "all_topics", "by_key"]
@@ -58,6 +59,20 @@ PLOTS = [
               "rejection, sensor driver error and GPS spoofing/jamming state "
               "that occurred, each on its own row against time",
         # Fallback only: build_faults sizes its own figure from the row count.
+        height=900,
+    ),
+    PlotSpec(
+        # Directly under the fault panel: "not at rest" is not a fault, but it
+        # silently disables the EKF's GPS drift checks, its zero-velocity update
+        # and in-run gyro bias learning -- so it is read alongside the faults.
+        key="atrest",
+        title="Faults: vehicle at rest",
+        topics=ulog_atrest.AT_REST_TOPICS,
+        build=ulog_atrest.build_at_rest,
+        blurb="the land detector's at-rest decision with each input that sets "
+              "it -- body rate, gyro and accel vibration -- against its limit, "
+              "the 1 s hold, landed, and what each EKF instance received",
+        # Fallback only: build_at_rest sets fig._page_height.
         height=900,
     ),
     PlotSpec(
