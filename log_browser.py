@@ -423,19 +423,18 @@ class FaultPanel(QtWidgets.QWidget):
     The dropdown lists only faults that actually occurred (ulog_faults does the
     finding), grouped by source and busiest first, each with its count and first
     time so the list is useful before anything is picked.  The first entry is
-    the all-faults overview.  The pick is remembered across logs by fault key,
-    so stepping through a series of logs keeps showing the same fault.
+    the all-faults overview, and every log OPENS on it: "what went wrong in
+    this log" is the question a log is opened with.  (It used to reopen on the
+    last pick, which hid the overview behind a stale single-fault view.)
     """
 
     OVERVIEW = "__overview__"
     HEADER_PX = 40
 
-    def __init__(self, ulog, path, page, make_ctx, remembered=None,
-                 on_pick=None, parent=None):
+    def __init__(self, ulog, path, page, make_ctx, parent=None):
         super().__init__(parent)
         self.ulog, self.path, self.page = ulog, path, page
         self._make_ctx = make_ctx
-        self._on_pick = on_pick
         self.faults = ulog_faults.collect_faults(ulog)
         self.canvas = None
         self.setStyleSheet(f"background: {C_SURFACE};")
@@ -474,8 +473,7 @@ class FaultPanel(QtWidgets.QWidget):
         lay.addLayout(row)
         self._lay = lay
 
-        idx = self.combo.findData(remembered) if remembered else -1
-        self.combo.setCurrentIndex(idx if idx > 0 else 0)
+        self.combo.setCurrentIndex(0)
         self.combo.currentIndexChanged.connect(self._show_current)
         self._show_current()
 
@@ -527,8 +525,6 @@ class FaultPanel(QtWidgets.QWidget):
         self.setFixedHeight(h + self.HEADER_PX)
         self.page.adopt_nav(fig)
         self.canvas.draw_idle()
-        if self._on_pick:
-            self._on_pick(key)
 
 
 # --- parameters ---------------------------------------------------------------
@@ -1705,9 +1701,7 @@ class Browser(QtWidgets.QMainWindow):
             try:
                 panel = FaultPanel(
                     ulog, path, self.page,
-                    make_ctx=lambda: PlotCtx(page_scroll=True),
-                    remembered=self.state.get("fault_pick"),
-                    on_pick=self._remember_fault_pick)
+                    make_ctx=lambda: PlotCtx(page_scroll=True))
             except Exception as e:
                 self._log(f"  !! {spec.title}: {type(e).__name__}: {e}")
                 return
@@ -1751,10 +1745,6 @@ class Browser(QtWidgets.QMainWindow):
             self._build = None
             self._build_gen += 1
             self.busy.hide()
-
-    def _remember_fault_pick(self, key):
-        self.state["fault_pick"] = key
-        _save_state(self.state)
 
     def _close_orphan_figures(self):
         """Close figures pyplot is holding that no canvas on the page shows.
