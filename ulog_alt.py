@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """ulog_alt.py -- the altitude estimation plot.
 
-Four stacked panels on one time axis, answering "why does the vehicle think it is
-at that height?":
+Eight stacked panels on one time axis, answering "why does the vehicle think it
+is at that height?":
 
   1. AMSL overlay   -- every height source as logged, plus the EKF's fused answer
   2. residual       -- each source MINUS the fused answer, which is where drift lives
   3. innovations    -- what the EKF itself thought of each measurement
   4. source band    -- which source it was actually fusing, and when each was valid
+  5-7. GPS quality  -- EPV/EPH/speed accuracy, satellites/PDOP and on-ground drift,
+                       each against the EKF2_REQ_* limit that gates GPS fusion
+  8. gate band      -- per-gate pass/fail, marked enforced or ignored by
+                       EKF2_GPS_CHECK; the reason panel 4's "fusing GPS" drops out
 
 Why four panels and not one overlay
 -----------------------------------
@@ -45,6 +49,7 @@ ALT_TOPICS = [
     "estimator_rng_hgt_bias", "estimator_selector_status", "actuator_armed",
 
     "vehicle_status",          # flight-mode overlay
+    "estimator_gps_status",    # GPS gate verdicts + drift rates (panels 7-8)
 ]
 
 # --- color ------------------------------------------------------------------
@@ -71,6 +76,57 @@ GPS_ALT_FIELDS = [("alt", 1e-3), ("altitude_msl_m", 1.0)]
 # to +2617 m and -17 m -- garbage that would set the AMSL axis single-handedly.
 MIN_FIX = 3
 
+# --- GPS fusion gates (panels 5-8) ------------------------------------------
+# One hue per DIRECTION, held across the three GPS value panels: blue is
+# vertical (the one this plot is about), violet horizontal, goldenrod speed.
+# Neutral slate / purple for the satellite-geometry pair, which are neither.
+C_VERT = C_GPS
+C_HORZ = "#4a3aa7"
+C_SPD = "#b8860b"
+C_NSAT = "#56677a"
+C_PDOP = "#7b2d8e"
+
+# Figure layout, inches (see build_altitude).
+TOP_IN = 0.95          # title + subtitle
+GAP_IN = 0.34          # between panels: each keeps its own time tick labels
+SECTION_GAP_IN = 0.62  # above the GPS panels, which carry a section heading
+BOTTOM_IN = 0.95       # x label + nav hint + mode key
+GATE_ROW_IN = 0.24     # per gate row; 12 rows of 7 pt labels
+PAGE_PX_PER_IN = 78    # the browser's scroll page, same as ulog_accel
+
+# The EKF2_GPS_CHECK bitmask, from the flown firmware's
+# src/modules/ekf2/EKF/gps_checks.cpp (MASK_GPS_*).  Every check_fail_* flag in
+# estimator_gps_status is COMPUTED whether or not its bit is set -- the mask only
+# decides whether a failure blocks fusion.  So a flag firing is not by itself a
+# problem, and the rows below say which ones were actually enforced.  The fix
+# check has no bit: fix_type < 3 always blocks.
+#
+# How a failure turns into "not fusing GPS" (v1.14 flown firmware): any
+# enforced failure stamps _last_gps_fail_us, and checks_passed (_gps_checks_passed)
+# is "no enforced failure for the last 10 s".
+#   GPS HEIGHT (gnss_height_control.cpp): needs checks_passed to START *and* to
+#     CONTINUE, so one enforced failure stops it on that sample and it cannot
+#     restart for 10 s.  The "checks passed" row is therefore, in effect, the
+#     "GPS height allowed" row -- compare it with "fusing GPS" in panel 4.
+#   GPS horizontal pos/vel (gps_control.cpp): starts after 5 s clean, stops after
+#     5 s failing -- EXCEPT that while GPS is the only horizontal aiding source it
+#     keeps fusing regardless, since dropping it would leave nothing.
+#
+#   (estimator_gps_status field, label, mask bit or None, EKF2_REQ_* param, unit)
+GATE_SHORT = {0: "NSATS", 1: "PDOP", 2: "EPH", 3: "EPV", 4: "SACC",
+              5: "HDRIFT", 6: "VDRIFT", 7: "HSPD", 8: "VSPD"}
+GPS_GATES = [
+    ("check_fail_gps_fix", "fix < 3D", None, None, ""),
+    ("check_fail_min_sat_count", "sats <", 0, "EKF2_REQ_NSATS", ""),
+    ("check_fail_max_pdop", "PDOP >", 1, "EKF2_REQ_PDOP", ""),
+    ("check_fail_max_horz_err", "EPH >", 2, "EKF2_REQ_EPH", " m"),
+    ("check_fail_max_vert_err", "EPV >", 3, "EKF2_REQ_EPV", " m"),
+    ("check_fail_max_spd_err", "speed acc >", 4, "EKF2_REQ_SACC", " m/s"),
+    ("check_fail_max_horz_drift", "horiz drift (gnd) >", 5, "EKF2_REQ_HDRIFT", " m/s"),
+    ("check_fail_max_vert_drift", "vert drift (gnd) >", 6, "EKF2_REQ_VDRIFT", " m/s"),
+    ("check_fail_max_horz_spd_err", "horiz speed (gnd) >", 7, "EKF2_REQ_HDRIFT", " m/s"),
+    ("check_fail_max_vert_spd_err", "vert vel mismatch >", 8, "EKF2_REQ_VDRIFT", " m/s"),
+]
 
 def _fused_amsl(ulog, ctx):
     """The EKF's altitude, AMSL, with a fallback for logs missing the global topic.
@@ -262,6 +318,241 @@ def _residual(t_src, y_src, t_fused, y_fused, debias):
     return r - off, off
 
 
+# --- GPS fusion gates -------------------------------------------------------
+
+def _param_steps(ulog, name):
+    """A parameter as a step series over the whole log: initial value, then
+    every in-flight change.  Empty if this firmware has no such parameter.
+
+    A series rather than a scalar because a gate limit drawn as a constant would
+    lie on any log where someone changed it mid-session -- and the limit line is
+    the thing every trace on these panels is read against."""
+    if name not in ulog.initial_parameters:
+        return np.array([]), np.array([])
+    t0 = getattr(ulog, "start_timestamp", 0) or 0
+    t, y = [0.0], [float(ulog.initial_parameters[name])]
+    for ts, n, v in ulog.changed_parameters:
+        if n == name:
+            t.append(max((ts - t0) / 6e7, 0.0))
+            y.append(float(v))
+    t.append(max(duration_min(ulog), t[-1]))
+    y.append(y[-1])
+    return np.asarray(t), np.asarray(y)
+
+
+def _gps_mask(ulog, ctx):
+    """EKF2_GPS_CHECK as logged at boot, plus a note if it changed in flight."""
+    mask = int(ulog.initial_parameters.get("EKF2_GPS_CHECK", 0))
+    if any(n == "EKF2_GPS_CHECK" for _t, n, _v in ulog.changed_parameters):
+        ctx.note("EKF2_GPS_CHECK changed during this log; 'enforced' labels use "
+                 "the boot value")
+    return mask
+
+
+def _enforced(mask, bit):
+    return bit is None or bool(mask & (1 << bit))
+
+
+def _limit_series(ulog, sid, param, unit, group, color, enforced):
+    """The gate limit as a toggleable dashed step line in its metric's colour.
+
+    A gate whose EKF2_GPS_CHECK bit is off is still drawn -- the receiver can
+    cross it and the flag still fires -- but faded and labelled, because a trace
+    over a line that blocks nothing is not a problem."""
+    t, y = _param_steps(ulog, param)
+    if not y.size:
+        return None
+    short = param.replace("EKF2_REQ_", "REQ_")
+    tag = "" if enforced else "  (gate OFF)"
+    return Series(sid, f"{short} {y[0]:g}{unit}{tag}", t, y, group, color,
+                  ls="--", visible=True, lw=1.3 if enforced else 1.0,
+                  alpha=0.95 if enforced else 0.45, drawstyle="steps-post",
+                  zorder=4)
+
+
+def _gps_quality_series(ulog, ekf, mask, ctx):
+    """Panels 5-7: each gated quantity with its EKF2_REQ_* limit beside it.
+
+    Read from vehicle_gps_position because that is exactly the message ekf2
+    feeds to its checks (EKF2.cpp: eph/epv straight through, sacc =
+    s_variance_m_s, nsats = satellites_used, pdop = sqrt(hdop^2 + vdop^2)).
+    The drift rates exist only inside the EKF, so those come from
+    estimator_gps_status of the instance this figure follows.
+    """
+    out = []
+    g = _get(ulog, "vehicle_gps_position") or _get(ulog, "sensor_gps")
+    if g is None:
+        ctx.note("no GPS topic -- GPS gate panels empty")
+        return out
+    t = _time_min(ulog, g)
+    ok = (np.asarray(g.data["fix_type"], dtype=float) >= MIN_FIX
+          if "fix_type" in g.data else np.ones(t.size, bool))
+
+    def gfield(name, scale=1.0):
+        if name not in g.data:
+            return None
+        # Blanked without a 3D fix: the fix gate is failing anyway, and the
+        # numbers are receiver placeholders -- hdop/vdop 99.99 gives PDOP 141,
+        # which would set the axis for the whole flight.
+        return gap_mask(t, np.asarray(g.data[name], dtype=float) * scale, ok)
+
+    # Panel 5: reported accuracy.  Log axis: on the real flights these sit at
+    # 0.1-0.6 while the limits are 0.5-5 and the bad-sky spikes reach 36 m, and
+    # a linear axis can show the limit or the normal data, never both.
+    for key, fname, label, color, ls, lw, param, unit, bit in (
+            ("epv", "epv", "EPV (vert acc)", C_VERT, "-", 1.6, "EKF2_REQ_EPV", " m", 3),
+            ("eph", "eph", "EPH (horiz acc)", C_HORZ, "-", 1.2, "EKF2_REQ_EPH", " m", 2),
+            ("sacc", "s_variance_m_s", "speed acc", C_SPD, "-.", 1.1,
+             "EKF2_REQ_SACC", " m/s", 4)):
+        y = gfield(fname)
+        if y is None:
+            continue
+        out.append(Series(f"gps_{key}", label, t, y, "gpsacc", color, ls=ls,
+                          visible=True, lw=lw))
+        lim = _limit_series(ulog, f"lim_{key}", param, unit, "gpsacc", color,
+                            _enforced(mask, bit))
+        if lim:
+            out.append(lim)
+
+    # Panel 6: satellite geometry.
+    y = gfield("satellites_used")
+    if y is not None:
+        out.append(Series("gps_nsats", "satellites used", t, y, "gpsnsat",
+                          C_NSAT, visible=True, lw=1.3, drawstyle="steps-post"))
+        lim = _limit_series(ulog, "lim_nsats", "EKF2_REQ_NSATS", "", "gpsnsat",
+                            C_NSAT, _enforced(mask, 0))
+        if lim:
+            out.append(lim)
+    if "hdop" in g.data and "vdop" in g.data:
+        pdop = gap_mask(t, np.hypot(np.asarray(g.data["hdop"], dtype=float),
+                                    np.asarray(g.data["vdop"], dtype=float)), ok)
+        out.append(Series("gps_pdop", "PDOP (hdop+vdop)", t, pdop, "gpspdop",
+                          C_PDOP, ls="-", visible=True, lw=1.1, alpha=0.85))
+        lim = _limit_series(ulog, "lim_pdop", "EKF2_REQ_PDOP", "", "gpspdop",
+                            C_PDOP, _enforced(mask, 1))
+        if lim:
+            out.append(lim)
+
+    # Panel 7: drift, which PX4 only evaluates while landed AND at rest
+    # (gps_checks.cpp: in air the flags are forced false).  These are the gates
+    # that hold a vehicle on the pad with "GPS not good enough" while the
+    # accuracy numbers above look fine.
+    s = _get(ulog, "estimator_gps_status", ekf)
+    if s is None:
+        ctx.note("no estimator_gps_status -- drift panel and gate band empty")
+        return out
+    ts = _time_min(ulog, s)
+    for key, fname, label, color, ls in (
+            ("vdrift", "position_drift_rate_vertical_m_s", "vert drift rate", C_VERT, "-"),
+            ("hdrift", "position_drift_rate_horizontal_m_s", "horiz drift rate", C_HORZ, "-"),
+            ("hspd", "filtered_horizontal_speed_m_s", "horiz speed (filt)", C_SPD, "-.")):
+        if fname in s.data:
+            out.append(Series(f"gps_{key}", label, ts,
+                              np.asarray(s.data[fname], dtype=float), "gpsdrift",
+                              color, ls=ls, visible=True, lw=1.2))
+    for key, param, color, bits in (("vdrift", "EKF2_REQ_VDRIFT", C_VERT, (6, 8)),
+                                    ("hdrift", "EKF2_REQ_HDRIFT", C_HORZ, (5, 7))):
+        lim = _limit_series(ulog, f"lim_{key}", param, " m/s", "gpsdrift", color,
+                            any(_enforced(mask, b) for b in bits))
+        if lim:
+            out.append(lim)
+    return out
+
+
+def _gate_rows(ulog, ekf, mask, ctx):
+    """Panel 8: the pass/fail verdict per gate, as a fixed checklist.
+
+    Every gate gets a row whether or not it fired, with a grey rail behind it,
+    so an empty row reads "checked, clean" rather than "not shown".  Bar colour
+    is the consequence: red = enforced, so this blocked GPS; grey = the flag
+    fired but EKF2_GPS_CHECK has that bit off, so it blocked nothing.  The top
+    row ORs the enforced ones -- the single answer to "was GPS being refused".
+    """
+    used = _gps_used_rows(ulog, ekf)
+    s = _get(ulog, "estimator_gps_status", ekf)
+    if s is None:
+        return used
+    t = _time_min(ulog, s)
+    params = ulog.initial_parameters
+    rows, blocking = [], np.zeros(t.size, bool)
+    for fname, label, bit, param, unit in GPS_GATES:
+        if fname not in s.data:
+            continue
+        v = np.asarray(s.data[fname], dtype=float) > 0.5
+        enf = _enforced(mask, bit)
+        if enf:
+            blocking |= v
+        lim = f" {float(params[param]):g}{unit}" if param in params else ""
+        # Short on purpose: the labels sit at the left edge, over the boot
+        # period -- which is exactly where gate failures cluster.  The section
+        # heading spells out the mask.
+        state = "" if enf else "  (off)"
+        rows.append((f"{label}{lim}{state}", spans_from_bool(t, v),
+                     C_BAD if enf else C_MUTED))
+    head = [("ANY ENFORCED GATE FAILING", spans_from_bool(t, blocking), C_BAD)]
+    if "checks_passed" in s.data:
+        v = np.asarray(s.data["checks_passed"], dtype=float) > 0.5
+        head.append(("checks passed (10 s clean)", spans_from_bool(t, v), C_GPS))
+    return used + head + rows
+
+
+def _gps_used_rows(ulog, ekf):
+    """Top of panel 8: each raw GPS dropout, and whether the EKF was actually
+    fusing GPS (height / horizontal) -- so cause and consequence share a time
+    axis.  Dropouts come from vehicle_gps_position at its full ~10 Hz:
+    estimator_gps_status is ~1 Hz and misses most single-sample dropouts.
+    """
+    rows = []
+    g = _get(ulog, "vehicle_gps_position")
+    if g is not None and "fix_type" in g.data:
+        fix = np.asarray(g.data["fix_type"]) >= 3
+        if fix.any():
+            # Only after the first fix: the boot-time search is not a dropout.
+            drop = ~fix & (np.arange(fix.size) > np.flatnonzero(fix)[0])
+            n = int(np.sum(np.diff(drop.astype(int)) == 1))
+            rows.append((f"GPS dropout (fix<3)  n={n}",
+                         spans_from_bool(_time_min(ulog, g), drop), C_BAD))
+    f = _get(ulog, "estimator_status_flags", ekf)
+    if f is not None:
+        tf = _time_min(ulog, f)
+        for field, label in (("cs_gps_hgt", "EKF FUSING GPS HEIGHT"),
+                             ("cs_gps", "EKF FUSING GPS HORIZONTAL")):
+            if field in f.data:
+                v = np.asarray(f.data[field], dtype=float) > 0.5
+                rows.append((label, spans_from_bool(tf, v), C_GPS))
+    return rows
+
+
+def _rescale_with_limits(ax, lines, log=False, pct=99.5):
+    """Fit the bulk of the data AND every visible limit line.
+
+    The limits are the reference these panels exist to show, so they are never
+    allowed off-screen; the data gets percentile bounds for the same reason as
+    _rescale_robust (one 36 m EPV spike would otherwise flatten the rest).
+    """
+    data = [l for l in lines if not l.get_gid()]
+    lims = [l for l in lines if l.get_gid() == "limit"]
+    v = window_values(ax, data, positive_only=log)
+    w = window_values(ax, lims, positive_only=log)
+    if v.size == 0 and w.size == 0:
+        return
+    pts = []
+    if v.size:
+        pts += [float(np.percentile(v, 100.0 - pct)), float(np.percentile(v, pct))]
+    if w.size:
+        pts += [float(w.min()), float(w.max())]
+    lo, hi = min(pts), max(pts)
+    if log:
+        ax.set_ylim(max(lo / 1.6, 1e-3), max(hi * 1.6, lo * 4))
+    else:
+        if hi == lo:
+            lo, hi = lo - 1, hi + 1
+        m = (hi - lo) * 0.10
+        # Counts and rates are read from zero: "6 sats against a limit of 6"
+        # and "16 against 6" must not look the same height.
+        ax.set_ylim(0.0 if lo >= 0 else lo - m, hi + m)
+
+
 def build_altitude(ulog, ctx=None, path=""):
     """The altitude estimation figure.  Same signature as every plot builder."""
     import matplotlib.pyplot as plt
@@ -386,39 +677,67 @@ def build_altitude(ulog, ctx=None, path=""):
                                  _blank_unfused(y), "ratio", color, ls=ls,
                                  visible=True, lw=1.1, alpha=0.75))
 
+    # --- panels 5-8: GPS fusion gates ---------------------------------------
+    gps_mask = _gps_mask(ulog, ctx)
+    series += _gps_quality_series(ulog, ekf, gps_mask, ctx)
+    gate_rows = _gate_rows(ulog, ekf, gps_mask, ctx)
+
     if not series:
         ctx.note("no altitude topics in this log -- nothing to plot")
         return None
 
     # --- figure -------------------------------------------------------------
-    fig = plt.figure(figsize=(15, 10), facecolor=C_SURFACE)
+    # Laid out in INCHES, bottom-up, and divided by the figure height at the
+    # end (the ulog_accel convention): the gate band's height follows its row
+    # count, and hand-written figure fractions would squash every other panel
+    # whenever it grew.  The first four panels keep the inches they had when
+    # this was a fixed 10 in figure.
+    band_in = max(1.5, GATE_ROW_IN * len(gate_rows) + 0.25)
+    stack = [("amsl", 1.85), ("res", 1.85), ("inn", 1.70), ("band", 1.50),
+             ("gacc", 1.80), ("gsat", 1.45), ("gdrift", 1.45),
+             ("gate", band_in)]
+    gap_above = {"gacc": SECTION_GAP_IN}       # room for the GPS section heading
+    fig_h = TOP_IN + sum(h for _k, h in stack) + BOTTOM_IN + sum(
+        gap_above.get(k, GAP_IN) for k, _h in stack[1:])
+    fig = plt.figure(figsize=(15, fig_h), facecolor=C_SURFACE)
     if fig.canvas.manager is not None:
         import os
         fig.canvas.manager.set_window_title(
             f"logGraph altitude - {os.path.basename(path)}")
 
-    # Heights: the overlay and the residual carry the argument, so they get the
-    # room; innovations are a supporting check; the band is categorical and needs
-    # only enough height to distinguish its rows.
+    def _f(inches):
+        return inches / fig_h
+
     # The gap between the checkbox panel's right edge (0.167) and `left` has to
     # hold BOTH the tick labels and the axis label.  The thermal plot gets away
     # with a 0.02 gap only because it stacks its y-axes on the right; here every
     # panel labels on the left, so the margin is nearly five times wider.
     left, width = 0.260, 0.655
-    rects = [(0.735, 0.185), (0.520, 0.185), (0.320, 0.170), (0.130, 0.150)]
-    ax_amsl, ax_res, ax_inn, ax_band = [
-        fig.add_axes([left, b, width, h], facecolor=C_SURFACE) for b, h in rects]
-    for a in (ax_amsl, ax_res, ax_inn):
-        a.sharex(ax_band)
+    rects, bottom = {}, BOTTOM_IN
+    for key, h in reversed(stack):
+        rects[key] = (_f(bottom), _f(h))
+        bottom += h + gap_above.get(key, GAP_IN)
+    ax = {k: fig.add_axes([left, rects[k][0], width, rects[k][1]],
+                          facecolor=C_SURFACE) for k, _h in stack}
+    ax_amsl, ax_res, ax_inn, ax_band = ax["amsl"], ax["res"], ax["inn"], ax["band"]
+    ax_gacc, ax_gsat, ax_gdrift, ax_gate = (ax["gacc"], ax["gsat"],
+                                            ax["gdrift"], ax["gate"])
+    for a in ax.values():
+        if a is not ax_gate:
+            a.sharex(ax_gate)
     ax_ratio = ax_inn.twinx()
     ax_ratio.set_facecolor("none")
+    ax_pdop = ax_gsat.twinx()
+    ax_pdop.set_facecolor("none")
+    ax_gacc.set_yscale("log")
 
     axis_of = {"amsl": ax_amsl, "resid": ax_res, "innov": ax_inn,
-               "ratio": ax_ratio}
+               "ratio": ax_ratio, "gpsacc": ax_gacc, "gpsnsat": ax_gsat,
+               "gpspdop": ax_pdop, "gpsdrift": ax_gdrift}
 
     spans = armed_spans(ulog)
     span_art = []
-    for a in (ax_amsl, ax_res, ax_inn, ax_band):
+    for a in ax.values():
         span_art += draw_armed(a, spans)
 
     # Zero lines: on the residual and innovation panels, zero is "the sensor and
@@ -445,31 +764,52 @@ def build_altitude(ulog, ctx=None, path=""):
             drawstyle=s.drawstyle, alpha=s.alpha,
             zorder=s.zorder if s.zorder is not None else 3)
         line.set_visible(s.visible)
+        if s.id.startswith("lim_"):
+            line.set_gid("limit")      # _rescale_with_limits keeps these on-screen
         s.line = line
 
     _draw_band(ax_band, ulog, ekf, ctx)
+    # min_width: a gate that fails for one 5 Hz GPS sample is a real event,
+    # and at full-log zoom it would otherwise be narrower than a pixel.
+    draw_band_rows(ax_gate, gate_rows, ylabel="GPS gates",
+                   empty_msg="no estimator_gps_status in this log",
+                   min_width=max(duration_min(ulog), 1.0) * 0.002, track=True)
 
     # --- axis furniture -----------------------------------------------------
-    for a in (ax_amsl, ax_res, ax_inn):
-        style_time_axis(a, label=False)
-    style_time_axis(ax_band)
+    for a in ax.values():
+        style_time_axis(a, label=a is ax_gate)
 
     ax_amsl.set_ylabel("altitude AMSL (m)", fontsize=9)
     ax_res.set_ylabel("residual vs fused (m)", fontsize=9)
     ax_inn.set_ylabel("innovation (m)", fontsize=9)
     ax_ratio.set_ylabel("test ratio", fontsize=9)
-    _style_axis(ax_amsl, C_INK)
-    _style_axis(ax_res, C_INK)
-    _style_axis(ax_inn, C_INK)
+    ax_gacc.set_ylabel("GPS accuracy\n(m, m/s; log)", fontsize=9)
+    ax_gsat.set_ylabel("satellites used", fontsize=9)
+    ax_pdop.set_ylabel("PDOP", fontsize=9)
+    ax_gdrift.set_ylabel("drift on ground\n(m/s)", fontsize=9)
+    for a in (ax_amsl, ax_res, ax_inn, ax_gacc, ax_gsat, ax_gdrift):
+        _style_axis(a, C_INK)
     _style_axis(ax_ratio, C_MUTED)
+    _style_axis(ax_pdop, C_PDOP)
 
-    fig.text(left, 0.955, "Altitude estimation", color=C_INK, fontsize=13,
+    # A section heading over the GPS panels: from here down the question changes
+    # from "what height does it think" to "was it ALLOWED to use GPS".
+    on = [n for b, n in GATE_SHORT.items() if _enforced(gps_mask, b)]
+    off = [n for b, n in GATE_SHORT.items() if not _enforced(gps_mask, b)]
+    head = (f"GPS fusion gates  —  EKF2_GPS_CHECK = {gps_mask}:  enforced "
+            f"fix, {', '.join(on) or '-'}   |   OFF {', '.join(off) or '-'}")
+    acc_top = rects["gacc"][0] + rects["gacc"][1]
+    fig.text(left, acc_top + _f(0.12),
+             head, color=C_INK, fontsize=10,
              fontweight="bold", ha="left")
+
+    fig.text(left, 1.0 - _f(0.45), "Altitude estimation", color=C_INK,
+             fontsize=13, fontweight="bold", ha="left")
     import os as _os
     who = f"{_os.path.basename(path)}   |   " if path else ""
     debias_note = ("residuals de-biased (constant offset removed, stated in the "
                    "label)" if ctx.debias else "residuals raw")
-    fig.text(left, 0.925,
+    fig.text(left, 1.0 - _f(0.75),
              f"{who}{duration_min(ulog):.1f} min   |   EKF instance {ekf}   |   "
              f"{debias_note}",
              color=C_MUTED, fontsize=9, ha="left")
@@ -492,6 +832,11 @@ def build_altitude(ulog, ctx=None, path=""):
         if n_r:
             bits.append(f"{n_r} test ratio(s) off-scale (max {max_r:.0f})")
         off_note.set_text("   ".join(bits))
+        _rescale_with_limits(ax_gacc, [s.line for s in series
+                                       if s.group == "gpsacc"], log=True)
+        for group, a in (("gpsnsat", ax_gsat), ("gpspdop", ax_pdop),
+                         ("gpsdrift", ax_gdrift)):
+            _rescale_with_limits(a, [s.line for s in series if s.group == group])
 
     base_extra = [("armed (shaded)", span_art, True)] if span_art else []
     # Flight-mode overlay: a rule on every panel at each mode change, named on
@@ -499,24 +844,42 @@ def build_altitude(ulog, ctx=None, path=""):
     # Hold 52 times (d05a88e3) is unreadable with it on and unanswerable with it
     # off.  min_gap keeps the LABELS legible without dropping any rule.
     mode_art, mode_codes = draw_mode_changes(
-        [ax_amsl, ax_res, ax_inn, ax_ratio, ax_band], mode_changes(ulog),
+        list(ax.values()) + [ax_ratio, ax_pdop], mode_changes(ulog),
         text_ax=ax_res, min_gap=max(duration_min(ulog), 1.0) * 0.035)
     extra = list(base_extra)
-    mode_art += mode_key(fig, left + width, 0.018, mode_codes)
+    mode_art += mode_key(fig, left + width, _f(0.18), mode_codes)
     if mode_art:
         extra.append(("mode changes", mode_art, True))
 
-    h = min(0.86, 0.035 * (len(series) + 6) + 0.05)
-    check_panel(fig, [0.012, 0.89 - h, 0.155, h], series,
+    # The checkbox panel spans the whole stack and each group's block is
+    # anchored beside its own panel -- with eight panels, "which legend goes
+    # with which graph" has to be answered by position, not by reading.
+    cb_top = rects["amsl"][0] + rects["amsl"][1]
+    cb_bot = rects["gate"][0]
+    cb_h = cb_top - cb_bot
+
+    def _anchor(key):
+        b, ph = rects[key]
+        return (b + ph / 2 - cb_bot) / cb_h
+
+    check_panel(fig, [0.012, cb_bot, 0.155, cb_h], series,
                 [("amsl", "ALL sources"), ("resid", "ALL residuals"),
-                 ("innov", "ALL innovations"), ("ratio", "ALL test ratios")],
-                extra=extra, on_change=refresh)
+                 ("innov", "ALL innovations"), ("ratio", "ALL test ratios"),
+                 ("gpsacc", "ALL GPS accuracy"), ("gpsnsat", "ALL satellites"),
+                 ("gpspdop", "ALL PDOP"), ("gpsdrift", "ALL drift")],
+                extra=extra, on_change=refresh,
+                anchors={"amsl": _anchor("amsl"), "resid": _anchor("res"),
+                         "innov": _anchor("inn"), "ratio": _anchor("inn"),
+                         "gpsacc": _anchor("gacc"), "gpsnsat": _anchor("gsat"),
+                         "gpspdop": _anchor("gsat"),
+                         "gpsdrift": _anchor("gdrift")})
     refresh()
-    add_mouse_navigation(fig, [ax_amsl, ax_res, ax_inn, ax_ratio, ax_band],
-                         page_scroll=ctx.page_scroll, fixed_y=[ax_band],
-                         on_view=refresh)
-    fig.text(left, 0.048, nav_hint(ctx.page_scroll), color=C_MUTED,
+    add_mouse_navigation(fig, list(ax.values()) + [ax_ratio, ax_pdop],
+                         page_scroll=ctx.page_scroll,
+                         fixed_y=[ax_band, ax_gate], on_view=refresh)
+    fig.text(left, _f(0.40), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
+    fig._page_height = int(round(fig_h * PAGE_PX_PER_IN))
     return fig
 
 

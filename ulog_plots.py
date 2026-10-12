@@ -92,7 +92,8 @@ PLOTS = [
         topics=ulog_alt.ALT_TOPICS,
         build=ulog_alt.build_altitude,
         blurb="GPS / barometer / rangefinder against the EKF's fused altitude, "
-              "with residuals, innovations and the fusion source",
+              "with residuals, innovations and the fusion source, plus the GPS "
+              "fusion gates (EPV/EPH/sats/PDOP/drift vs EKF2_REQ_*)",
         height=780,
     ),
     PlotSpec(
