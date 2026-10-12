@@ -10,7 +10,9 @@ is at that height?":
   4. source band    -- which source it was actually fusing, and when each was valid
   5-7. GPS quality  -- EPV/EPH/speed accuracy, satellites/PDOP and on-ground drift,
                        each against the EKF2_REQ_* limit that gates GPS fusion
-  8. gate band      -- per-gate pass/fail, marked enforced or ignored by
+  8. interference   -- the receiver's own jamming indicator, jamming state and
+                       spoofing state (not gates: context for 5-7 and 9)
+  9. gate band      -- per-gate pass/fail, marked enforced or ignored by
                        EKF2_GPS_CHECK; the reason panel 4's "fusing GPS" drops out
 
 Why four panels and not one overlay
@@ -76,7 +78,7 @@ GPS_ALT_FIELDS = [("alt", 1e-3), ("altitude_msl_m", 1.0)]
 # to +2617 m and -17 m -- garbage that would set the AMSL axis single-handedly.
 MIN_FIX = 3
 
-# --- GPS fusion gates (panels 5-8) ------------------------------------------
+# --- GPS fusion gates (panels 5-9) ------------------------------------------
 # One hue per DIRECTION, held across the three GPS value panels: blue is
 # vertical (the one this plot is about), violet horizontal, goldenrod speed.
 # Neutral slate / purple for the satellite-geometry pair, which are neither.
@@ -85,6 +87,20 @@ C_HORZ = "#4a3aa7"
 C_SPD = "#b8860b"
 C_NSAT = "#56677a"
 C_PDOP = "#7b2d8e"
+# Interference panel: one hue per series (indicator, jamming state, spoofing
+# state), so the right-axis state steps read without the legend.
+C_JAM = "#8b1e3f"     # deep crimson -- not C_BAD: these are not gate failures
+C_SPOOF = "#c27c0e"   # amber
+# Jamming STATE gets its own hue: sharing crimson with the indicator made the
+# two indistinguishable where they overlap.  Olive is unused anywhere in the
+# figure and separates from both crimson and amber.
+C_JAM_STATE = "#6b8e23"
+
+# u-blox states as PX4 passes them through (sensor_gps.msg).  Jamming and
+# spoofing share the 0-3 scale, so one right axis carries both; the ticks use
+# the jamming names (short, the right margin is narrow) and the spoofing
+# meaning goes in its legend label: 1 none, 2 indicated, 3 multiple.
+JAM_STATE_TICKS = ["0 unknown", "1 OK", "2 warning", "3 critical"]
 
 # Figure layout, inches (see build_altitude).
 TOP_IN = 0.95          # title + subtitle
@@ -459,6 +475,72 @@ def _gps_quality_series(ulog, ekf, mask, ctx):
     return out
 
 
+def _gps_interference_series(ulog, ctx):
+    """Panel 8: what the receiver says about RF interference and spoofing.
+
+    Straight from the u-blox MON-RF / NAV-STATUS fields PX4 copies into
+    vehicle_gps_position.  None of these gate EKF fusion in v1.14; they are here
+    so a dropout or an accuracy spike in the panels around it can be checked
+    against "was the receiver seeing interference at that moment".
+
+    Deliberately NOT blanked on fix < 3D like the accuracy panels: interference
+    is exactly what you want to see across a dropout, and the receiver keeps
+    reporting it (the dropout samples carry normal indicator values).  What is
+    blanked is the receiver's "not supported" placeholder (-1, e.g. non-u-blox
+    units) and noise_per_ms's 0 before the RF front end has started.
+    """
+    out = []
+    g = _get(ulog, "vehicle_gps_position") or _get(ulog, "sensor_gps")
+    if g is None:
+        return out
+    t = _time_min(ulog, g)
+
+    def raw(name):
+        return (np.asarray(g.data[name], dtype=float)
+                if name in g.data else None)
+
+    ji = raw("jamming_indicator")
+    if ji is not None and np.any(ji >= 0):
+        # 0-255, the receiver's continuous-wave jamming estimate.  Not a
+        # calibrated unit -- read it relative to the same vehicle's own quiet
+        # baseline (antenna moved off the airframe read ~5 here, on it 15-30).
+        out.append(Series("gps_jam_ind", "jamming indicator (0-255)", t,
+                          gap_mask(t, ji, ji >= 0), "gpsjam", C_JAM,
+                          visible=True, lw=1.3))
+    nz = raw("noise_per_ms")
+    if nz is not None and np.any(nz > 0):
+        out.append(Series("gps_noise", "noise per ms", t,
+                          gap_mask(t, nz, nz > 0), "gpsjam", C_NSAT, ls=":",
+                          visible=False, lw=1.1))
+    agc = raw("automatic_gain_control")
+    if agc is not None and np.any(agc > 0):
+        # Always 0 on the lab's F9P logs (field not filled on this build), so
+        # only shown when a log actually carries it.
+        out.append(Series("gps_agc", "AGC count", t, gap_mask(t, agc, agc > 0),
+                          "gpsjam", C_MUTED, ls="-.", visible=False, lw=1.0))
+
+    for key, fname, label, color, ls, lw, alpha, z in (
+            ("jam_state", "jamming_state", "jamming state", C_JAM_STATE, "-",
+             1.8, 0.9, 4),
+            ("spoof_state", "spoofing_state", "spoofing state (2 = indicated)",
+             C_SPOOF, "--", 1.4, 0.9, 4)):
+        y = raw(fname)
+        if y is None:
+            continue
+        valid = (y >= 0) & (y <= 3)
+        if not np.any(valid & (y > 0)):
+            continue                  # all "unknown": receiver doesn't report it
+        n = int(np.sum(np.diff((y >= 2).astype(int)) == 1) + (y[0] >= 2))
+        out.append(Series(f"gps_{key}", f"{label}  ({n}x ≥2)", t,
+                          gap_mask(t, y, valid), "gpsjstate", color, ls=ls,
+                          visible=True, lw=lw, alpha=alpha, zorder=z,
+                          drawstyle="steps-post"))
+    if not out:
+        ctx.note("receiver reports no jamming/spoofing fields -- interference "
+                 "panel empty")
+    return out
+
+
 def _gate_rows(ulog, ekf, mask, ctx):
     """Panel 8: the pass/fail verdict per gate, as a fixed checklist.
 
@@ -677,9 +759,10 @@ def build_altitude(ulog, ctx=None, path=""):
                                  _blank_unfused(y), "ratio", color, ls=ls,
                                  visible=True, lw=1.1, alpha=0.75))
 
-    # --- panels 5-8: GPS fusion gates ---------------------------------------
+    # --- panels 5-9: GPS fusion gates ---------------------------------------
     gps_mask = _gps_mask(ulog, ctx)
     series += _gps_quality_series(ulog, ekf, gps_mask, ctx)
+    series += _gps_interference_series(ulog, ctx)
     gate_rows = _gate_rows(ulog, ekf, gps_mask, ctx)
 
     if not series:
@@ -694,7 +777,7 @@ def build_altitude(ulog, ctx=None, path=""):
     # this was a fixed 10 in figure.
     band_in = max(1.5, GATE_ROW_IN * len(gate_rows) + 0.25)
     stack = [("amsl", 1.85), ("res", 1.85), ("inn", 1.70), ("band", 1.50),
-             ("gacc", 1.80), ("gsat", 1.45), ("gdrift", 1.45),
+             ("gacc", 1.80), ("gsat", 1.45), ("gdrift", 1.45), ("gjam", 1.45),
              ("gate", band_in)]
     gap_above = {"gacc": SECTION_GAP_IN}       # room for the GPS section heading
     fig_h = TOP_IN + sum(h for _k, h in stack) + BOTTOM_IN + sum(
@@ -720,8 +803,8 @@ def build_altitude(ulog, ctx=None, path=""):
     ax = {k: fig.add_axes([left, rects[k][0], width, rects[k][1]],
                           facecolor=C_SURFACE) for k, _h in stack}
     ax_amsl, ax_res, ax_inn, ax_band = ax["amsl"], ax["res"], ax["inn"], ax["band"]
-    ax_gacc, ax_gsat, ax_gdrift, ax_gate = (ax["gacc"], ax["gsat"],
-                                            ax["gdrift"], ax["gate"])
+    ax_gacc, ax_gsat, ax_gdrift, ax_gjam, ax_gate = (
+        ax["gacc"], ax["gsat"], ax["gdrift"], ax["gjam"], ax["gate"])
     for a in ax.values():
         if a is not ax_gate:
             a.sharex(ax_gate)
@@ -729,11 +812,14 @@ def build_altitude(ulog, ctx=None, path=""):
     ax_ratio.set_facecolor("none")
     ax_pdop = ax_gsat.twinx()
     ax_pdop.set_facecolor("none")
+    ax_jstate = ax_gjam.twinx()
+    ax_jstate.set_facecolor("none")
     ax_gacc.set_yscale("log")
 
     axis_of = {"amsl": ax_amsl, "resid": ax_res, "innov": ax_inn,
                "ratio": ax_ratio, "gpsacc": ax_gacc, "gpsnsat": ax_gsat,
-               "gpspdop": ax_pdop, "gpsdrift": ax_gdrift}
+               "gpspdop": ax_pdop, "gpsdrift": ax_gdrift, "gpsjam": ax_gjam,
+               "gpsjstate": ax_jstate}
 
     spans = armed_spans(ulog)
     span_art = []
@@ -787,10 +873,22 @@ def build_altitude(ulog, ctx=None, path=""):
     ax_gsat.set_ylabel("satellites used", fontsize=9)
     ax_pdop.set_ylabel("PDOP", fontsize=9)
     ax_gdrift.set_ylabel("drift on ground\n(m/s)", fontsize=9)
-    for a in (ax_amsl, ax_res, ax_inn, ax_gacc, ax_gsat, ax_gdrift):
+    ax_gjam.set_ylabel("GPS jamming\nindicator", fontsize=9)
+    ax_jstate.set_ylabel("jamming / spoofing\nstate", fontsize=9)
+    # Fixed 0-3 with named ticks: a state axis that rescaled to the data would
+    # make "always 2" look like a flat line in the middle of nowhere.
+    ax_jstate.set_ylim(-0.3, 3.4)
+    ax_jstate.set_yticks(range(4))
+    ax_jstate.set_yticklabels(JAM_STATE_TICKS, fontsize=7)
+    ax_jstate.axhline(2.0, color=C_MUTED, lw=0.8, ls=":", alpha=0.6, zorder=1)
+    for a in (ax_amsl, ax_res, ax_inn, ax_gacc, ax_gsat, ax_gdrift, ax_gjam):
         _style_axis(a, C_INK)
     _style_axis(ax_ratio, C_MUTED)
     _style_axis(ax_pdop, C_PDOP)
+    # Neutral, like the shared test-ratio axis: it carries BOTH states, so
+    # painting it in either one's hue would claim it for that one.  The lines'
+    # own colours (olive jamming, amber spoofing) say which is which.
+    _style_axis(ax_jstate, C_MUTED)
 
     # A section heading over the GPS panels: from here down the question changes
     # from "what height does it think" to "was it ALLOWED to use GPS".
@@ -835,7 +933,7 @@ def build_altitude(ulog, ctx=None, path=""):
         _rescale_with_limits(ax_gacc, [s.line for s in series
                                        if s.group == "gpsacc"], log=True)
         for group, a in (("gpsnsat", ax_gsat), ("gpspdop", ax_pdop),
-                         ("gpsdrift", ax_gdrift)):
+                         ("gpsdrift", ax_gdrift), ("gpsjam", ax_gjam)):
             _rescale_with_limits(a, [s.line for s in series if s.group == group])
 
     base_extra = [("armed (shaded)", span_art, True)] if span_art else []
@@ -844,7 +942,7 @@ def build_altitude(ulog, ctx=None, path=""):
     # Hold 52 times (d05a88e3) is unreadable with it on and unanswerable with it
     # off.  min_gap keeps the LABELS legible without dropping any rule.
     mode_art, mode_codes = draw_mode_changes(
-        list(ax.values()) + [ax_ratio, ax_pdop], mode_changes(ulog),
+        list(ax.values()) + [ax_ratio, ax_pdop, ax_jstate], mode_changes(ulog),
         text_ax=ax_res, min_gap=max(duration_min(ulog), 1.0) * 0.035)
     extra = list(base_extra)
     mode_art += mode_key(fig, left + width, _f(0.18), mode_codes)
@@ -852,7 +950,7 @@ def build_altitude(ulog, ctx=None, path=""):
         extra.append(("mode changes", mode_art, True))
 
     # The checkbox panel spans the whole stack and each group's block is
-    # anchored beside its own panel -- with eight panels, "which legend goes
+    # anchored beside its own panel -- with nine panels, "which legend goes
     # with which graph" has to be answered by position, not by reading.
     cb_top = rects["amsl"][0] + rects["amsl"][1]
     cb_bot = rects["gate"][0]
@@ -866,17 +964,20 @@ def build_altitude(ulog, ctx=None, path=""):
                 [("amsl", "ALL sources"), ("resid", "ALL residuals"),
                  ("innov", "ALL innovations"), ("ratio", "ALL test ratios"),
                  ("gpsacc", "ALL GPS accuracy"), ("gpsnsat", "ALL satellites"),
-                 ("gpspdop", "ALL PDOP"), ("gpsdrift", "ALL drift")],
+                 ("gpspdop", "ALL PDOP"), ("gpsdrift", "ALL drift"),
+                 ("gpsjam", "ALL interference"), ("gpsjstate", "ALL jam/spoof state")],
                 extra=extra, on_change=refresh,
                 anchors={"amsl": _anchor("amsl"), "resid": _anchor("res"),
                          "innov": _anchor("inn"), "ratio": _anchor("inn"),
                          "gpsacc": _anchor("gacc"), "gpsnsat": _anchor("gsat"),
                          "gpspdop": _anchor("gsat"),
-                         "gpsdrift": _anchor("gdrift")})
+                         "gpsdrift": _anchor("gdrift"),
+                         "gpsjam": _anchor("gjam"),
+                         "gpsjstate": _anchor("gjam")})
     refresh()
-    add_mouse_navigation(fig, list(ax.values()) + [ax_ratio, ax_pdop],
+    add_mouse_navigation(fig, list(ax.values()) + [ax_ratio, ax_pdop, ax_jstate],
                          page_scroll=ctx.page_scroll,
-                         fixed_y=[ax_band, ax_gate], on_view=refresh)
+                         fixed_y=[ax_band, ax_gate, ax_jstate], on_view=refresh)
     fig.text(left, _f(0.40), nav_hint(ctx.page_scroll), color=C_MUTED,
              fontsize=8, ha="left")
     fig._page_height = int(round(fig_h * PAGE_PX_PER_IN))
