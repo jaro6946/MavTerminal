@@ -35,7 +35,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import matplotlib.pyplot as plt
 import ulog_faults
 import ulog_plots
-from log_tags import (TAGS_SUFFIX, TagBar, TagFilter, merge_tags,
+from log_tags import (TAGS_SUFFIX, TagBar, TagFilter, auto_tags, merge_tags,
                       tags_path_for)
 from qt_common import NotesBox, PlotCanvas
 from report_tab import ReportTab
@@ -68,7 +68,7 @@ PLOT_HEIGHT = 470          # px per stacked plot; ~2 fit on a 1080p screen
 # Bumped whenever the library scan learns a new fact.  Cached rows below this
 # version are re-scanned once, rather than sitting blank in a column that did not
 # exist when they were cached.
-SCAN_VERSION = 2
+SCAN_VERSION = 3          # 3: auto-tags (vehicle / sim) from the log header
 
 # (The library sidebar became a dropdown; its width constants went with it.)
 
@@ -603,6 +603,7 @@ def scan_log(path):
     facts = corruption_of(ulog, path)
     facts["started"] = start_epoch(ulog) or 0.0
     facts["date_src"] = "gps" if facts["started"] else "none"
+    facts["auto_tags"] = auto_tags(ulog)
     return facts
 
 
@@ -988,6 +989,35 @@ class Browser(QtWidgets.QMainWindow):
         path = self._notes_path      # the log the notes/tags rows are showing
         if path is None:
             return
+        self._write_tags(path, tags)
+        # The row text carries the tags and the filter may now include or
+        # exclude this log, so the whole projection is redone.
+        self._rebuild_picker()
+
+    def _apply_auto_tags(self, path):
+        """Add the scan's auto-tags (log_tags.auto_tags) to a log, ONCE.
+
+        Once per file, not per scan: the record remembers it was done, so a
+        tag you remove by hand stays removed.  The flag lives in the size/mtime
+        stamped record, so a replaced file is tagged afresh.  Adds only --
+        tags already on the log, typed or auto, are never touched."""
+        key = os.path.abspath(path)
+        rec = self.state["durations"].get(key) or {}
+        if rec.get("auto_tagged") or "auto_tags" not in rec:
+            return
+        have = self._tags_of(path)
+        new = merge_tags(have, rec["auto_tags"])
+        if len(new) != len(have):
+            self._write_tags(path, new)
+            self._log(f"  auto-tagged {os.path.basename(path)}: "
+                      f"{', '.join(rec['auto_tags'])}")
+            if self._notes_path and os.path.abspath(self._notes_path) == key:
+                self.tag_bar.set_tags(new)
+            self._refresh_picker_row(path)
+        self._update_record(path, auto_tagged=True)
+
+    def _write_tags(self, path, tags):
+        """Persist a log's tags: sidecar, else the JSON fallback; learn them."""
         key = os.path.abspath(path)
         side = tags_path_for(path)
         try:
@@ -1004,9 +1034,6 @@ class Browser(QtWidgets.QMainWindow):
         self._tag_cache[key] = merge_tags(tags)
         self.state["tag_vocab"] = merge_tags(self.state["tag_vocab"], tags)
         _save_state(self.state)
-        # The row text carries the tags and the filter may now include or
-        # exclude this log, so the whole projection is redone.
-        self._rebuild_picker()
 
     def _tag_vocabulary(self):
         """Every tag known: the remembered vocabulary plus any found on disk
@@ -1404,6 +1431,7 @@ class Browser(QtWidgets.QMainWindow):
             self._update_record(path, scan_v=SCAN_VERSION, **facts)
         except OSError:
             return                  # the file went away mid-scan
+        self._apply_auto_tags(path)
         for it in self._iter_items():
             if it.data(0, QtCore.Qt.UserRole) == path:
                 st = os.stat(path)
@@ -1636,8 +1664,9 @@ class Browser(QtWidgets.QMainWindow):
         started = start_epoch(ulog) or 0.0
         facts = corruption_of(ulog, path)
         facts.update(started=started, date_src="gps" if started else "none",
-                     scan_v=SCAN_VERSION)
+                     scan_v=SCAN_VERSION, auto_tags=auto_tags(ulog))
         self._update_record(path, **facts)
+        self._apply_auto_tags(path)
         if facts["corrupt_bytes"]:
             self._log(f"  !! {facts['corrupt_bytes']} bytes unreadable "
                       f"({facts['corrupt_pct']:.3g}% of the file)")

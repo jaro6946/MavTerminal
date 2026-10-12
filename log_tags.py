@@ -26,9 +26,25 @@ from qt_common import FlowLayout, flow_holder
 from ulog_common import C_MUTED, C_SATS
 
 __all__ = ["TAGS_SUFFIX", "tags_path_for", "normalize_tag", "merge_tags",
-           "TagBar", "TagFilter"]
+           "auto_tags", "VEHICLE_BOARDS", "SIM_TAG", "TagBar", "TagFilter"]
 
 TAGS_SUFFIX = "_tags.txt"
+
+# Auto-tags: which vehicle flew a log, read from the log itself.  Filenames say
+# it only when someone remembered to (FC_log.ulg, log_17_..., UUIDs), but every
+# .ulg header carries the flight controller's sys_uuid, so the BOARD names the
+# vehicle.  Keyed by the uuid's last 12 hex digits -- unique across this fleet
+# and short enough to read off a log.  Move a board to another airframe and
+# this table is the one line to change.
+VEHICLE_BOARDS = {
+    "510100390018": "grazer10",     # MAV_SYS_ID 10
+    "51090033001c": "grazer12",     # MAV_SYS_ID 12
+    "510c00400042": "grazer17",     # MAV_SYS_ID 1
+    "510700190036": "hexi",         # Cube Orange+
+}
+# SYS_HITL != 0: the board was flying a simulator, so its uuid names a desk,
+# not a vehicle -- these get SIM_TAG instead of a vehicle tag.
+SIM_TAG = "sim"
 
 # Pill styling shared by both widgets.  The filter's pills are checkable; the
 # tag bar's are plain buttons whose click removes the tag.
@@ -59,6 +75,18 @@ def merge_tags(*lists):
             if t:
                 out.setdefault(t.casefold(), t)
     return sorted(out.values(), key=str.casefold)
+
+
+def auto_tags(ulog):
+    """Tags this log earns from its own header: its vehicle, or SIM_TAG.
+
+    Needs only the header and parameters, which every parse reads whatever its
+    topic filter, so the library scan gets this for free."""
+    if int(ulog.initial_parameters.get("SYS_HITL", 0) or 0):
+        return [SIM_TAG]
+    uuid = str(ulog.msg_info_dict.get("sys_uuid", "")).lower()
+    tag = VEHICLE_BOARDS.get(uuid[-12:])
+    return [tag] if tag else []
 
 
 def _pill(text, tooltip="", checkable=False):
