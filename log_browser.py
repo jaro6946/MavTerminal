@@ -1862,10 +1862,8 @@ class Browser(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, "Export", "No logs match the current tag filter.")
             return
-        names = self.tag_filter.selected()
-        stem = "_".join(re.sub(r"[^\w.-]+", "-", n) for n in names) or "all"
         default = os.path.join(os.path.expanduser("~"),
-                               f"logs_{stem}_{time.strftime('%Y-%m-%d')}.zip")
+                               f"{time.strftime('%Y-%m-%d')}.zip")
         dest, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, f"Export {len(paths)} log(s)", default, "Zip archive (*.zip)")
         if not dest:
