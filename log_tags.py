@@ -235,9 +235,10 @@ class TagFilter(QtWidgets.QWidget):
 
     `on_change()` asks the Browser to re-project the dropdown.  Right-click a
     pill that no log uses to drop it from the vocabulary (typos).
+    `on_export()` asks the Browser to zip up the logs the filter matches.
     """
 
-    def __init__(self, on_change, on_forget, parent=None):
+    def __init__(self, on_change, on_forget, on_export=None, parent=None):
         super().__init__(parent)
         self._on_change = on_change
         self._on_forget = on_forget
@@ -262,6 +263,15 @@ class TagFilter(QtWidgets.QWidget):
         self.lbl = QtWidgets.QLabel("")
         self.lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         head.addWidget(self.lbl, 1)
+        # In the header, not the collapsible body: "export what I'm filtering
+        # to" should not need the section opened first.
+        if on_export is not None:
+            self.btn_export = QtWidgets.QPushButton("Export…")
+            self.btn_export.setToolTip(
+                "Zip the logs this filter matches, with their tags, notes and "
+                "diagnosis files,\nfor sharing.  No filter = the whole library.")
+            self.btn_export.clicked.connect(on_export)
+            head.addWidget(self.btn_export)
         v.addLayout(head)
 
         self.body = QtWidgets.QWidget()
@@ -289,6 +299,10 @@ class TagFilter(QtWidgets.QWidget):
     # -- the Browser's view of it
     def active(self):
         return bool(self._selected)
+
+    def selected(self):
+        """The selected tags, as spelled, sorted."""
+        return sorted(self._selected.values(), key=str.casefold)
 
     def matches(self, tags):
         """Does a log carrying `tags` pass the filter?"""

@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import zipfile
 
 import matplotlib
 matplotlib.use("QtAgg")            # before any pyplot import, to match the shell
@@ -823,7 +824,8 @@ class Browser(QtWidgets.QMainWindow):
         # Closed every launch, and the selection is not persisted: a filter
         # left on from last week is a library that looks like it lost logs.
         self.tag_filter = TagFilter(on_change=self._tag_filter_changed,
-                                    on_forget=self._forget_tag)
+                                    on_forget=self._forget_tag,
+                                    on_export=self._export_filtered)
         cv.addWidget(self.tag_filter)
 
         self.title = QtWidgets.QLabel("no log loaded")
@@ -1831,6 +1833,113 @@ class Browser(QtWidgets.QMainWindow):
                 self._load_selected()
             return
         super().keyPressEvent(event)
+
+    # -- export
+    def _filtered_paths(self):
+        """Library logs the tag filter matches, in dropdown order.
+
+        From the filter itself, not the dropdown's rows: the dropdown also keeps
+        the SELECTED log even when it does not match, and an export that quietly
+        included it would not be the set the filter names."""
+        seen, out = set(), []
+        for p in self._library_paths():
+            key = os.path.abspath(p)
+            if key not in seen and os.path.isfile(p) and \
+                    self.tag_filter.matches(self._tags_of(p)):
+                seen.add(key)
+                out.append(p)
+        return out
+
+    def _export_filtered(self):
+        """Zip the filtered logs with their sidecars, for sharing.
+
+        Sidecars are what make a shared log worth more than the .ulg alone --
+        tags and notes live beside it, never inside it (see log_tags) -- so
+        each goes in under the same stem.  index.csv lists every log with its
+        tags, for whoever opens the zip without MavTerminal."""
+        paths = self._filtered_paths()
+        if not paths:
+            QtWidgets.QMessageBox.information(
+                self, "Export", "No logs match the current tag filter.")
+            return
+        names = self.tag_filter.selected()
+        stem = "_".join(re.sub(r"[^\w.-]+", "-", n) for n in names) or "all"
+        default = os.path.join(os.path.expanduser("~"),
+                               f"logs_{stem}_{time.strftime('%Y-%m-%d')}.zip")
+        dest, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, f"Export {len(paths)} log(s)", default, "Zip archive (*.zip)")
+        if not dest:
+            return
+        if not dest.lower().endswith(".zip"):
+            dest += ".zip"
+
+        # Archive names: the bare filename, unless two logs share it -- every
+        # HITL run writes FC_log.ulg -- then the run folder is prefixed.  Flat,
+        # not in subfolders: an added library folder is scanned one level deep,
+        # and the sidecars follow the new stem so they still pair up.
+        base_count = {}
+        for p in paths:
+            base_count[os.path.basename(p)] = base_count.get(
+                os.path.basename(p), 0) + 1
+
+        def arc_stem(p):
+            folder, base = os.path.split(p)
+            stem = base[:-4] if base.lower().endswith(".ulg") else base
+            if base_count[base] > 1:
+                stem = f"{os.path.basename(folder)}_{stem}"
+            return stem
+
+        prog = QtWidgets.QProgressDialog(
+            "Exporting logs…", "Cancel", 0, len(paths), self)
+        prog.setWindowModality(QtCore.Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        index = ["file,tags"]
+        n_side = 0
+        try:
+            # Deflate level 1: ULog compresses well and level 1 gets most of it
+            # at a fraction of the time -- a whole library is ~1.5 GB.
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED,
+                                 compresslevel=1) as zf:
+                for i, p in enumerate(paths):
+                    prog.setValue(i)
+                    prog.setLabelText(f"Exporting {i + 1} of {len(paths)}:\n"
+                                      f"{os.path.basename(p)}")
+                    QtWidgets.QApplication.processEvents()
+                    if prog.wasCanceled():
+                        raise InterruptedError
+                    a = arc_stem(p)
+                    zf.write(p, a + ".ulg")
+                    src_stem = p[:-4] if p.lower().endswith(".ulg") else p
+                    for suffix in (NOTES_SUFFIX, "_diag.txt"):
+                        if os.path.isfile(src_stem + suffix):
+                            zf.write(src_stem + suffix, a + suffix)
+                            n_side += 1
+                    # Tags from _tags_of, not the sidecar file: a log in a
+                    # read-only folder keeps its tags in the JSON state, and
+                    # they should travel all the same.
+                    tags = self._tags_of(p)
+                    if tags:
+                        zf.writestr(a + TAGS_SUFFIX, "\n".join(tags) + "\n")
+                        n_side += 1
+                    cell = "; ".join(tags).replace('"', '""')
+                    index.append(f'"{a}.ulg","{cell}"')
+                zf.writestr("index.csv", "\n".join(index) + "\n")
+        except InterruptedError:
+            prog.close()
+            with contextlib.suppress(OSError):
+                os.remove(dest)
+            self._log("export cancelled")
+            return
+        except OSError as e:
+            prog.close()
+            with contextlib.suppress(OSError):
+                os.remove(dest)
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+            return
+        prog.setValue(len(paths))
+        mb = os.path.getsize(dest) / 1e6
+        self._log(f"exported {len(paths)} log(s) + {n_side} sidecar file(s) "
+                  f"-> {dest}  ({mb:.0f} MB)")
 
     def _rename_selected(self):
         path = self._selected_path()
