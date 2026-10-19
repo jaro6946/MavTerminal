@@ -34,6 +34,11 @@ Refs look like normal ones so nothing else has to learn a new syntax:
     heading[0].published_vs_gsf     |published heading - GSF heading|, degrees
     heading[0].compass_vs_gsf       |compass heading - GSF heading|, degrees,
                                     level flight only
+    gps[0].dropout_rate             GPS dropouts (fix_type falling below 3D)
+                                    per minute, counted only while more than
+                                    GPS_MIN_SATS satellites are in use
+    gps[0].satellites               satellites in use, same gate (NaN at or
+                                    below GPS_MIN_SATS)
 
 The two heading channels are measured against the same witness -- the EKF-GSF
 of whichever instance is primary, in flight, converged -- so they share one
@@ -50,7 +55,7 @@ from ulog_accel import preflight_bias_fail
 __all__ = ["derived_field", "is_derived", "DERIVED_REFS",
            "DERIVED_UNITS", "derived_units"]
 
-DERIVED_TOPICS = ("preflight", "imu", "dds", "mag", "heading")
+DERIVED_TOPICS = ("preflight", "imu", "dds", "mag", "heading", "gps")
 
 _EMPTY = (np.array([]), np.array([]))
 
@@ -327,6 +332,73 @@ def _compass_vs_gsf(ulog, inst):
     return _break_gaps(t[ok], e[ok])
 
 
+# A dropout is only a receiver fault when the sky was good.  At or below this
+# many satellites a lost fix is the antenna not seeing enough of the sky (bench
+# logs indoors or under a cover) -- a different mechanism, and one that would
+# swamp the rate.  Both gps[] channels are NaN there, so a scatter's per-log
+# mean is taken over the good-sky time only.
+GPS_MIN_SATS = 10
+
+
+def _gps_gated(ulog, inst):
+    """(t_s, dropout_onset 0/1, sats_in_view, keep) from vehicle_gps_position.
+
+    A dropout sample reports satellites_used = 0 while the receiver is still
+    tracking ~30 (the single-epoch NAV-PVT glitch), so the satellite count at
+    each sample is the one from the last sample WITH a 3D fix.  Nothing before
+    the first fix counts: that is cold start, not a dropout.
+    """
+    d = _get(ulog, "vehicle_gps_position", inst)
+    if d is None or "fix_type" not in d.data:
+        return None
+    t = (np.asarray(d.data["timestamp"], dtype=np.float64)
+         - ulog.start_timestamp) / 1e6
+    fix = np.asarray(d.data["fix_type"])
+    good = fix >= 3
+    if t.size < 2 or not good.any():
+        return None
+    sats = np.asarray(d.data["satellites_used"], dtype=float)
+    last = np.where(good, np.arange(t.size), 0)
+    np.maximum.accumulate(last, out=last)
+    seen = sats[last]
+    seen[:np.argmax(good)] = np.nan
+    keep = seen > GPS_MIN_SATS
+    drop = ~good
+    onset = drop & ~np.r_[False, drop[:-1]] & keep
+    return t, onset.astype(float), seen, keep
+
+
+def _gps_dropout_rate(ulog, inst):
+    """GPS dropouts per minute, over good-sky time only (see GPS_MIN_SATS).
+
+    The window runs on GATED time -- the clock stops while the gate is shut --
+    so a minute of bad sky inside the window neither adds events nor dilutes
+    the rate.  Counted from vehicle_gps_position at whatever rate it was
+    logged: at SDLOG_PROFILE=1 that is 2 Hz, which hides most single-epoch
+    dropouts, so only compare logs recorded at 10 Hz.
+    """
+    g = _gps_gated(ulog, inst)
+    if g is None:
+        return _EMPTY
+    t, onset, _seen, keep = g
+    step = np.diff(t, append=t[-1])
+    # A logging gap is not good-sky time.
+    step[step > 1.0] = 0.0
+    tau = np.cumsum(np.where(keep, step, 0.0))
+    _t, rate = _win_rate(tau, onset)
+    rate = np.where(keep, rate, np.nan)
+    return t / 60.0, rate
+
+
+def _gps_satellites(ulog, inst):
+    """Satellites in use (last 3D-fix sample), NaN at or below GPS_MIN_SATS."""
+    g = _gps_gated(ulog, inst)
+    if g is None:
+        return _EMPTY
+    t, _onset, seen, keep = g
+    return t / 60.0, np.where(keep, seen, np.nan)
+
+
 def _break_gaps(t, e):
     """Insert one NaN in every gap longer than GAP_MIN -- see GAP_MIN."""
     if t.size < 2:
@@ -368,6 +440,8 @@ _REGISTRY = {
     ("mag", "failed_over"): _mag_failed_over,
     ("heading", "published_vs_gsf"): _published_vs_gsf,
     ("heading", "compass_vs_gsf"): _compass_vs_gsf,
+    ("gps", "dropout_rate"): _gps_dropout_rate,
+    ("gps", "satellites"): _gps_satellites,
 }
 
 DERIVED_REFS = tuple(f"{topic}[i].{name}" for topic, name in _REGISTRY)
@@ -385,6 +459,8 @@ DERIVED_UNITS = {
     ("mag", "failed_over"): "0/1",
     ("heading", "published_vs_gsf"): "deg",
     ("heading", "compass_vs_gsf"): "deg",
+    ("gps", "dropout_rate"): "dropouts/min",
+    ("gps", "satellites"): "satellites",
 }
 
 
