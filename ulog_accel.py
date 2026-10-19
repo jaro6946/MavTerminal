@@ -301,22 +301,27 @@ def _series_bias(ulog, ctx, instances):
                                  f"EKF {i} bias {name}", tb, y, "bias", col,
                                  ls=AXIS_STYLE[j], lw=1.4, visible=True))
         thr, _v = _preflight_threshold(d)
-        # One line per sign, from the worst axis: the three axis thresholds differ
-        # only by their variance term (~1% apart in practice), and drawing six
-        # near-coincident dashed lines per instance turns the panel to hatching.
-        # The max is the conservative choice -- a crossing above it is a failure
-        # on every axis, so the drawn line never over-claims.
-        worst = np.nanmax(thr, axis=1)
-        tt, yy = _clean(t, worst)
-        # Both signs as ONE line, joined by a NaN so matplotlib breaks between
-        # them.  A separate negative series would double this panel's share of
-        # the checkbox column for a curve that is, by construction, the mirror of
-        # one already there -- and would let the reader hide half a gate.
-        tg = np.concatenate([tt, [np.nan], tt])
-        yg = np.concatenate([yy, [np.nan], -yy])
-        series.append(Series(f"estimator_sensor_bias[{i}].preflight_limit",
-                             f"EKF {i} arming limit +/-", tg, yg, "bias", col,
-                             ls="-.", lw=1.0, alpha=0.7, visible=True, zorder=2))
+        # One limit PER AXIS, in that axis's dash pattern, so each bias line is
+        # read against its own gate.  This used to be a single line at the
+        # loosest axis (the max), on the assumption that the axes differ by ~1%.
+        # They do not while the vehicle sits level: x/y are barely observable,
+        # so their 3-sigma term is large.  MTL112: z gate 0.313 vs x/y ~0.39, and
+        # a z bias of 0.33 that FAILED the check sat visibly under the drawn
+        # 0.39 line.  The three axes share one checkbox (a _LineGroup).
+        #
+        # Both signs per axis as ONE line, joined by a NaN so matplotlib breaks
+        # between them -- the negative half is the mirror, not extra data.
+        per_axis = []
+        for j in range(3):
+            tt, yy = _clean(t, thr[:, j])
+            per_axis.append((np.concatenate([tt, [np.nan], tt]),
+                             np.concatenate([yy, [np.nan], -yy]), AXIS_STYLE[j]))
+        s_lim = Series(f"estimator_sensor_bias[{i}].preflight_limit",
+                       f"EKF {i} arming limit +/- (per axis)", per_axis[2][0],
+                       per_axis[2][1], "bias", col, ls=per_axis[2][2], lw=0.9,
+                       alpha=0.55, visible=True, zorder=2)
+        s_lim.extra_lines = per_axis[:2]
+        series.append(s_lim)
     if not series:
         ctx.note("no estimator_sensor_bias in this log -- the preflight "
                  "'High Accelerometer Bias' check cannot be reproduced")
@@ -644,6 +649,31 @@ def _calibration_changes(ulog):
     return [float(t[i]) for i in np.flatnonzero(np.diff(c) != 0) + 1]
 
 
+class _LineGroup:
+    """Several Line2D behind one checkbox.  The checkbox panel toggles
+    visibility; the rescale reads data -- both see the first line, which is
+    enough because the members share x and the y range is pinned by `keep`."""
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    def set_visible(self, v):
+        for ln in self.lines:
+            ln.set_visible(v)
+
+    def get_visible(self):
+        return self.lines[0].get_visible()
+
+    def get_xdata(self):
+        return self.lines[0].get_xdata()
+
+    def get_ydata(self):
+        return self.lines[0].get_ydata()
+
+    def get_color(self):
+        return self.lines[0].get_color()
+
+
 def _rescale_clipped(ax, lines, pct=99.5, keep=None):
     """Percentile y-limits, with a range that must stay in view.
 
@@ -793,6 +823,15 @@ def build_accel(ulog, ctx=None, path=""):
             zorder=s.zorder if s.zorder is not None else 3)
         line.set_visible(s.visible)
         s.line = line
+        extra = getattr(s, "extra_lines", None)
+        if extra:
+            more = [axis_of[s.group].plot(
+                        et, ey, color=s.color, ls=els, lw=s.lw, alpha=s.alpha,
+                        zorder=s.zorder if s.zorder is not None else 3)[0]
+                    for et, ey, els in extra]
+            for ln in more:
+                ln.set_visible(s.visible)
+            s.line = _LineGroup([line] + more)
 
     # Recalibration markers on the bias panel: a bias step across one of these is
     # the datum moving, not the estimate converging.

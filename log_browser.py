@@ -445,14 +445,14 @@ class FaultPanel(QtWidgets.QWidget):
         lay.setSpacing(0)
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(10, 6, 10, 4)
-        row.addWidget(QtWidgets.QLabel(f"fault ({len(self.faults)} in this log):"))
+        row.addWidget(QtWidgets.QLabel(f"event / fault ({len(self.faults)} in this log):"))
         self.combo = QtWidgets.QComboBox()
         self.combo.setStyleSheet("font-family: monospace;")
         self.combo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToMinimumContentsLength)
         self.combo.setMinimumContentsLength(60)
         self.combo.setMaxVisibleItems(30)
-        self.combo.addItem("All faults (overview)", self.OVERVIEW)
+        self.combo.addItem("All events and faults (overview)", self.OVERVIEW)
         last_src = None
         for f in self.faults:
             if f.source != last_src:
@@ -833,7 +833,7 @@ class Browser(QtWidgets.QMainWindow):
             f"font-size: 13px; font-weight: 600; padding: 0 10px 6px 10px;")
         cv.addWidget(self.title)
 
-        # Tags above the notes and the plots (so above Faults over time), and
+        # Tags above the notes and the plots (so above Events and faults over time), and
         # filled on SELECTION, not on Load -- they need no parse.
         self.tag_bar = TagBar(on_change=self._set_log_tags,
                               vocabulary=self._tag_vocabulary)

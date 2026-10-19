@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ulog_faults.py -- every fault a log recorded, and when each one happened.
+"""ulog_faults.py -- every event and fault a log recorded, and when each happened.
 
 Two halves:
 
@@ -30,6 +30,23 @@ different ways and none of them is complete on its own:
             is cumulative, so each step up is one occurrence.
   gps       sensor_gps spoofing / jamming state at "indicated" or worse.
 
+Plus one source that is not a fault but explains many of them:
+
+  event     sensor calibrations: each run from "[cal] calibration started" to
+            done / failed / cancelled, with the CAL_* parameters it changed.  A
+            calibration tips the vehicle on every side, so it trips the failure
+            detector (fd_critical_failure, "Attitude failure (roll)") and mag
+            and attitude checks; without the run drawn beside them those read as
+            real faults (MTL111, 6:08-9:41).
+            EKF resets: every step of the yaw / position / height / velocity
+            reset counters of the PUBLISHED estimate, sized by its delta, and
+            every change of the primary EKF instance.  A reset is a jump in the
+            estimate that no motion caused -- the explanation for a heading or
+            position step in any other plot.
+            Parameter changes made while logging, other than those a calibration
+            run wrote: name, old -> new.  A change mid-log silently changes what
+            the rest of the log means.
+
 Occurrence semantics: an EVENT (message, counter step) is one instant; a STATE
 (flag) occurs once per rising edge and lasts until it clears -- so "occurrences"
 is always "how many times did it start", whichever kind it is.
@@ -55,6 +72,7 @@ __all__ = ["Fault", "FAULT_TOPICS", "collect_faults", "build_faults",
            "build_fault_detail", "fmt_clock"]
 
 FAULT_TOPICS = [
+    "vehicle_local_position", "estimator_selector_status",
     "failsafe_flags", "vehicle_status", "actuator_armed",
     "estimator_status_flags",
     "sensor_accel", "sensor_gyro", "sensor_mag", "sensor_baro", "sensor_gps",
@@ -64,10 +82,11 @@ FAULT_TOPICS = [
 # message is amber so a screen full of "no GCS connection" chatter does not look
 # as alarming as one real ERROR.
 C_WARN = "#d9822b"
+C_EVENT = "#2a78d6"     # blue: something that HAPPENED, not something wrong
 LEVEL_COLOR = {"EMERGENCY": C_BAD, "ALERT": C_BAD, "CRITICAL": C_BAD,
                "ERROR": C_BAD, "WARNING": C_WARN}
-SOURCE_ORDER = ["message", "failsafe", "ekf", "driver", "gps"]
-SOURCE_NAME = {"message": "log message", "failsafe": "failsafe flag",
+SOURCE_ORDER = ["event", "message", "failsafe", "ekf", "driver", "gps"]
+SOURCE_NAME = {"event": "event", "message": "log message", "failsafe": "failsafe flag",
                "ekf": "EKF flag", "driver": "driver errors", "gps": "GPS"}
 
 # Numbers in a message are VALUES ("RTT too high: 18 ms", "Compasses 104°
@@ -313,13 +332,177 @@ def _gps(ulog, t_end):
     return out
 
 
+# PX4 commander/calibration_messages.h.  The "2" after "started:" is a protocol
+# version, not a count.
+_CAL_START = re.compile(r"\[cal\] calibration started: \d+ (\w+)")
+_CAL_END = re.compile(r"\[cal\] calibration (done|failed|cancelled)")
+# Which parameters each calibration writes.  "level" writes the board offsets.
+_CAL_PARAMS = {"accel": ("CAL_ACC",), "gyro": ("CAL_GYRO",), "mag": ("CAL_MAG",),
+               "level": ("SENS_BOARD_X_OFF", "SENS_BOARD_Y_OFF"),
+               "baro": ("CAL_BARO",), "airspeed": ("SENS_DPRES_OFF",)}
+
+
+def _calibration(ulog, t_end):
+    """One event row per calibration TYPE: a bar per run, red if it failed.
+
+    The value carried per run is how many parameters it changed -- 0 on a
+    "done" run means nothing was saved, worth knowing before trusting it."""
+    t0 = getattr(ulog, "start_timestamp", 0) or 0
+    runs, open_ = [], None
+    for m in getattr(ulog, "logged_messages", []) or []:
+        t = (m.timestamp - t0) / 6e7
+        ms = _CAL_START.search(m.message)
+        if ms:
+            if open_:
+                runs.append(open_ + (t, "interrupted"))
+            open_ = (ms.group(1), t)
+            continue
+        me = _CAL_END.search(m.message)
+        if me and open_:
+            runs.append(open_ + (t, me.group(1)))
+            open_ = None
+    if open_:
+        runs.append(open_ + (t_end, "unfinished"))
+    if not runs:
+        return []
+    changed = [((ts - t0) / 6e7, name) for ts, name, _v in
+               (getattr(ulog, "changed_parameters", []) or []) if ts > t0]
+    out = []
+    for kind in OrderedDict((r[0], None) for r in runs):
+        mine = [r for r in runs if r[0] == kind]
+        prefixes = _CAL_PARAMS.get(kind, ("CAL_",))
+        spans, onsets, vals, texts = [], [], [], []
+        for _k, a, b, how in mine:
+            # Parameters land at or just after the "done" line.
+            n = sum(1 for t, name in changed
+                    if a <= t <= b + 0.05 and name.startswith(prefixes))
+            spans.append((a, b))
+            onsets.append(a)
+            vals.append(n)
+            texts.append(f"{fmt_clock(a)}-{fmt_clock(b)} {how}, {n} params changed")
+        bad = any(r[3] != "done" for r in mine)
+        outcome = ", ".join(sorted({r[3] for r in mine}))
+        out.append(Fault(key=f"event:cal:{kind}", source="event",
+                         label=f"{kind} calibration ({outcome}, "
+                               f"{sum(vals)} params changed)",
+                         color=C_BAD if bad else C_EVENT,
+                         lanes=[("", spans, onsets)],
+                         value_t=np.asarray(onsets), values=np.asarray(vals, float),
+                         value_name="parameters changed", texts=texts))
+    return out
+
+
+# (counter field, label, value name, delta -> number)
+_RESETS = (
+    ("heading_reset_counter", "EKF yaw reset", "yaw step (deg)",
+     lambda d, i: np.degrees(d["delta_heading"][i])),
+    ("xy_reset_counter", "EKF horizontal position reset", "position step (m)",
+     lambda d, i: np.hypot(d["delta_xy[0]"][i], d["delta_xy[1]"][i])),
+    ("z_reset_counter", "EKF height reset", "height step (m, +down)",
+     lambda d, i: d["delta_z"][i]),
+    ("vxy_reset_counter", "EKF horizontal velocity reset", "velocity step (m/s)",
+     lambda d, i: np.hypot(d["delta_vxy[0]"][i], d["delta_vxy[1]"][i])),
+    ("vz_reset_counter", "EKF vertical velocity reset", "velocity step (m/s, +down)",
+     lambda d, i: d["delta_vz"][i]),
+)
+
+
+def _ekf_resets(ulog):
+    """Steps of the published estimate's reset counters, plus primary-instance
+    switches.  Only steps WITHIN the log count: the first sample's counter
+    already includes resets from before logging started (the boot alignment),
+    which have no time here."""
+    out = []
+    d = _get(ulog, "vehicle_local_position")
+    if d is not None:
+        t = _time_min(ulog, d)
+        for field, label, vname, delta in _RESETS:
+            if field not in d.data:
+                continue
+            c = np.asarray(d.data[field], dtype=np.int64)
+            # uint8 counter: a wrap 255 -> 0 is still one step.
+            idx = np.flatnonzero(np.diff(c) % 256 != 0) + 1
+            if idx.size == 0:
+                continue
+            vals = np.array([float(delta(d.data, i)) for i in idx])
+            unit = vname[vname.index("(") + 1:].split(",")[0].rstrip(")")
+            big = vals[np.argmax(np.abs(vals))]
+            out.append(Fault(key=f"event:reset:{field}", source="event",
+                             label=f"{label} (largest {big:+.3g} {unit})",
+                             color=C_EVENT,
+                             lanes=[("", [], list(t[idx]))],
+                             value_t=t[idx], values=vals, value_name=vname,
+                             texts=[f"{fmt_clock(t[i])} {v:+.3g} {unit}"
+                                    for i, v in zip(idx, vals)]))
+    d = _get(ulog, "estimator_selector_status")
+    if d is not None and "primary_instance" in d.data:
+        t = _time_min(ulog, d)
+        p = np.asarray(d.data["primary_instance"], dtype=np.int64)
+        idx = np.flatnonzero(np.diff(p) != 0) + 1
+        if idx.size:
+            out.append(Fault(
+                key="event:ekf_primary", source="event",
+                label="EKF primary instance switched", color=C_EVENT,
+                lanes=[("", [], list(t[idx]))], value_t=t[idx],
+                values=p[idx].astype(float), value_name="new primary instance",
+                texts=[f"{fmt_clock(t[i])} EKF {p[i - 1]} -> {p[i]}" for i in idx]))
+    return out
+
+
+def _fmt_param(v):
+    return f"{v:g}" if isinstance(v, float) else str(v)
+
+
+def _param_changes(ulog, cal_faults):
+    """Parameter changes made while logging, minus the ones a calibration run
+    wrote.  One row per parameter; the wording list carries old -> new."""
+    t0 = getattr(ulog, "start_timestamp", 0) or 0
+    cal = []
+    for f in cal_faults:
+        kind = f.key.rsplit(":", 1)[-1]
+        prefixes = _CAL_PARAMS.get(kind, ("CAL_",))
+        for _lane, spans, _on in f.lanes:
+            cal += [(a, b + 0.05, prefixes) for a, b in spans]
+    current = dict(getattr(ulog, "initial_parameters", {}) or {})
+    rows = OrderedDict()
+    for ts, name, val in getattr(ulog, "changed_parameters", []) or []:
+        old = current.get(name)
+        current[name] = val
+        if ts <= t0 or old == val:
+            continue
+        t = (ts - t0) / 6e7
+        if any(a <= t <= b and name.startswith(px) for a, b, px in cal):
+            continue
+        rows.setdefault(name, []).append((t, old, val))
+    out = []
+    for name, ch in rows.items():
+        ts = np.array([c[0] for c in ch])
+        first, last = ch[0][1], ch[-1][2]
+        label = (f"param {name}: {_fmt_param(first)} -> {_fmt_param(last)}"
+                 if first is not None else f"param {name} set to {_fmt_param(last)}")
+        out.append(Fault(key=f"event:param:{name}", source="event", label=label,
+                         color=C_EVENT, lanes=[("", [], list(ts))],
+                         value_t=ts, values=np.array([float(c[2]) for c in ch]),
+                         value_name=name,
+                         texts=[f"{fmt_clock(t)} {_fmt_param(o)} -> {_fmt_param(v)}"
+                                for t, o, v in ch]))
+    return out
+
+
 def collect_faults(ulog):
     """Every fault that occurred in this log, grouped by source, busiest first."""
     t_end = duration_min(ulog)
-    faults = (_messages(ulog) + _failsafe(ulog, t_end) + _ekf(ulog, t_end)
+    cal = _calibration(ulog, t_end)
+    faults = (cal + _ekf_resets(ulog) + _param_changes(ulog, cal)
+              + _messages(ulog) + _failsafe(ulog, t_end) + _ekf(ulog, t_end)
               + _driver(ulog) + _gps(ulog, t_end))
     faults = [f for f in faults if f.count]
-    faults.sort(key=lambda f: (SOURCE_ORDER.index(f.source), -f.count, f.label))
+    # Events keep their collection order (calibrations, resets, parameters):
+    # grouped by kind reads better than busiest-first there.
+    seq = {id(f): i for i, f in enumerate(faults)}
+    faults.sort(key=lambda f: (SOURCE_ORDER.index(f.source),
+                               seq[id(f)] if f.source == "event" else -f.count,
+                               f.label))
     return faults
 
 
@@ -374,18 +557,25 @@ def build_faults(ulog, ctx=None, path="", faults=None):
     ax.set_facecolor(C_SURFACE)
     draw_band_rows(ax, rows, empty_msg="no faults recorded in this log",
                    min_width=hold, track=True)
+    # Calibration runs shaded down the whole chart: the faults a calibration
+    # causes (failure detector, attitude/heading checks) line up under it.
+    for f in faults:
+        if f.key.startswith("event:cal:"):
+            for _lane, spans, _on in f.lanes:
+                for s0, s1 in spans:
+                    ax.axvspan(s0, s1, color=C_EVENT, alpha=0.07, lw=0, zorder=0)
     ax.set_xlim(0, dur)
     style_time_axis(ax)
     codes = _decorate_time(fig, [ax], ulog, ax)
-    fig.text(left, 1.0 - f_(0.35), "Faults over time", fontsize=13,
+    fig.text(left, 1.0 - f_(0.35), "Events and faults over time", fontsize=13,
              fontweight="bold", color=C_INK)
     by_src = OrderedDict()
     for f in faults:
         by_src[f.source] = by_src.get(f.source, 0) + 1
     fig.text(left, 1.0 - f_(0.62),
-             f"{len(faults)} distinct faults: " + ", ".join(
+             f"{len(faults)} distinct events/faults: " + ", ".join(
                  f"{k} {SOURCE_NAME[s]}" for s, k in by_src.items())
-             if faults else "no warnings, failsafes, EKF faults or driver errors",
+             if faults else "no events, warnings, failsafes, EKF faults or driver errors",
              fontsize=9, color=C_MUTED)
     if codes:
         mode_key(fig, right, 1.0 - f_(0.35), codes)

@@ -20,9 +20,11 @@ import ulog_accel
 import ulog_alt
 import ulog_commands
 import ulog_cpu
+import ulog_esc
 import ulog_faults
 import ulog_graph
 import ulog_heading
+import ulog_link
 import ulog_localz
 import ulog_path
 import ulog_atrest
@@ -52,10 +54,11 @@ PLOTS = [
         # log_browser.FaultPanel, which puts a fault picker above the figure;
         # the PDF and CLI get this overview (one row per fault).
         key="faults",
-        title="Faults over time",
+        title="Events and faults over time",
         topics=ulog_faults.FAULT_TOPICS,
         build=ulog_faults.build_faults,
-        blurb="every warning/error message, failsafe flag, EKF fault or "
+        blurb="calibration runs (and what they saved), then every "
+              "warning/error message, failsafe flag, EKF fault or "
               "rejection, sensor driver error and GPS spoofing/jamming state "
               "that occurred, each on its own row against time",
         # Fallback only: build_faults sizes its own figure from the row count.
@@ -173,6 +176,17 @@ PLOTS = [
         height=880,
     ),
     PlotSpec(
+        # Next to the motors plot: command above, what the rotors actually did here.
+        key="esc",
+        title="ESC telemetry (measured RPM)",
+        topics=ulog_esc.ESC_TOPICS,
+        build=ulog_esc.build_esc,
+        blurb="each motor's MEASURED speed from bidirectional DShot, its split "
+              "from the four-motor mean (steady split = yaw or CG trim), and the "
+              "telemetry error rate",
+        height=960,
+    ),
+    PlotSpec(
         key="cpu",
         title="Processor load / links",
         topics=ulog_cpu.CPU_TOPICS,
@@ -183,6 +197,20 @@ PLOTS = [
               "uORB topics the bridge writes",
         # Fallback only: build_cpu sizes its own figure from the band.
         height=1250,
+    ),
+    PlotSpec(
+        # Directly under the load plot, which shows the bridge only as the
+        # rate of the uORB topics it wrote; this one is the link itself.
+        key="link",
+        title="Link bandwidth / what uses it",
+        topics=ulog_link.LINK_TOPICS,
+        build=ulog_link.build_link,
+        blurb="each serial link's capacity against its measured use -- DDS "
+              "out and in stacked by topic with the protocol overhead on top "
+              "(from dds_link_status, custom v1.18 firmware only), and every "
+              "MAVLink instance against its own budget",
+        # Fallback only: build_link sets fig._page_height.
+        height=900,
     ),
 ]
 

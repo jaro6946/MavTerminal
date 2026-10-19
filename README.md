@@ -292,6 +292,7 @@ timeline, labelled at each transition):
 
 | Plot | What it answers |
 |---|---|
+| **Events and faults over time** | First on the page. Calibration runs (blue bars, red if failed or cancelled), each with the number of `CAL_*` parameters it saved, shaded down the whole chart. EKF resets of the published estimate (yaw, horizontal and vertical position, velocity), each sized by its jump, plus every switch of the primary EKF instance. Parameter changes made while logging, other than those a calibration wrote, as old → new. Below them, every warning or error message, failsafe flag, EKF fault, sensor driver error and GPS jamming state, one row each. The shading matters because a calibration tips the vehicle on every side, which trips `fd_critical_failure` and the attitude and heading checks. Pick a single row in the browser's dropdown to see it in detail. |
 | **Thermal / GPS** | Every temperature channel the log carries, satellite count and `fix_type`, and dT/dt for one channel. |
 | **Altitude estimation** | Why the vehicle thinks it is at that height: an AMSL overlay of GPS / barometer / rangefinder against the EKF's fused altitude, the **residual** of each source vs fused, the EKF's **innovations and test ratios**, and a band showing which source it was actually fusing. |
 | **Local z / EKF instance** | Whose z you are looking at. PX4 publishes ONE instance's `vehicle_local_position`, and each instance anchors its **own** local origin — so a selector handover republishes z against a different datum. Overlays every instance's own z and `ref_alt` plus the selector scores. (On `SquareWaypointMission_1.ulg` the origins sat a permanent 30.25 m apart and published z stepped 89 m while the vehicle held still.) |
@@ -301,7 +302,9 @@ timeline, labelled at each transition):
 | **Commands: throttle / roll / pitch / yaw** | What the vehicle was *told* to do: the collective throttle command, and commanded (dashed magenta) vs actual (solid black) roll, pitch and yaw from the quaternions `q_d` / `q`. The mixer's normalised torque command per axis (right-hand axis) and per-motor output are there to switch on, for spotting saturation. Lines are broken across logging holes rather than bridged. |
 | **Speed** | Speed with no direction: 3D and horizontal ground speed from the estimate, the commanded speed (only finite in velocity-controlled modes), and the raw GPS receiver speed as an EKF-independent witness. A second panel resolves velocity into the **heading frame** — forward / right / up along the nose, levelled (follows yaw, not tilt), actual vs commanded — so pitch and roll show up as the speed they produce. Signs follow PX4 FRD: +right, the opposite of rotorpy's {V} frame. |
 | **Motors / vibration spectrum** | Each motor's command (`actuator_motors`) over time, above PX4's **onboard gyro FFT** peaks (`sensor_gyro_fft`, run on the raw ~2 kHz gyro) as frequency vs time coloured by SNR. With no ESC telemetry wired this is the only rotor-speed evidence in the log — indirect and not labelled by motor. An offline spectrogram of `sensor_combined` is *not* offered: at ~190 Hz its Nyquist (~95 Hz) sits right on the ~100 Hz rotor line. |
+| **ESC telemetry (measured RPM)** | Each motor's measured speed from bidirectional DShot (`esc_status`), its split from the four-motor mean while armed (2 s mean; a steady split is trim, a diagonal pair means yaw imbalance and a front/rear pair means CG), and the telemetry error rate. Needs `PWM_MAIN_TIMx` = -8/-7/-6. RPM is eRPM divided by `DSHOT_MOT_POL1`/2, so a wrong pole count scales it. |
 | **Processor load / links** | Did the board run out of CPU or bandwidth, and what did it drop: CPU/RAM, the EKF's own time slip and per-IMU publish rates, SD buffer pressure and the MAVLink rate throttle, and the **companion / uXRCE-DDS bridge traffic** measured from the uORB topics the bridge writes. |
+| **Link bandwidth / what uses it** | Each serial link's capacity (baud / 10) against what is using it. DDS out and in are stacked by topic with the protocol overhead on top, and the top of the stack is the measured wire rate. That data comes from `dds_link_status`, which only the grazer custom v1.18 firmware logs. Every MAVLink instance is shown against its UART with its `MAV_x_RATE` budget dashed. A band marks reconnects, dropped samples, overruns and throttling. Topic names come from `dds_topic_maps.json`; add a firmware's list with `python3 ulog_link.py --register <dds_topics.yaml>`. |
 
 Every EKF-instance-aware plot is shaded by
 `estimator_selector_status.primary_instance`, so an excursion is always read
@@ -466,6 +469,8 @@ materialising ~100 topics nobody plots.
 | `ulog_path.py` | 3D flight path + basemaps |
 | `ulog_commands.py` | Commands (throttle / attitude), speed, motors + onboard FFT |
 | `ulog_cpu.py` | Processor load / links |
+| `ulog_esc.py` | ESC telemetry (measured RPM, split, telemetry errors) |
+| `ulog_link.py` | Link bandwidth / what uses it (+ `dds_topic_maps.json`, topic-list hash → names) |
 | `ulog_report.py` | PDF export |
 | `log_browser.py` | The PyQt5 browser window |
 
