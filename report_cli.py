@@ -32,7 +32,7 @@ from matplotlib.figure import Figure
 
 from report_model import (ALIGNMENTS, Report, list_reports, reports_dir)
 from report_render import (STAT_COLS, _percent_scale, assign_axes,
-                           build_figure, fit_value_axes, fmt_stat,
+                           build_figure, fit_value_axes, fmt_stat, graph_topics,
                            gather_series, scatter_points, short_ref, stats_of,
                            window_of)
 from ulog_cache import parse_ulog
@@ -106,13 +106,17 @@ def _load_logs(report, root, log=print):
     for d, _dirs, files in os.walk(base):
         known += [os.path.join(d, f) for f in files if f.endswith(".ulg")]
     resolved = report.resolved(known)
+    # Only the topics the graphs read.  Every log is held at once (a scatter
+    # needs them all), and an unfiltered parse of a 45-log report is ~4 GB of
+    # .ulg -- that took the whole WSL VM down.  Filtered, it is a few MB a log.
+    topics = graph_topics(report.graphs)
     ulogs, missing = {}, []
     for ref in report.logs:
         p = resolved.get(ref.name)
         if p is None:
             missing.append(ref.name)
             continue
-        ulogs[ref.name] = parse_ulog(p, None)
+        ulogs[ref.name] = parse_ulog(p, topics)
         if os.path.basename(p) != ref.name:
             log(f"  note: {ref.name} resolved to {os.path.basename(p)} (renamed)")
     return ulogs, missing

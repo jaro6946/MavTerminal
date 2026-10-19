@@ -53,7 +53,7 @@ import numpy as np
 from ulog_accel import preflight_bias_fail
 
 __all__ = ["derived_field", "is_derived", "DERIVED_REFS",
-           "DERIVED_UNITS", "derived_units"]
+           "DERIVED_UNITS", "derived_units", "derived_inputs"]
 
 DERIVED_TOPICS = ("preflight", "imu", "dds", "mag", "heading", "gps")
 
@@ -462,6 +462,26 @@ DERIVED_UNITS = {
     ("gps", "dropout_rate"): "dropouts/min",
     ("gps", "satellites"): "satellites",
 }
+
+
+# The logged topics each computed channel reads, so a caller can parse just
+# those instead of the whole log.  That matters at report scale: a 45-log
+# scatter is 3.9 GB of .ulg, and parsing every topic of every log at once ran
+# a 7 GB WSL out of memory.  None = not enumerated (the heading and mag
+# channels reach into plot modules) -- the caller must then parse everything.
+DERIVED_INPUTS = {
+    "preflight": ("estimator_sensor_bias",),
+    "imu": ("sensor_accel",),
+    "dds": ("offboard_control_mode",),
+    "mag": None,
+    "heading": None,
+    "gps": ("vehicle_gps_position",),
+}
+
+
+def derived_inputs(topic):
+    """Logged topics a computed channel needs, or None for "all of them"."""
+    return DERIVED_INPUTS.get(topic)
 
 
 def derived_units(topic, name):

@@ -37,8 +37,8 @@ from qt_common import FlowLayout, NotesBox, PlotCanvas, flow_holder
 from report_model import (ALIGNMENTS, HEIGHT_RANGE, LogRef, Report,
                           list_reports, reports_dir)
 from report_render import (DRAW_PX, STAT_COLS, assign_axes, build_figure,
-                           fit_value_axes, fmt_stat, gather_series, plot_y,
-                           short_ref, stats_of)
+                           fit_value_axes, fmt_stat, gather_series,
+                           graph_topics, plot_y, short_ref, stats_of)
 import ulog_cache
 from ulog_cache import parse_ulog
 from ulog_common import (C_INK, C_MUTED, C_SURFACE, VARY, add_mouse_navigation,
@@ -67,9 +67,10 @@ class LoadWorker(QtCore.QObject):
     failed = QtCore.pyqtSignal(str, str)
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, paths):
+    def __init__(self, paths, topics=None):
         super().__init__()
         self.paths = list(paths)
+        self.topics = topics
         self.cancelled = False
 
     @QtCore.pyqtSlot()
@@ -82,7 +83,7 @@ class LoadWorker(QtCore.QObject):
             if self.cancelled:
                 break
             try:
-                self.one.emit(p, parse_ulog(p, None))
+                self.one.emit(p, parse_ulog(p, self.topics))
             except Exception as e:
                 self.failed.emit(p, f"{type(e).__name__}: {e}")
         self.finished.emit()
@@ -1208,21 +1209,37 @@ class ReportTab(QtWidgets.QWidget):
         known = [p for p, _ in self._list_logs()]
         return self.report.resolved(known).get(name)
 
+    def parse_topics(self):
+        """Topics to parse each log for: None (all of them) unless that cannot fit.
+
+        Unfiltered is the default because the field picker offers every channel
+        in the file (see LoadWorker).  But a graph's logs must all be resident
+        at once, and past the browse cache's MAX_MB an unfiltered parse of them
+        is more than this machine has -- a 45-log scatter is 3.9 GB of .ulg,
+        and parsing all of it took the WSL VM down.  Then only the topics the
+        graphs read are parsed (a few MB a log), and the picker offers just
+        those topics until the report shrinks again."""
+        need = max([self._graph_mb(g) for g in self.report.graphs] or [0.0])
+        if need <= ulog_cache.MAX_MB:
+            return None
+        return graph_topics(self.report.graphs)
+
     def loaded_ulogs(self, names):
         """{name: ulog} for those already parsed.  Missing ones are simply absent."""
+        topics = self.parse_topics()
         out = {}
         for n in names:
             p = self.path_for(n)
             if not p:
                 continue
-            hit = self.cache.get(p, None)       # None = needs an unfiltered parse
+            hit = self.cache.get(p, topics)     # None = needs an unfiltered parse
             if hit is not None:
                 out[n] = hit.ulog
         return out
 
     def inventory_of(self, name):
         p = self.path_for(name)
-        hit = self.cache.get(p, None) if p else None
+        hit = self.cache.get(p, self.parse_topics()) if p else None
         return hit.inventory if hit is not None else []
 
     def _reload_all(self):
@@ -1231,13 +1248,14 @@ class ReportTab(QtWidgets.QWidget):
     def _ensure_loaded(self, graph_ids):
         """Parse whatever the named graphs still need, then refresh them."""
         want = []
+        topics = self.parse_topics()
         for gid in graph_ids:
             g = self.report.graph(gid)
             if g is None:
                 continue
             for name in g.logs:
                 p = self.path_for(name)
-                if p and self.cache.get(p, None) is None and p not in want:
+                if p and self.cache.get(p, topics) is None and p not in want:
                     want.append(p)
         if not want:
             for gid in graph_ids:
@@ -1257,7 +1275,10 @@ class ReportTab(QtWidgets.QWidget):
         self._pending_ids = list(dict.fromkeys(
             list(getattr(self, "_pending_ids", [])) + list(graph_ids)))
         self._thread = QtCore.QThread(self)
-        self._worker = LoadWorker(want)
+        if topics is not None:
+            self._log(f"report: logs too large to parse whole -- reading only "
+                      f"{len(topics)} topic(s) the graphs use")
+        self._worker = LoadWorker(want, topics)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.one.connect(self._one_loaded)
@@ -1267,9 +1288,10 @@ class ReportTab(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(str, object)
     def _one_loaded(self, path, ulog):
-        # topics=None: this is the unfiltered parse, so it satisfies every
-        # later request including the browse tab's.
-        self.cache.put(path, ulog, None)
+        # topics=None (the usual case) is the unfiltered parse, so it satisfies
+        # every later request including the browse tab's.
+        self.cache.put(path, ulog,
+                       self._worker.topics if self._worker is not None else None)
         self._log(f"  {os.path.basename(path)} ready")
 
     @QtCore.pyqtSlot(str, str)

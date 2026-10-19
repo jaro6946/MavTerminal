@@ -23,8 +23,9 @@ from matplotlib.lines import Line2D
 
 from report_model import ALIGNMENTS
 from ulog_cache import start_epoch
-from ulog_derived import derived_field, derived_units, is_derived
-from ulog_common import (C_GRID, C_INK, C_MUTED, C_SURFACE, armed_spans,
+from ulog_derived import derived_field, derived_inputs, derived_units, is_derived
+from ulog_common import (ARMED_TOPIC, C_GRID, C_INK, C_MUTED, C_SURFACE,
+                         armed_spans,
                          decimate, field, parse_ref, style_time_axis)
 
 __all__ = ["SERIES_COLORS", "LOG_STYLES", "STAT_COLS", "DRAW_PX",
@@ -32,7 +33,8 @@ __all__ = ["SERIES_COLORS", "LOG_STYLES", "STAT_COLS", "DRAW_PX",
            "absolute_base", "stats_of", "fmt_stat", "gather_series",
            "auto_axis", "assign_axes", "build_figure", "fit_value_axes",
            "window_of", "plot_y", "log_date", "LANE_ON", "LANE_FRAC",
-           "scatter_points", "spearman", "axis_label", "log_epoch"]
+           "scatter_points", "spearman", "axis_label", "log_epoch",
+           "graph_topics"]
 
 # Channel colours.  A categorical set -- these encode identity, not magnitude, so
 # they are chosen to stay apart at one-pixel line width and to survive the two
@@ -254,6 +256,37 @@ def gather_series(graph, ulogs, names=None):
                 "color": series_color(ci), "ls": log_style(si),
                 "unaligned": bool(why)})
     return series, problems
+
+
+# Read for every graph whatever its channels: the arming topic for the
+# first_arm alignment, a GNSS topic for the log's date (start_epoch) -- which
+# also numbers scatter markers in date order.
+BASE_TOPICS = (ARMED_TOPIC, "vehicle_gps_position", "sensor_gps")
+
+
+def graph_topics(graphs):
+    """The logged topics these graphs can read, or None if that is "all".
+
+    A parse filtered to these is enough for gather_series and everything
+    downstream of it.  None whenever a channel is unparsable or a computed
+    channel has not declared its inputs, because guessing short would draw a
+    graph that is silently missing lines.
+    """
+    want = set(BASE_TOPICS)
+    for g in graphs:
+        for ref in g.fields:
+            try:
+                topic, _mid, _name = parse_ref(ref)
+            except ValueError:
+                return None
+            if is_derived(topic):
+                inputs = derived_inputs(topic)
+                if inputs is None:
+                    return None
+                want.update(inputs)
+            else:
+                want.add(topic)
+    return frozenset(want)
 
 
 def auto_axis(graph, series):
