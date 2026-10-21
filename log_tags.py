@@ -26,7 +26,8 @@ from qt_common import FlowLayout, flow_holder
 from ulog_common import C_MUTED, C_SATS
 
 __all__ = ["TAGS_SUFFIX", "tags_path_for", "normalize_tag", "merge_tags",
-           "auto_tags", "VEHICLE_BOARDS", "SIM_TAG", "TagBar", "TagFilter"]
+           "auto_tags", "board_facts", "tags_for", "VEHICLE_BOARDS", "SIM_TAG",
+           "TagBar", "TagFilter"]
 
 TAGS_SUFFIX = "_tags.txt"
 
@@ -39,7 +40,8 @@ TAGS_SUFFIX = "_tags.txt"
 VEHICLE_BOARDS = {
     "510100390018": "grazer10",     # MAV_SYS_ID 10
     "51090033001c": "grazer12",     # MAV_SYS_ID 12
-    "510c00400042": "grazer17",     # MAV_SYS_ID 1
+    "510c00400042": "grazer17",     # MAV_SYS_ID 1, old FC (to 2026-09)
+    "5102001c0041": "grazer17",     # MAV_SYS_ID 4, v1.18 FC (2026-10-16 on)
     "510700190036": "hexi",         # Cube Orange+
 }
 # SYS_HITL != 0: the board was flying a simulator, so its uuid names a desk,
@@ -77,16 +79,29 @@ def merge_tags(*lists):
     return sorted(out.values(), key=str.casefold)
 
 
-def auto_tags(ulog):
-    """Tags this log earns from its own header: its vehicle, or SIM_TAG.
+def board_facts(ulog):
+    """{board, hitl}: what auto-tagging needs from a log's header.
 
     Needs only the header and parameters, which every parse reads whatever its
-    topic filter, so the library scan gets this for free."""
-    if int(ulog.initial_parameters.get("SYS_HITL", 0) or 0):
-        return [SIM_TAG]
+    topic filter, so the library scan gets this for free.  The browser stores
+    these in the log's record rather than the resulting tags, so a board added
+    to VEHICLE_BOARDS later tags logs already scanned -- no re-read."""
     uuid = str(ulog.msg_info_dict.get("sys_uuid", "")).lower()
-    tag = VEHICLE_BOARDS.get(uuid[-12:])
+    return {"board": uuid[-12:],
+            "hitl": bool(int(ulog.initial_parameters.get("SYS_HITL", 0) or 0))}
+
+
+def tags_for(board, hitl):
+    """Tags a log earns from its board facts: its vehicle, or SIM_TAG."""
+    if hitl:
+        return [SIM_TAG]
+    tag = VEHICLE_BOARDS.get(board or "")
     return [tag] if tag else []
+
+
+def auto_tags(ulog):
+    """Tags this log earns from its own header (see board_facts)."""
+    return tags_for(**board_facts(ulog))
 
 
 def _pill(text, tooltip="", checkable=False):

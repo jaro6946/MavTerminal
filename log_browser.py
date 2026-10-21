@@ -36,8 +36,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import matplotlib.pyplot as plt
 import ulog_faults
 import ulog_plots
-from log_tags import (TAGS_SUFFIX, TagBar, TagFilter, auto_tags, merge_tags,
-                      tags_path_for)
+from log_tags import (TAGS_SUFFIX, TagBar, TagFilter, board_facts, merge_tags,
+                      tags_for, tags_path_for)
 from qt_common import NotesBox, PlotCanvas
 from report_tab import ReportTab
 from ulog_cache import (LogCache, MeasuredULog, corruption_of, parse_ulog,
@@ -69,7 +69,8 @@ PLOT_HEIGHT = 470          # px per stacked plot; ~2 fit on a 1080p screen
 # Bumped whenever the library scan learns a new fact.  Cached rows below this
 # version are re-scanned once, rather than sitting blank in a column that did not
 # exist when they were cached.
-SCAN_VERSION = 3          # 3: auto-tags (vehicle / sim) from the log header
+SCAN_VERSION = 4          # 3: auto-tags (vehicle / sim) from the log header
+                          # 4: store the board id + SYS_HITL, not the tags
 
 # (The library sidebar became a dropdown; its width constants went with it.)
 
@@ -604,7 +605,7 @@ def scan_log(path):
     facts = corruption_of(ulog, path)
     facts["started"] = start_epoch(ulog) or 0.0
     facts["date_src"] = "gps" if facts["started"] else "none"
-    facts["auto_tags"] = auto_tags(ulog)
+    facts.update(board_facts(ulog))
     return facts
 
 
@@ -997,26 +998,40 @@ class Browser(QtWidgets.QMainWindow):
         self._rebuild_picker()
 
     def _apply_auto_tags(self, path):
-        """Add the scan's auto-tags (log_tags.auto_tags) to a log, ONCE.
+        """Add the log's auto-tags (log_tags.tags_for its board) ONCE EACH.
 
-        Once per file, not per scan: the record remembers it was done, so a
-        tag you remove by hand stays removed.  The flag lives in the size/mtime
-        stamped record, so a replaced file is tagged afresh.  Adds only --
-        tags already on the log, typed or auto, are never touched."""
+        The record keeps the list already applied (auto_applied), so a tag you
+        remove by hand stays removed -- but a tag the log earns LATER, because
+        its board was added to VEHICLE_BOARDS after it was scanned, still
+        arrives.  (A done/not-done flag here once left a new board's logs
+        untagged for good.)  The list lives in the size/mtime stamped record,
+        so a replaced file is tagged afresh.  Adds only -- tags already on the
+        log, typed or auto, are never touched."""
         key = os.path.abspath(path)
         rec = self.state["durations"].get(key) or {}
-        if rec.get("auto_tagged") or "auto_tags" not in rec:
+        if "board" not in rec:
+            return                      # not scanned at SCAN_VERSION 4 yet
+        earned = tags_for(rec["board"], rec.get("hitl"))
+        applied = rec.get("auto_applied")
+        if applied is None:             # record from the done-flag era
+            applied = rec.get("auto_tags", []) if rec.get("auto_tagged") else []
+        todo = [t for t in earned
+                if t.casefold() not in {a.casefold() for a in applied}]
+        if not earned and rec["board"]:
+            self._log(f"  no auto-tag for {os.path.basename(path)}: board "
+                      f"{rec['board']} is not in log_tags.VEHICLE_BOARDS")
+        if not todo:
             return
         have = self._tags_of(path)
-        new = merge_tags(have, rec["auto_tags"])
+        new = merge_tags(have, todo)
         if len(new) != len(have):
             self._write_tags(path, new)
             self._log(f"  auto-tagged {os.path.basename(path)}: "
-                      f"{', '.join(rec['auto_tags'])}")
+                      f"{', '.join(todo)}")
             if self._notes_path and os.path.abspath(self._notes_path) == key:
                 self.tag_bar.set_tags(new)
             self._refresh_picker_row(path)
-        self._update_record(path, auto_tagged=True)
+        self._update_record(path, auto_applied=merge_tags(applied, todo))
 
     def _write_tags(self, path, tags):
         """Persist a log's tags: sidecar, else the JSON fallback; learn them."""
@@ -1666,7 +1681,7 @@ class Browser(QtWidgets.QMainWindow):
         started = start_epoch(ulog) or 0.0
         facts = corruption_of(ulog, path)
         facts.update(started=started, date_src="gps" if started else "none",
-                     scan_v=SCAN_VERSION, auto_tags=auto_tags(ulog))
+                     scan_v=SCAN_VERSION, **board_facts(ulog))
         self._update_record(path, **facts)
         self._apply_auto_tags(path)
         if facts["corrupt_bytes"]:
