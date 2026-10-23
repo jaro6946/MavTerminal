@@ -439,6 +439,13 @@ def _gps_quality_series(ulog, ekf, mask, ctx):
                             C_NSAT, _enforced(mask, 0))
         if lim:
             out.append(lim)
+    # HDOP/VDOP as the receiver reports them, in the direction hues of the
+    # accuracy panel above; PDOP below is the combination ekf2 actually gates.
+    for key, label, color in (("vdop", "VDOP", C_VERT), ("hdop", "HDOP", C_HORZ)):
+        y = gfield(key)
+        if y is not None:
+            out.append(Series(f"gps_{key}", label, t, y, "gpspdop", color,
+                              ls=":", visible=True, lw=1.2))
     if "hdop" in g.data and "vdop" in g.data:
         pdop = gap_mask(t, np.hypot(np.asarray(g.data["hdop"], dtype=float),
                                     np.asarray(g.data["vdop"], dtype=float)), ok)
@@ -871,7 +878,7 @@ def build_altitude(ulog, ctx=None, path=""):
     ax_ratio.set_ylabel("test ratio", fontsize=9)
     ax_gacc.set_ylabel("GPS accuracy\n(m, m/s; log)", fontsize=9)
     ax_gsat.set_ylabel("satellites used", fontsize=9)
-    ax_pdop.set_ylabel("PDOP", fontsize=9)
+    ax_pdop.set_ylabel("DOP", fontsize=9)
     ax_gdrift.set_ylabel("drift on ground\n(m/s)", fontsize=9)
     ax_gjam.set_ylabel("GPS jamming\nindicator", fontsize=9)
     ax_jstate.set_ylabel("jamming / spoofing\nstate", fontsize=9)
@@ -964,7 +971,7 @@ def build_altitude(ulog, ctx=None, path=""):
                 [("amsl", "ALL sources"), ("resid", "ALL residuals"),
                  ("innov", "ALL innovations"), ("ratio", "ALL test ratios"),
                  ("gpsacc", "ALL GPS accuracy"), ("gpsnsat", "ALL satellites"),
-                 ("gpspdop", "ALL PDOP"), ("gpsdrift", "ALL drift"),
+                 ("gpspdop", "ALL DOP"), ("gpsdrift", "ALL drift"),
                  ("gpsjam", "ALL interference"), ("gpsjstate", "ALL jam/spoof state")],
                 extra=extra, on_change=refresh,
                 anchors={"amsl": _anchor("amsl"), "resid": _anchor("res"),
