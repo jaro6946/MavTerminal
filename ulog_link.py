@@ -8,7 +8,8 @@ Four stacked panels on one time axis:
                  stacked by topic with the protocol overhead on top
   2. DDS in   -- companion -> flight controller (the SE3 setpoints), same form
   3. MAVLink  -- every MAVLink instance's tx and rx as % of its own budget
-  4. band     -- connection, reconnects, dropped samples, overruns, throttling
+  4. RTT      -- round-trip time of each link's time-sync pings, by port
+  5. band     -- connection, reconnects, dropped samples, overruns, throttling
 
 Where the numbers come from
 ---------------------------
@@ -52,6 +53,18 @@ forwards over Ethernet -- the radio's own RF rate is not in the log.
 There is no per-message breakdown in the log; live, `mavlink status streams`
 in the nsh shell gives one.
 
+RTT: `timesync_status`, published by each time-sync user on every answered ping
+(DDS: the client pings the agent every UXRCE_DDS_SYNCT period; MAVLink: PX4
+sends TIMESYNC requests, and an instance only gets an RTT if the far end answers
+them -- mavlink-routerd and QGC do not, MAVROS does).  The logger keeps 1 Hz.
+The message has no port field, but it does carry source_protocol: DDS is on the
+UXRCE_DDS_CFG port, and MAVLink instances publish source UNKNOWN, so they are
+tied to a port only when exactly one MAV_x is on a serial port.  The RTT is ping
+to reply: wire time both ways PLUS USB-serial buffering on the companion (the
+FTDI latency_timer) and the far end's scheduling, so it is a link-latency
+ceiling, not a pure wire time.  Samples above 10 ms (MAX_RTT_SAMPLE) are
+rejected by the offset filter; the panel draws that gate.
+
 Acronyms: DDS = Data Distribution Service (the ROS 2 transport), uXRCE-DDS = the
 PX4 client that bridges uORB to it, XRCE = eXtremely Resource Constrained
 Environments (the wire protocol), uORB = PX4's internal publish/subscribe bus,
@@ -72,8 +85,8 @@ from ulog_common import (C_ARMED, C_BAD, C_INK, C_MUTED, C_SURFACE, PlotCtx, Ser
                          mode_key, nav_hint, spans_from_bool, style_time_axis,
                          window_values)
 
-LINK_TOPICS = ["dds_link_status", "telemetry_status", "actuator_armed",
-               "vehicle_status"]
+LINK_TOPICS = ["dds_link_status", "telemetry_status", "timesync_status",
+               "actuator_armed", "vehicle_status"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAPS_FILE = os.path.join(HERE, "dds_topic_maps.json")
@@ -100,8 +113,13 @@ C_CAP = C_BAD
 # fill the UART, and the output stream starts dropping samples.
 BUSY_PCT = 80.0
 
+# Timesync rejects samples with an RTT at or above this (src/lib/timesync
+# MAX_RTT_SAMPLE); a link above it never updates its clock offset.
+RTT_GATE_MS = 10.0
+C_DDS_RTT = "#2a78d6"
+
 # --- layout, in inches (see ulog_accel for why this is not in fractions) -----
-PANEL_IN = {"out": 2.6, "in": 2.1, "mav": 1.9}
+PANEL_IN = {"out": 2.6, "in": 2.1, "mav": 1.9, "rtt": 1.9}
 GAP_IN = 0.48
 TOP_IN = 0.95
 BOTTOM_IN = 1.35
@@ -385,6 +403,60 @@ def _mav_series(ulog, ctx):
     return series
 
 
+# --- round-trip time ----------------------------------------------------------------
+
+# timesync_status.source_protocol
+TS_UNKNOWN, TS_MAVLINK, TS_DDS = 0, 1, 2
+
+
+def _dds_port(ulog):
+    cfg = int(ulog.initial_parameters.get("UXRCE_DDS_CFG", 0) or 0)
+    if cfg in PORT_BAUD:
+        return PORT_BAUD[cfg][0]
+    return "Ethernet (UDP)" if cfg == 1000 else "port unknown"
+
+
+def _rtt_series(ulog, ctx):
+    """RTT in ms per timesync_status instance, labelled with its port.
+
+    Returns (series, stats) with stats = [(label, median, p95, rejected frac)]
+    for the subtitle and band."""
+    series, stats = [], []
+    mav_ports = _mav_ports(ulog)
+    for m in _instances(ulog, "timesync_status"):
+        d = _get(ulog, "timesync_status", m)
+        if d is None or "round_trip_time" not in d.data:
+            continue
+        rtt = _arr(d, "round_trip_time") / 1000.0
+        if not rtt.size:
+            continue
+        t = _time_min(ulog, d)
+        src = int(_arr(d, "source_protocol")[-1]) if "source_protocol" in d.data else TS_UNKNOWN
+        if src == TS_DDS:
+            label, color = f"DDS on {_dds_port(ulog)}", C_DDS_RTT
+        else:
+            # PX4's MavlinkTimesync publishes as UNKNOWN; DDS is the only other user
+            if len(mav_ports) == 1:
+                x, port, _cap, _b = mav_ports[0]
+                label = f"MAVLink on {port} (MAV_{x})"
+            else:
+                label = "MAVLink, port unknown"
+                ctx.note(f"timesync_status[{m}] is a MAVLink link but "
+                         f"{len(mav_ports)} MAV_x serial ports are enabled and "
+                         f"the message does not say which one")
+            color = C_LINK
+        rej = float(np.mean(rtt >= RTT_GATE_MS))
+        stats.append((label, float(np.median(rtt)), float(np.percentile(rtt, 95)), rej, t, rtt))
+        series.append(Series(f"timesync_status[{m}].round_trip_time",
+                             f"RTT {label}  (median {np.median(rtt):.1f} ms)",
+                             t, rtt, "rtt", color, lw=1.4, visible=True,
+                             drawstyle="steps-post"))
+    if not series:
+        ctx.note("no timesync_status in this log -- no round-trip time: the DDS "
+                 "client never synchronised, and no MAVLink peer answers TIMESYNC")
+    return series, stats
+
+
 # --- band ------------------------------------------------------------------------
 
 def _counter_spans(t, counter, hold):
@@ -393,8 +465,12 @@ def _counter_spans(t, counter, hold):
             for i in np.flatnonzero(np.diff(c) > 0) + 1]
 
 
-def _band_rows(ulog, dds, hold):
+def _band_rows(ulog, dds, rtt_stats, hold):
     rows = [("armed", armed_spans(ulog), C_ARMED)]
+    for label, _med, _p95, rej, t, rtt in rtt_stats:
+        if rej > 0:
+            rows.append((f"{label}: RTT >= {RTT_GATE_MS:.0f} ms (sync rejects it)",
+                         spans_from_bool(t, rtt >= RTT_GATE_MS), C_BAD))
     if dds is not None:
         d, t = dds["d"], dds["t"]
         if "connected" in d.data:
@@ -455,20 +531,23 @@ def build_link(ulog, ctx=None, path=""):
     import matplotlib.pyplot as plt
 
     ctx = ctx or PlotCtx()
-    if not (has_topic(ulog, "dds_link_status") or has_topic(ulog, "telemetry_status")):
-        ctx.note("no dds_link_status or telemetry_status in this log")
+    if not (has_topic(ulog, "dds_link_status") or has_topic(ulog, "telemetry_status")
+            or has_topic(ulog, "timesync_status")):
+        ctx.note("no dds_link_status, telemetry_status or timesync_status in this log")
         return None
 
     dur = duration_min(ulog) or 1.0
     hold = dur * MIN_EVENT_FRAC
     dds = _dds_series(ulog, ctx)
     mav = _mav_series(ulog, ctx)
-    series = (dds["tx"] + dds["rx"] if dds else []) + mav
+    rtt, rtt_stats = _rtt_series(ulog, ctx)
+    series = (dds["tx"] + dds["rx"] if dds else []) + mav + rtt
     if not series:
         return None
-    rows = _band_rows(ulog, dds, hold)
+    rows = _band_rows(ulog, dds, rtt_stats, hold)
     # Without dds_link_status the two DDS panels would be empty boxes.
-    keys = (["out", "in"] if dds else []) + (["mav"] if mav else [])
+    keys = ((["out", "in"] if dds else []) + (["mav"] if mav else [])
+            + (["rtt"] if rtt else []))
     panel_in = [(k, PANEL_IN[k]) for k in keys]
 
     band_in = min(max(len(rows) * BAND_ROW_IN + BAND_PAD_IN, BAND_MIN_IN), BAND_MAX_IN)
@@ -505,8 +584,12 @@ def build_link(ulog, ctx=None, path=""):
     # 100% = the link is full.  Drawn as a line, not a Series: the axes are
     # fitted to the data, so on a quiet link it is off screen and the usage is
     # readable; the right-hand axis and the subtitle still state the capacity.
-    for a in panels:
-        a.axhline(100.0, color=C_CAP, lw=1.1, ls="--", alpha=0.8, zorder=1)
+    for k in keys:
+        if k != "rtt":
+            axis_of[k].axhline(100.0, color=C_CAP, lw=1.1, ls="--", alpha=0.8, zorder=1)
+    if rtt:
+        axis_of["rtt"].axhline(RTT_GATE_MS, color=C_CAP, lw=1.1, ls="--",
+                               alpha=0.8, zorder=1)
 
     stack_art = []
     if dds:
@@ -526,7 +609,7 @@ def build_link(ulog, ctx=None, path=""):
     for s in series:
         (line,) = axis_of[s.group].plot(
             s.t, s.y, color=s.color, ls=s.ls, lw=s.lw, label=s.label,
-            drawstyle="steps-post" if s.group != "mav" else "default",
+            drawstyle="steps-post" if s.group not in ("mav", "rtt") else "default",
             alpha=s.alpha, zorder=s.zorder if s.zorder is not None else 3)
         line.set_visible(s.visible)
         s.line = line
@@ -541,7 +624,8 @@ def build_link(ulog, ctx=None, path=""):
     style_time_axis(ax_band)
     ylabels = {"out": "DDS out: FC -> companion\n(% of UART)",
                "in": "DDS in: companion -> FC\n(% of UART)",
-               "mav": "MAVLink\n(% of UART, dashed = budget)"}
+               "mav": "MAVLink\n(% of UART, dashed = budget)",
+               "rtt": f"round-trip time (ms)\n(dashed = {RTT_GATE_MS:.0f} ms sync gate)"}
     for k in keys:
         axis_of[k].set_ylabel(ylabels[k], fontsize=9)
 
@@ -566,10 +650,13 @@ def build_link(ulog, ctx=None, path=""):
              color=C_MUTED, fontsize=9, ha="left")
 
     def _fit(ax, group):
-        """Floor at 0: these are rates, and the stack's base must stay on screen."""
+        """Floor at 0: these are rates, and the stack's base must stay on screen.
+        The RTT axis always keeps its sync gate in view, so headroom reads off it."""
         lines = [s.line for s in series if s.group == group]
         v = window_values(ax, lines)
         hi = float(v.max()) if v.size else 1.0
+        if group == "rtt":
+            hi = max(hi, RTT_GATE_MS)
         ax.set_ylim(0.0, max(hi, 1.0) * 1.08)
 
     def refresh():
@@ -594,7 +681,7 @@ def build_link(ulog, ctx=None, path=""):
 
     check_panel(fig, [0.012, cb_bot, 0.200, cb_top - cb_bot], series,
                 [("out", "ALL DDS out"), ("in", "ALL DDS in"),
-                 ("mav", "ALL MAVLink")],
+                 ("mav", "ALL MAVLink"), ("rtt", "ALL round-trip")],
                 extra=extra, on_change=refresh,
                 anchors={k: _anchor(k) for k in keys})
     refresh()
