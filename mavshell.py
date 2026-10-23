@@ -98,7 +98,8 @@ def autodetect_port():
 # --- Arguments -------------------------------------------------------------
 ap = argparse.ArgumentParser(description="MAVLink terminal / batch tool")
 ap.add_argument("-p", "--port", default=os.environ.get("MAV_PORT") or autodetect_port(),
-                help="serial port (default: $MAV_PORT or auto-detected FC)")
+                help="serial port (default: $MAV_PORT or auto-detected FC); "
+                     "'companion' = through the RB5's mavlink-routerd over adb")
 ap.add_argument("-b", "--baud", type=int, default=int(os.environ.get("MAV_BAUD", "57600")),
                 help="baud rate (default: $MAV_BAUD or 57600)")
 ap.add_argument("-c", "--cmd", action="append", default=[],
@@ -143,6 +144,10 @@ if not OFFLINE:
         sys.exit("No flight-controller serial port found. "
                  "Plug in the FC or pass --port <PORT>.")
 
+    # 'companion' -> adb forward to the RB5's mavlink-routerd (FC TELEM1); slower
+    # than USB but immune to the FC's USB link wedging on big transfers.
+    import pull_log
+    PORT = pull_log.resolve_port(PORT)
     print(f"Connecting to {PORT} @ {BAUD}...")
     try:
         mav = mavutil.mavlink_connection(PORT, baud=BAUD)
