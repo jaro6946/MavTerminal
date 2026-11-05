@@ -480,13 +480,15 @@ class BagTab(QtWidgets.QWidget):
         self.btn_play.setFixedWidth(44)
         self.btn_play.clicked.connect(self._toggle_play)
         tr.addWidget(self.btn_play)
-        for label, delta, tip in (("−5 s", -5.0, "Back 5 s"),
+        for label, delta, tip in (("−5 s", -5.0, "Back 5 s and play"),
+                                  ("−0.5 s", -0.5, "Back 0.5 s and play"),
                                   ("◀|", None, "Back one frame (,)"),
                                   ("|▶", None, "Forward one frame (.)"),
-                                  ("+5 s", 5.0, "Forward 5 s")):
+                                  ("+0.5 s", 0.5, "Forward 0.5 s and play"),
+                                  ("+5 s", 5.0, "Forward 5 s and play")):
             btn = QtWidgets.QPushButton(label)
             btn.setToolTip(tip)
-            btn.setFixedWidth(52)
+            btn.setFixedWidth(62 if "." in label else 52)
             if delta is not None:
                 btn.clicked.connect(lambda _=False, d=delta: self._nudge(d))
             elif label == "◀|":
@@ -741,7 +743,7 @@ class BagTab(QtWidgets.QWidget):
             self.player.play()
 
     def _nudge(self, seconds):
-        """±5 s jumps and PLAYS from there -- a skip, not a frame step.  (Frame
+        """±5 s / ±0.5 s jump and PLAY from there -- a skip, not a frame step.  (Frame
         steps and bookmark selection park paused; those are for inspecting.)"""
         if not self.video:
             return

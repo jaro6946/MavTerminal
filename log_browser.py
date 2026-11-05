@@ -739,7 +739,16 @@ class Browser(QtWidgets.QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         self.tabs = QtWidgets.QTabWidget()
-        outer.addWidget(self.tabs, 1)
+        # Tabs over the console in a splitter: drag the divider down to give the
+        # tabs (the Bags video above all) more height, or all the way to hide
+        # the console.  Sizes persist in log_browser.json.
+        self.vsplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.vsplit.setHandleWidth(7)
+        self.vsplit.setStyleSheet(
+            "QSplitter::handle:vertical { background: #d6d5d0; }"
+            "QSplitter::handle:vertical:hover { background: #a9a8a3; }")
+        self.vsplit.addWidget(self.tabs)
+        outer.addWidget(self.vsplit, 1)
 
         # Everything built below is the BROWSE tab -- one log, its plots.
         # The Report tab is a separate widget, added once the library tree it
@@ -853,9 +862,16 @@ class Browser(QtWidgets.QMainWindow):
         # would only halve the room each of them gets.
         self.console = QtWidgets.QPlainTextEdit()
         self.console.setReadOnly(True)
-        self.console.setMaximumHeight(110)
         self.console.setStyleSheet("font-family: monospace; font-size: 11px;")
-        outer.addWidget(self.console)
+        self.vsplit.addWidget(self.console)
+        self.vsplit.setCollapsible(0, False)       # the tabs never vanish
+        self.vsplit.setStretchFactor(0, 1)         # window resizes go to the tabs
+        self.vsplit.setStretchFactor(1, 0)
+        sizes = self.state.get("console_split")
+        self.vsplit.setSizes(sizes if isinstance(sizes, list) and len(sizes) == 2
+                             else [10000, 110])
+        self.vsplit.splitterMoved.connect(
+            lambda *_: self.state.__setitem__("console_split", self.vsplit.sizes()))
 
         # The tree is still the MODEL -- it holds one row per log with the six
         # columns, the check states and the per-cell colours, and every method

@@ -448,9 +448,12 @@ per day, and lets you drop **bookmarks**: a point in time with a title and notes
   with the venv stripped from its environment (it needs the system `python3`
   for ROS 2 Jazzy) and streams the output into the console.
 - **Transport**: Space or a click on the video plays and pauses; `,` and `.`
-  step one frame (100 ms at the script's 10 fps) and stay paused; the ±5 s
-  buttons jump and keep playing (they start playback if paused); there is a
-  speed menu, and a scrubber that jumps to wherever you click.
+  step one frame (100 ms at the script's 10 fps) and stay paused; the ±5 s and
+  ±0.5 s buttons jump and keep playing (they start playback if paused); there
+  is a speed menu, and a scrubber that jumps to wherever you click.
+- **More video height**: the console under the tabs sits below a draggable
+  divider (all tabs share it). Drag it down to shrink or hide the console; the
+  position is remembered.
 - **+ Add bookmark** (on the transport row) bookmarks the current position and
   puts the cursor in its title. Every bookmark is a triangle under the
   scrubber; the selected one is larger and darker.
