@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""bag_tab.py -- the browser's Bags tab: play a day's bag video and mark sections.
+"""bag_tab.py -- the browser's Bags tab: play a day's bag video and bookmark it.
 
 A "bag" here is one folder under `Log Analysis/Bags/bag analysis/`, holding the
 combined camera + data-panel MP4 that `Bags/make_bag_video/make_bag_video.sh`
-renders from that day's ROS 2 bags.  The tab plays it and lets you mark time
-ranges of interest -- start, end, title, notes -- which list on the right;
-selecting one parks the video, PAUSED, on that section's first frame.
+renders from that day's ROS 2 bags.  The tab plays it and lets you drop
+BOOKMARKS -- a point in time with a title and notes -- which list on the right;
+selecting one parks the video, PAUSED, on that bookmark's frame.
 
-Sections live in a sidecar beside the video, `<video stem>_sections.json`, the
-same convention as the logs' `_notes.txt` / `_tags.txt`: the annotation travels
-with the file it annotates, and a script can read it without the GUI.
+Bookmarks live in a sidecar beside the video, `<video stem>_bookmarks.json`,
+the same convention as the logs' `_notes.txt` / `_tags.txt`: the annotation
+travels with the file it annotates, and a script can read it without the GUI.
 
 A date folder under `Bags/` that has bags but no video yet is listed too, with
 a "Make video" button that runs make_bag_video.sh and streams its output into
@@ -20,7 +20,7 @@ widget renders through a native overlay that `grab()` cannot see (a screenshot
 of it is solid black), so it could not be checked headlessly.  A
 QAbstractVideoSurface receives every decoded frame as memory instead; painting
 that is a few lines, and a paused seek delivers exactly one frame -- which is
-precisely the "park on the section start" behaviour this tab needs.
+precisely the "park on the bookmark" behaviour this tab needs.
 
 Acronyms: GUI = graphical user interface, ROS = Robot Operating System,
 WSLg = Windows Subsystem for Linux GUI support.
@@ -34,18 +34,17 @@ from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets
 
 from ulog_common import C_BAD, C_MUTED
 
-__all__ = ["BagTab", "scan_bags", "script_env", "sections_path_for", "load_sections",
-           "save_sections", "fmt_time"]
+__all__ = ["BagTab", "scan_bags", "script_env", "bookmarks_path_for",
+           "load_bookmarks", "save_bookmarks", "fmt_time"]
 
 ANALYSIS_DIR = "bag analysis"
 SCRIPT_REL = os.path.join("make_bag_video", "make_bag_video.sh")
 PREFERRED_VIDEO = "grazer10_all_bags_combined.mp4"
-SECTIONS_SUFFIX = "_sections.json"
+BOOKMARKS_SUFFIX = "_bookmarks.json"
 DEFAULT_FPS = 10.0            # make_bag_video renders a fixed 10 fps grid
 
-C_SECTION = "#2a78d6"         # a section span on the scrubber
-C_SECTION_SEL = "#0b4fa8"     # the selected one
-C_MARK = "#e08a00"            # the pending in/out marks
+C_BOOKMARK = "#2a78d6"        # a bookmark tick on the scrubber
+C_BOOKMARK_SEL = "#0b4fa8"    # the selected one
 
 _DATE_RE = re.compile(r"^(\d{4})_(\d{2})_(\d{2})$")
 # An analysis folder covers one date, or a day range within a month:
@@ -132,38 +131,37 @@ def scan_bags(bags_root):
     return out
 
 
-def sections_path_for(video):
-    return os.path.splitext(video)[0] + SECTIONS_SUFFIX
+def bookmarks_path_for(video):
+    return os.path.splitext(video)[0] + BOOKMARKS_SUFFIX
 
 
-def load_sections(video):
-    """[{'title','start_s','end_s','notes'}] sorted by start; [] if none/unreadable."""
+def load_bookmarks(video):
+    """[{'title','t_s','notes'}] sorted by time; [] if none/unreadable."""
     try:
-        with open(sections_path_for(video)) as f:
+        with open(bookmarks_path_for(video)) as f:
             data = json.load(f)
     except (OSError, ValueError):
         return []
     out = []
-    for s in data.get("sections", []):
+    for b in data.get("bookmarks", []):
         try:
-            out.append({"title": str(s.get("title", "")),
-                        "start_s": float(s["start_s"]),
-                        "end_s": float(s["end_s"]),
-                        "notes": str(s.get("notes", ""))})
+            out.append({"title": str(b.get("title", "")),
+                        "t_s": float(b["t_s"]),
+                        "notes": str(b.get("notes", ""))})
         except (KeyError, TypeError, ValueError):
             continue
-    out.sort(key=lambda s: (s["start_s"], s["end_s"]))
+    out.sort(key=lambda b: b["t_s"])
     return out
 
 
-def save_sections(video, sections):
+def save_bookmarks(video, bookmarks):
     """Atomic: write a temp file and rename over, so a crash never leaves half a JSON."""
-    path = sections_path_for(video)
+    path = bookmarks_path_for(video)
     tmp = path + ".tmp"
     data = {"video": os.path.basename(video),
-            "sections": [{"title": s["title"], "start_s": round(s["start_s"], 3),
-                          "end_s": round(s["end_s"], 3), "notes": s["notes"]}
-                         for s in sections]}
+            "bookmarks": [{"title": b["title"], "t_s": round(b["t_s"], 3),
+                           "notes": b["notes"]}
+                          for b in sorted(bookmarks, key=lambda b: b["t_s"])]}
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
@@ -273,20 +271,19 @@ class VideoView(QtWidgets.QWidget):
         super().mousePressEvent(ev)
 
 
-class SectionSlider(QtWidgets.QSlider):
-    """The scrubber, with every section drawn on its groove.
+class BookmarkSlider(QtWidgets.QSlider):
+    """The scrubber, with a tick under the groove for every bookmark.
 
-    Painted INTO the slider rather than as a strip beside it so the spans line up
-    with the handle exactly -- the groove's pixel extent comes from the style,
-    and a separate widget would have to guess its margins.
+    Painted INTO the slider rather than as a strip beside it so the ticks line
+    up with the handle exactly -- the groove's pixel extent comes from the
+    style, and a separate widget would have to guess its margins.
     """
 
     def __init__(self, parent=None):
         super().__init__(QtCore.Qt.Horizontal, parent)
-        self.spans = []           # [(start_ms, end_ms)]
+        self.ticks = []           # [ms]
         self.selected = -1
-        self.marks = (None, None)  # pending in/out, ms
-        self.setMinimumHeight(26)
+        self.setMinimumHeight(28)
 
     def _x(self, ms, groove):
         span = max(1, self.maximum() - self.minimum())
@@ -323,24 +320,24 @@ class SectionSlider(QtWidgets.QSlider):
         g = QtCore.QRect(groove.left() + half, groove.top(),
                          max(1, groove.width() - 2 * half), groove.height())
         p = QtGui.QPainter(self)
-        y, h = self.height() - 6, 5
-        for i, (a, b) in enumerate(self.spans):
-            x0, x1 = self._x(a, g), self._x(b, g)
-            col = QtGui.QColor(C_SECTION_SEL if i == self.selected else C_SECTION)
-            if i != self.selected:
-                col.setAlpha(150)
-            p.fillRect(QtCore.QRectF(x0, y, max(2.0, x1 - x0), h), col)
-        p.setPen(QtGui.QPen(QtGui.QColor(C_MARK), 2))
-        for ms in self.marks:
-            if ms is not None:
-                x = self._x(ms, g)
-                p.drawLine(QtCore.QPointF(x, 1), QtCore.QPointF(x, self.height() - 1))
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setPen(QtCore.Qt.NoPen)
+        # An upward triangle under the groove, its point at the bookmark time.
+        y0 = self.height() - 1
+        for i, ms in enumerate(self.ticks):
+            x = self._x(ms, g)
+            sel = i == self.selected
+            w, h = (6, 9) if sel else (4, 7)
+            p.setBrush(QtGui.QColor(C_BOOKMARK_SEL if sel else C_BOOKMARK))
+            p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(x, y0 - h),
+                                           QtCore.QPointF(x - w, y0),
+                                           QtCore.QPointF(x + w, y0)]))
         p.end()
 
 
 class SideTab(QtWidgets.QPushButton):
     """A narrow full-height button with its label running bottom-to-top, like
-    a docked-panel tab -- what is left of the sections panel when collapsed."""
+    a docked-panel tab -- what is left of the bookmarks panel when collapsed."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -358,7 +355,7 @@ class SideTab(QtWidgets.QPushButton):
         f = p.font()
         f.setBold(True)
         p.setFont(f)
-        p.setPen(QtGui.QColor(C_SECTION_SEL))
+        p.setPen(QtGui.QColor(C_BOOKMARK_SEL))
         # The arrow is drawn UPRIGHT at the top: a glyph inside rotated text
         # turns with it, so a "◂" there would not point left.
         p.drawText(QtCore.QRect(0, 6, self.width(), 20), QtCore.Qt.AlignCenter, "◂")
@@ -372,7 +369,7 @@ class SideTab(QtWidgets.QPushButton):
 # --- the tab ---------------------------------------------------------------
 
 class BagTab(QtWidgets.QWidget):
-    """Bag picker + video player + section list.  See the module docstring."""
+    """Bag picker + video player + bookmark list.  See the module docstring."""
 
     def __init__(self, bags_root, log, state=None, parent=None):
         super().__init__(parent)
@@ -381,9 +378,7 @@ class BagTab(QtWidgets.QWidget):
         self.state = state if state is not None else {}
         self.entries = []
         self.video = None             # path of the loaded MP4
-        self.sections = []
-        self._mark_in = None          # seconds
-        self._mark_out = None
+        self.bookmarks = []
         self._fps = DEFAULT_FPS
         self._scrubbing = False
         self._suppress_select = False
@@ -444,7 +439,7 @@ class BagTab(QtWidgets.QWidget):
         bh.addWidget(self.busy)
         v.addWidget(bar)
 
-        # Video on the left, sections panel on the right.  The video is 1280 x
+        # Video on the left, bookmarks panel on the right.  The video is 1280 x
         # 1324 (data panel stacked over the camera), taller than wide, so it is
         # height-limited and a side panel mostly takes width the letterboxing
         # was wasting anyway.  The panel still collapses (Hide ▸) for when
@@ -458,13 +453,13 @@ class BagTab(QtWidgets.QWidget):
         body.setSpacing(0)
         body.addWidget(split, 1)
         self.btn_show = SideTab()
-        self.btn_show.setToolTip("Show the sections panel")
+        self.btn_show.setToolTip("Show the bookmarks panel")
         self.btn_show.clicked.connect(lambda: self._set_strip_open(True))
         body.addWidget(self.btn_show)
         v.addLayout(body, 1)
         self.split = split
 
-        # left: video + transport + marking
+        # left: video + transport
         left = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(left)
         lv.setContentsMargins(10, 0, 4, 6)
@@ -472,7 +467,7 @@ class BagTab(QtWidgets.QWidget):
         self.view.clicked.connect(self._toggle_play)
         lv.addWidget(self.view, 1)
 
-        self.slider = SectionSlider()
+        self.slider = BookmarkSlider()
         self.slider.setRange(0, 0)
         self.slider.sliderPressed.connect(lambda: setattr(self, "_scrubbing", True))
         self.slider.sliderReleased.connect(self._scrub_done)
@@ -502,6 +497,12 @@ class BagTab(QtWidgets.QWidget):
         self.time_lbl = QtWidgets.QLabel("0:00.0 / 0:00.0")
         self.time_lbl.setStyleSheet("font-family: monospace; padding: 0 8px;")
         tr.addWidget(self.time_lbl)
+        # On the transport row: one button no longer earns a row of its own,
+        # and that row is video height.
+        self.btn_add = QtWidgets.QPushButton("+ Add bookmark")
+        self.btn_add.setToolTip("Bookmark the current position")
+        self.btn_add.clicked.connect(self._add_bookmark)
+        tr.addWidget(self.btn_add)
         tr.addStretch(1)
         tr.addWidget(QtWidgets.QLabel("speed"))
         self.speed = QtWidgets.QComboBox()
@@ -513,33 +514,14 @@ class BagTab(QtWidgets.QWidget):
         tr.addWidget(self.speed)
         lv.addLayout(tr)
 
-        mk = QtWidgets.QHBoxLayout()
-        self.btn_in = QtWidgets.QPushButton("Mark start  [")
-        self.btn_in.setToolTip("Mark the current position as a section start ([)")
-        self.btn_in.clicked.connect(self._mark_start)
-        mk.addWidget(self.btn_in)
-        self.btn_out = QtWidgets.QPushButton("Mark end  ]")
-        self.btn_out.setToolTip("Mark the current position as a section end (])")
-        self.btn_out.clicked.connect(self._mark_end)
-        mk.addWidget(self.btn_out)
-        self.mark_lbl = QtWidgets.QLabel()
-        self.mark_lbl.setStyleSheet("font-family: monospace; padding: 0 8px;")
-        mk.addWidget(self.mark_lbl)
-        mk.addStretch(1)
-        self.btn_add = QtWidgets.QPushButton("+ Add section")
-        self.btn_add.setToolTip(
-            "Make a section from the marks (no end mark = the current position)")
-        self.btn_add.clicked.connect(self._add_section)
-        mk.addWidget(self.btn_add)
-        lv.addLayout(mk)
         split.addWidget(left)
 
-        # right: section list over the editor
+        # right: bookmark list over the editor
         right = QtWidgets.QWidget()
         rv = QtWidgets.QVBoxLayout(right)
         rv.setContentsMargins(4, 0, 10, 6)
         hrow = QtWidgets.QHBoxLayout()
-        hdr = QtWidgets.QLabel("Sections")
+        hdr = QtWidgets.QLabel("Bookmarks")
         hdr.setStyleSheet("font-weight: 600;")
         hrow.addWidget(hdr)
         hrow.addStretch(1)
@@ -552,39 +534,32 @@ class BagTab(QtWidgets.QWidget):
         self.list.setStyleSheet("font-family: monospace;")
         self.list.currentRowChanged.connect(self._row_changed)
         # Clicking the row that is ALREADY selected changes no row, so it would
-        # not re-seek; itemClicked covers "take me back to the start of this one".
+        # not re-seek; itemClicked covers "take me back to this one".
         self.list.itemClicked.connect(lambda _it: self._goto_selected())
         rv.addWidget(self.list, 1)
 
-        self.editor = QtWidgets.QGroupBox("Selected section")
+        self.editor = QtWidgets.QGroupBox("Selected bookmark")
         form = QtWidgets.QFormLayout(self.editor)
         self.ed_title = QtWidgets.QLineEdit()
         self.ed_title.setPlaceholderText("title")
         self.ed_title.textEdited.connect(self._edited)
         form.addRow("Title", self.ed_title)
-        self.ed_start = QtWidgets.QLabel()
-        self.ed_end = QtWidgets.QLabel()
-        for lbl, which in ((self.ed_start, "start"), (self.ed_end, "end")):
-            lbl.setStyleSheet("font-family: monospace;")
-            row = QtWidgets.QHBoxLayout()
-            row.addWidget(lbl, 1)
-            b = QtWidgets.QPushButton("= playhead")
-            b.setToolTip(f"Move this section's {which} to the current position")
-            b.clicked.connect(lambda _=False, w=which: self._set_edge(w))
-            row.addWidget(b)
-            go = QtWidgets.QPushButton("go")
-            go.setToolTip(f"Park the video on this section's {which}")
-            go.setFixedWidth(40)
-            go.clicked.connect(lambda _=False, w=which: self._goto_edge(w))
-            row.addWidget(go)
-            form.addRow("Start" if which == "start" else "End", row)
+        self.ed_time = QtWidgets.QLabel()
+        self.ed_time.setStyleSheet("font-family: monospace;")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.ed_time, 1)
+        b = QtWidgets.QPushButton("= playhead")
+        b.setToolTip("Move this bookmark to the current position")
+        b.clicked.connect(self._set_time)
+        row.addWidget(b)
+        form.addRow("Time", row)
         self.ed_notes = QtWidgets.QPlainTextEdit()
         self.ed_notes.setPlaceholderText("notes")
         self.ed_notes.textChanged.connect(self._notes_changed)
         form.addRow("Notes", self.ed_notes)
-        self.btn_del = QtWidgets.QPushButton("Delete section")
+        self.btn_del = QtWidgets.QPushButton("Delete bookmark")
         self.btn_del.setStyleSheet(f"color: {C_BAD};")
-        self.btn_del.clicked.connect(self._delete_section)
+        self.btn_del.clicked.connect(self._delete_bookmark)
         form.addRow("", self.btn_del)
         rv.addWidget(self.editor, 2)
         split.addWidget(right)
@@ -606,18 +581,19 @@ class BagTab(QtWidgets.QWidget):
 
         # Shortcuts are scoped to this tab.  Text fields still get their own keys:
         # QLineEdit / QPlainTextEdit claim printable characters (incl. space,
-        # '[', ',') through ShortcutOverride before a shortcut can fire.
-        for key, slot in (("Space", self._toggle_play), ("[", self._mark_start),
-                          ("]", self._mark_end), (",", lambda: self._step(-1)),
+        # ',') through ShortcutOverride before a shortcut can fire.
+        for key, slot in (("Space", self._toggle_play),
+                          (",", lambda: self._step(-1)),
                           (".", lambda: self._step(+1))):
             sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), self)
             sc.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(slot)
 
-        self._update_marks()
         self._fill_editor(None)
         self._set_media_enabled(False)
-        self._set_strip_open(bool(self.state.get("bag_sections_open", True)))
+        # Own key: the panel used to be the "sections" one.
+        self.state.pop("bag_sections_open", None)
+        self._set_strip_open(bool(self.state.get("bag_bookmarks_open", True)))
 
     # -- picker
     def _current_name(self):
@@ -629,8 +605,8 @@ class BagTab(QtWidgets.QWidget):
         self.picker.clear()
         for e in self.entries:
             if e["video"]:
-                n = len(load_sections(e["video"]))
-                extra = f"{n} section{'s' if n != 1 else ''}" if n else ""
+                n = len(load_bookmarks(e["video"]))
+                extra = f"{n} bookmark{'s' if n != 1 else ''}" if n else ""
                 txt = f"{e['name']:<16} {e['n_bags']:>2} bags   video   {extra}"
             else:
                 txt = f"{e['name']:<16} {e['n_bags']:>2} bags   no video yet"
@@ -669,11 +645,9 @@ class BagTab(QtWidgets.QWidget):
     # -- media
     def _load_video(self, e):
         self.player.stop()
-        self._mark_in = self._mark_out = None
-        self._update_marks()
         if not e["video"]:
             self.video = None
-            self.sections = []
+            self.bookmarks = []
             self._rebuild_list()
             self.player.setMedia(QtMultimedia.QMediaContent())
             self.view.clear(f"{e['name']}: {e['n_bags']} bags, no video yet.\n\n"
@@ -682,21 +656,20 @@ class BagTab(QtWidgets.QWidget):
             self.status.setText("")
             return
         self.video = e["video"]
-        self.sections = load_sections(self.video)
+        self.bookmarks = load_bookmarks(self.video)
         self._rebuild_list()
         self.view.clear("loading…")
         self._pending_seek = 0
         self.player.setMedia(QtMultimedia.QMediaContent(
             QtCore.QUrl.fromLocalFile(self.video)))
         self._set_media_enabled(True)
-        self.status.setText(f"{self.video}   ·   sections → "
-                            f"{os.path.basename(sections_path_for(self.video))}")
+        self.status.setText(f"{self.video}   ·   bookmarks → "
+                            f"{os.path.basename(bookmarks_path_for(self.video))}")
         self._log(f"[bags] {e['name']}: {os.path.basename(self.video)}, "
-                  f"{len(self.sections)} section(s)")
+                  f"{len(self.bookmarks)} bookmark(s)")
 
     def _set_media_enabled(self, on):
-        for w in (self.slider, self.btn_play, self.btn_in, self.btn_out,
-                  self.btn_add, self.speed):
+        for w in (self.slider, self.btn_play, self.btn_add, self.speed):
             w.setEnabled(on)
 
     def _on_status(self, status):
@@ -769,7 +742,7 @@ class BagTab(QtWidgets.QWidget):
 
     def _nudge(self, seconds):
         """±5 s jumps and PLAYS from there -- a skip, not a frame step.  (Frame
-        steps and section selection park paused; those are for inspecting.)"""
+        steps and bookmark selection park paused; those are for inspecting.)"""
         if not self.video:
             return
         dur = self.player.duration()
@@ -782,55 +755,18 @@ class BagTab(QtWidgets.QWidget):
     def _step(self, n):
         self._park(self.player.position() + n * 1000.0 / self._fps)
 
-    # -- marks
+    # -- bookmarks
     def _pos_s(self):
         return self.player.position() / 1000.0
 
-    def _mark_start(self):
+    def _add_bookmark(self):
         if not self.video:
             return
-        self._mark_in = self._pos_s()
-        if self._mark_out is not None and self._mark_out <= self._mark_in:
-            self._mark_out = None
-        self._update_marks()
-
-    def _mark_end(self):
-        if not self.video:
-            return
-        self._mark_out = self._pos_s()
-        if self._mark_in is not None and self._mark_in >= self._mark_out:
-            self._mark_in = None
-        self._update_marks()
-
-    def _update_marks(self):
-        self.mark_lbl.setText(f"start {fmt_time(self._mark_in)}   "
-                              f"end {fmt_time(self._mark_out)}")
-        to_ms = lambda s: None if s is None else int(s * 1000)
-        self.slider.marks = (to_ms(self._mark_in), to_ms(self._mark_out))
-        self.slider.update()
-
-    def _add_section(self):
-        if not self.video:
-            return
-        start = self._mark_in
-        end = self._mark_out if self._mark_out is not None else self._pos_s()
-        if start is None:
-            QtWidgets.QMessageBox.information(
-                self, "Add section", "Mark a start first ([ or “Mark start”).")
-            return
-        if end <= start:
-            QtWidgets.QMessageBox.information(
-                self, "Add section",
-                f"The end ({fmt_time(end)}) must come after the start "
-                f"({fmt_time(start)}).  Mark an end, or move past the start.")
-            return
-        sec = {"title": f"Section {len(self.sections) + 1}",
-               "start_s": start, "end_s": end, "notes": ""}
-        self.sections.append(sec)
-        self._mark_in = self._mark_out = None
-        self._update_marks()
+        bm = {"title": f"Bookmark {len(self.bookmarks) + 1}",
+              "t_s": self._pos_s(), "notes": ""}
+        self.bookmarks.append(bm)
         self._save()
-        self._rebuild_list(select=sec, seek=False)
+        self._rebuild_list(select=bm, seek=False)
         # Straight into naming it: the default title is a placeholder, so the
         # panel has to be open for that.
         self._set_strip_open(True)
@@ -841,141 +777,120 @@ class BagTab(QtWidgets.QWidget):
         self.ed_title.setFocus()
         self.ed_title.selectAll()
 
-    # -- section list
-    def _sort(self):
-        self.sections.sort(key=lambda s: (s["start_s"], s["end_s"]))
-
-    def _row_text(self, s):
-        dur = s["end_s"] - s["start_s"]
-        title = s["title"] or "(untitled)"
-        mark = "  ✎" if s["notes"].strip() else ""
-        return (f"{fmt_time(s['start_s']):>8} – {fmt_time(s['end_s']):<8} "
-                f"({dur:5.1f} s)  {title}{mark}")
+    def _row_text(self, b):
+        title = b["title"] or "(untitled)"
+        mark = "  ✎" if b["notes"].strip() else ""
+        return f"{fmt_time(b['t_s']):>8}  {title}{mark}"
 
     def _rebuild_list(self, select=None, seek=False):
-        self._sort()
+        self.bookmarks.sort(key=lambda b: b["t_s"])
         self._suppress_select = not seek
         self.list.clear()
-        for s in self.sections:
-            it = QtWidgets.QListWidgetItem(self._row_text(s))
-            if s["notes"].strip():
-                it.setToolTip(s["notes"])
+        for b in self.bookmarks:
+            it = QtWidgets.QListWidgetItem(self._row_text(b))
+            if b["notes"].strip():
+                it.setToolTip(b["notes"])
             self.list.addItem(it)
         row = -1
         if select is not None:
-            row = next((i for i, s in enumerate(self.sections) if s is select), -1)
+            row = next((i for i, b in enumerate(self.bookmarks) if b is select), -1)
         self.list.setCurrentRow(row)
         self._suppress_select = False
-        self._fill_editor(self.sections[row] if row >= 0 else None)
-        self._update_spans()
+        self._fill_editor(self.bookmarks[row] if row >= 0 else None)
+        self._update_ticks()
 
-    def _update_spans(self):
-        self.slider.spans = [(int(s["start_s"] * 1000), int(s["end_s"] * 1000))
-                             for s in self.sections]
+    def _update_ticks(self):
+        self.slider.ticks = [int(b["t_s"] * 1000) for b in self.bookmarks]
         self.slider.selected = self.list.currentRow()
         self.slider.update()
         self._update_strip_btn()
 
     def _set_strip_open(self, open_):
-        """Hide/show the sections panel.  Hidden, the QSplitter gives its width
+        """Hide/show the bookmarks panel.  Hidden, the QSplitter gives its width
         to the video; shown again, it comes back at the size it had."""
         self.strip.setVisible(open_)
         self.btn_show.setVisible(not open_)
-        self.state["bag_sections_open"] = bool(open_)
+        self.state["bag_bookmarks_open"] = bool(open_)
         self._update_strip_btn()
 
     def _update_strip_btn(self):
-        self.btn_show.setText(f"Sections ({len(self.sections)})")
+        self.btn_show.setText(f"Bookmarks ({len(self.bookmarks)})")
 
     def _selected(self):
         r = self.list.currentRow()
-        return self.sections[r] if 0 <= r < len(self.sections) else None
+        return self.bookmarks[r] if 0 <= r < len(self.bookmarks) else None
 
     def _row_changed(self, row):
         self._flush()
-        sec = self.sections[row] if 0 <= row < len(self.sections) else None
-        self._fill_editor(sec)
+        bm = self.bookmarks[row] if 0 <= row < len(self.bookmarks) else None
+        self._fill_editor(bm)
         self.slider.selected = row
         self.slider.update()
-        if sec is not None and not self._suppress_select:
-            self._park(sec["start_s"] * 1000)
+        if bm is not None and not self._suppress_select:
+            self._park(bm["t_s"] * 1000)
 
     def _goto_selected(self):
-        sec = self._selected()
-        if sec is not None:
-            self._park(sec["start_s"] * 1000)
+        bm = self._selected()
+        if bm is not None:
+            self._park(bm["t_s"] * 1000)
 
-    def _goto_edge(self, which):
-        sec = self._selected()
-        if sec is not None:
-            self._park(sec[f"{which}_s"] * 1000)
-
-    def _fill_editor(self, sec):
-        self.editor.setEnabled(sec is not None)
+    def _fill_editor(self, bm):
+        self.editor.setEnabled(bm is not None)
         self.ed_title.blockSignals(True)
         self.ed_notes.blockSignals(True)
-        self.ed_title.setText(sec["title"] if sec else "")
-        self.ed_notes.setPlainText(sec["notes"] if sec else "")
+        self.ed_title.setText(bm["title"] if bm else "")
+        self.ed_notes.setPlainText(bm["notes"] if bm else "")
         self.ed_title.blockSignals(False)
         self.ed_notes.blockSignals(False)
-        self.ed_start.setText(fmt_time(sec["start_s"]) if sec else "—")
-        self.ed_end.setText(fmt_time(sec["end_s"]) if sec else "—")
+        self.ed_time.setText(fmt_time(bm["t_s"]) if bm else "—")
 
     def _refresh_row(self):
         r = self.list.currentRow()
-        sec = self._selected()
-        if sec is None:
+        bm = self._selected()
+        if bm is None:
             return
         it = self.list.item(r)
-        it.setText(self._row_text(sec))
-        it.setToolTip(sec["notes"] if sec["notes"].strip() else "")
+        it.setText(self._row_text(bm))
+        it.setToolTip(bm["notes"] if bm["notes"].strip() else "")
 
     def _edited(self, _text=None):
-        sec = self._selected()
-        if sec is None:
+        bm = self._selected()
+        if bm is None:
             return
-        sec["title"] = self.ed_title.text()
+        bm["title"] = self.ed_title.text()
         self._refresh_row()
         self._save_timer.start()
 
     def _notes_changed(self):
-        sec = self._selected()
-        if sec is None:
+        bm = self._selected()
+        if bm is None:
             return
-        sec["notes"] = self.ed_notes.toPlainText()
+        bm["notes"] = self.ed_notes.toPlainText()
         self._refresh_row()
         self._save_timer.start()
 
-    def _set_edge(self, which):
-        sec = self._selected()
-        if sec is None:
+    def _set_time(self):
+        bm = self._selected()
+        if bm is None:
             return
-        t = self._pos_s()
-        other = sec["end_s"] if which == "start" else sec["start_s"]
-        if (which == "start" and t >= other) or (which == "end" and t <= other):
-            QtWidgets.QMessageBox.information(
-                self, "Section",
-                f"The start must come before the end "
-                f"(playhead {fmt_time(t)}, other edge {fmt_time(other)}).")
-            return
-        sec[f"{which}_s"] = t
+        bm["t_s"] = self._pos_s()
         self._save()
-        self._rebuild_list(select=sec, seek=False)
+        self._rebuild_list(select=bm, seek=False)
 
-    def _delete_section(self):
-        sec = self._selected()
-        if sec is None:
+    def _delete_bookmark(self):
+        bm = self._selected()
+        if bm is None:
             return
         if QtWidgets.QMessageBox.question(
-                self, "Delete section",
-                f"Delete “{sec['title'] or '(untitled)'}” "
-                f"({fmt_time(sec['start_s'])} – {fmt_time(sec['end_s'])})?"
+                self, "Delete bookmark",
+                f"Delete “{bm['title'] or '(untitled)'}” at {fmt_time(bm['t_s'])}?"
         ) != QtWidgets.QMessageBox.Yes:
             return
         r = self.list.currentRow()
-        self.sections.remove(sec)
+        self.bookmarks.remove(bm)
         self._save()
-        nxt = self.sections[min(r, len(self.sections) - 1)] if self.sections else None
+        nxt = (self.bookmarks[min(r, len(self.bookmarks) - 1)]
+               if self.bookmarks else None)
         self._rebuild_list(select=nxt, seek=False)
 
     # -- persistence
@@ -984,10 +899,10 @@ class BagTab(QtWidgets.QWidget):
         if not self.video:
             return
         try:
-            save_sections(self.video, self.sections)
+            save_bookmarks(self.video, self.bookmarks)
         except OSError as exc:
-            self._log(f"[bags] could not save sections: {exc}")
-            QtWidgets.QMessageBox.warning(self, "Sections", f"Could not save:\n{exc}")
+            self._log(f"[bags] could not save bookmarks: {exc}")
+            QtWidgets.QMessageBox.warning(self, "Bookmarks", f"Could not save:\n{exc}")
 
     def _flush(self):
         """Write a pending debounced edit now (on switching, closing)."""

@@ -439,7 +439,7 @@ including the real failsafe cause) followed by each plot on its own page.
 
 The third tab plays the companion's ROS 2 bag videos, the combined camera +
 data-panel MP4 that `Log Analysis/Bags/make_bag_video/make_bag_video.sh` renders
-per day, and lets you mark **sections**: time ranges with a title and notes.
+per day, and lets you drop **bookmarks**: a point in time with a title and notes.
 
 - **Picker** lists every folder in `Bags/bag analysis/` that holds an MP4
   (`2026_11_04`, or a day range such as `2026_06_20-23`), plus any
@@ -451,27 +451,26 @@ per day, and lets you mark **sections**: time ranges with a title and notes.
   step one frame (100 ms at the script's 10 fps) and stay paused; the ±5 s
   buttons jump and keep playing (they start playback if paused); there is a
   speed menu, and a scrubber that jumps to wherever you click.
-- **Marking**: `[` marks the start and `]` marks the end; **+ Add section**
-  makes the section (with no end mark, the end is the current position) and
-  puts the cursor in the title field. The marks and every section are drawn on
-  the scrubber.
-- **Sections** list in time order on a panel to the right of the video. The
-  **Hide ▸** button in its header collapses it, giving the video the full
-  width; the vertical **◂ Sections (n)** tab left on the right edge brings it
-  back. Adding a section reopens
-  it; the open/closed state and the divider position are remembered. Selecting one parks the video
-  **paused on its first frame**, ready to play. Clicking the selected row again
-  re-parks it. The editor below the list renames it, edits its notes, moves
-  either edge to the playhead (or parks on it with **go**), and deletes it.
+- **+ Add bookmark** (on the transport row) bookmarks the current position and
+  puts the cursor in its title. Every bookmark is a triangle under the
+  scrubber; the selected one is larger and darker.
+- **Bookmarks** list in time order on a panel to the right of the video.
+  Selecting one parks the video **paused on its frame**, ready to play.
+  Clicking the selected row again re-parks it. The editor below the list
+  renames it, edits its notes, moves it to the playhead, and deletes it.
+- The panel's **Hide ▸** button collapses it, giving the video the full
+  width; the vertical **◂ Bookmarks (n)** tab left on the right edge brings it
+  back. Adding a bookmark reopens it; the open/closed state and the divider
+  position are remembered.
 
-Sections save automatically (edits are debounced 0.6 s, and pending edits are
+Bookmarks save automatically (edits are debounced 0.6 s, and pending edits are
 written on switching or closing) to a sidecar beside the video,
-`<video stem>_sections.json`:
+`<video stem>_bookmarks.json`, in time order:
 
 ```json
 {"video": "grazer10_all_bags_combined.mp4",
- "sections": [{"title": "Tag acquired", "start_s": 60.0, "end_s": 75.5,
-               "notes": "drone sees tag at 6.9 m"}]}
+ "bookmarks": [{"title": "Tag acquired", "t_s": 60.0,
+                "notes": "drone sees tag at 6.9 m"}]}
 ```
 
 Times are seconds into the **video**, not bag or UTC time; the frame header
