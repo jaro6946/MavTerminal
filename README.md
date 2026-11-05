@@ -454,8 +454,8 @@ per day, and lets you mark **sections**: time ranges with a title and notes.
   makes the section (with no end mark, the end is the current position) and
   puts the cursor in the title field. The marks and every section are drawn on
   the scrubber.
-- **Sections** sit in a strip under the video. **Sections (n)** on the marking
-  row, or `S`, hides and shows it. Hiding it is what makes the video bigger:
+- **Sections** sit in a strip under the video. The **Sections (n)** button on the
+  marking row hides and shows it. Hiding it is what makes the video bigger:
   the picture is taller than wide, so height is its limit. Adding a section
   reopens the strip, and the open/closed state and the divider position are
   remembered. The list is in time order. Selecting one parks the video

@@ -490,7 +490,7 @@ class BagTab(QtWidgets.QWidget):
         # is taller than wide, so height is its limit.  See _set_strip_open.
         self.btn_strip = QtWidgets.QPushButton()
         self.btn_strip.setCheckable(True)
-        self.btn_strip.setToolTip("Show / hide the sections strip (S)")
+        self.btn_strip.setToolTip("Show / hide the sections strip")
         self.btn_strip.toggled.connect(self._set_strip_open)
         mk.addWidget(self.btn_strip)
         self.btn_add = QtWidgets.QPushButton("+ Add section")
@@ -578,8 +578,7 @@ class BagTab(QtWidgets.QWidget):
         # '[', ',') through ShortcutOverride before a shortcut can fire.
         for key, slot in (("Space", self._toggle_play), ("[", self._mark_start),
                           ("]", self._mark_end), (",", lambda: self._step(-1)),
-                          (".", lambda: self._step(+1)),
-                          ("S", self.btn_strip.toggle)):
+                          (".", lambda: self._step(+1))):
             sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), self)
             sc.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(slot)
