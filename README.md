@@ -448,7 +448,8 @@ per day, and lets you mark **sections**: time ranges with a title and notes.
   with the venv stripped from its environment (it needs the system `python3`
   for ROS 2 Jazzy) and streams the output into the console.
 - **Transport**: Space or a click on the video plays and pauses; `,` and `.`
-  step one frame (100 ms at the script's 10 fps); there are ±5 s buttons, a
+  step one frame (100 ms at the script's 10 fps) and stay paused; the ±5 s
+  buttons jump and keep playing (they start playback if paused); there is a
   speed menu, and a scrubber that jumps to wherever you click.
 - **Marking**: `[` marks the start and `]` marks the end; **+ Add section**
   makes the section (with no end mark, the end is the current position) and

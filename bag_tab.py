@@ -768,7 +768,16 @@ class BagTab(QtWidgets.QWidget):
             self.player.play()
 
     def _nudge(self, seconds):
-        self._park(self.player.position() + seconds * 1000)
+        """±5 s jumps and PLAYS from there -- a skip, not a frame step.  (Frame
+        steps and section selection park paused; those are for inspecting.)"""
+        if not self.video:
+            return
+        dur = self.player.duration()
+        ms = self.player.position() + seconds * 1000
+        ms = int(max(0, min(ms, dur - 1 if dur > 0 else ms)))
+        self.player.setPosition(ms)
+        self._on_position(ms)
+        self.player.play()
 
     def _step(self, n):
         self._park(self.player.position() + n * 1000.0 / self._fps)
