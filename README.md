@@ -454,11 +454,11 @@ per day, and lets you mark **sections**: time ranges with a title and notes.
   makes the section (with no end mark, the end is the current position) and
   puts the cursor in the title field. The marks and every section are drawn on
   the scrubber.
-- **Sections** sit in a strip under the video. The **Sections (n)** button on the
-  marking row hides and shows it. Hiding it is what makes the video bigger:
-  the picture is taller than wide, so height is its limit. Adding a section
-  reopens the strip, and the open/closed state and the divider position are
-  remembered. The list is in time order. Selecting one parks the video
+- **Sections** list in time order on a panel to the right of the video. The
+  **Hide ▸** button in its header collapses it, giving the video the full
+  width; the vertical **◂ Sections (n)** tab left on the right edge brings it
+  back. Adding a section reopens
+  it; the open/closed state and the divider position are remembered. Selecting one parks the video
   **paused on its first frame**, ready to play. Clicking the selected row again
   re-parks it. The editor below the list renames it, edits its notes, moves
   either edge to the playhead (or parks on it with **go**), and deletes it.

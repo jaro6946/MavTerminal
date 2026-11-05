@@ -338,6 +338,37 @@ class SectionSlider(QtWidgets.QSlider):
         p.end()
 
 
+class SideTab(QtWidgets.QPushButton):
+    """A narrow full-height button with its label running bottom-to-top, like
+    a docked-panel tab -- what is left of the sections panel when collapsed."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(30)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed,
+                           QtWidgets.QSizePolicy.Expanding)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+    def paintEvent(self, _ev):
+        p = QtWidgets.QStylePainter(self)
+        opt = QtWidgets.QStyleOptionButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        p.drawControl(QtWidgets.QStyle.CE_PushButton, opt)
+        f = p.font()
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QtGui.QColor(C_SECTION_SEL))
+        # The arrow is drawn UPRIGHT at the top: a glyph inside rotated text
+        # turns with it, so a "◂" there would not point left.
+        p.drawText(QtCore.QRect(0, 6, self.width(), 20), QtCore.Qt.AlignCenter, "◂")
+        p.rotate(-90)
+        # rotated by -90: x runs up the widget (negative), y runs right
+        p.drawText(QtCore.QRect(-self.height(), 0, self.height(), self.width()),
+                   QtCore.Qt.AlignCenter, self.text())
+        p.end()
+
+
 # --- the tab ---------------------------------------------------------------
 
 class BagTab(QtWidgets.QWidget):
@@ -413,21 +444,30 @@ class BagTab(QtWidgets.QWidget):
         bh.addWidget(self.busy)
         v.addWidget(bar)
 
-        # Video on top at full width, sections in a strip underneath.  The video
-        # is 1280 x 1324 (data panel stacked over the camera), i.e. taller than
-        # wide, so it is height-limited: every pixel of height the sections give
-        # back makes the picture bigger, while a side panel only ate width the
-        # letterboxing was already wasting.  The divider is draggable and
-        # remembered.
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        # Video on the left, sections panel on the right.  The video is 1280 x
+        # 1324 (data panel stacked over the camera), taller than wide, so it is
+        # height-limited and a side panel mostly takes width the letterboxing
+        # was wasting anyway.  The panel still collapses (Hide ▸) for when
+        # the window is narrow.  The divider is draggable and remembered.
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         split.setChildrenCollapsible(False)
-        v.addWidget(split, 1)
+        # The splitter shares a row with the collapsed panel's tab, which is the
+        # only thing left on screen to bring the panel back.
+        body = QtWidgets.QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(split, 1)
+        self.btn_show = SideTab()
+        self.btn_show.setToolTip("Show the sections panel")
+        self.btn_show.clicked.connect(lambda: self._set_strip_open(True))
+        body.addWidget(self.btn_show)
+        v.addLayout(body, 1)
         self.split = split
 
-        # top: video + transport + marking
+        # left: video + transport + marking
         left = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(left)
-        lv.setContentsMargins(10, 0, 10, 4)
+        lv.setContentsMargins(10, 0, 4, 6)
         self.view = VideoView()
         self.view.clicked.connect(self._toggle_play)
         lv.addWidget(self.view, 1)
@@ -486,13 +526,6 @@ class BagTab(QtWidgets.QWidget):
         self.mark_lbl.setStyleSheet("font-family: monospace; padding: 0 8px;")
         mk.addWidget(self.mark_lbl)
         mk.addStretch(1)
-        # Hiding the strip is what actually makes the video bigger: the picture
-        # is taller than wide, so height is its limit.  See _set_strip_open.
-        self.btn_strip = QtWidgets.QPushButton()
-        self.btn_strip.setCheckable(True)
-        self.btn_strip.setToolTip("Show / hide the sections strip")
-        self.btn_strip.toggled.connect(self._set_strip_open)
-        mk.addWidget(self.btn_strip)
         self.btn_add = QtWidgets.QPushButton("+ Add section")
         self.btn_add.setToolTip(
             "Make a section from the marks (no end mark = the current position)")
@@ -501,33 +534,30 @@ class BagTab(QtWidgets.QWidget):
         lv.addLayout(mk)
         split.addWidget(left)
 
-        # bottom: section list (left) + editor (right)
+        # right: section list over the editor
         right = QtWidgets.QWidget()
-        rh = QtWidgets.QHBoxLayout(right)
-        rh.setContentsMargins(10, 4, 10, 6)
-        listbox = QtWidgets.QWidget()
-        rv = QtWidgets.QVBoxLayout(listbox)
-        rv.setContentsMargins(0, 0, 0, 0)
+        rv = QtWidgets.QVBoxLayout(right)
+        rv.setContentsMargins(4, 0, 10, 6)
+        hrow = QtWidgets.QHBoxLayout()
         hdr = QtWidgets.QLabel("Sections")
         hdr.setStyleSheet("font-weight: 600;")
-        rv.addWidget(hdr)
+        hrow.addWidget(hdr)
+        hrow.addStretch(1)
+        btn_hide = QtWidgets.QPushButton("Hide ▸")
+        btn_hide.setToolTip("Collapse this panel; the video takes the width")
+        btn_hide.clicked.connect(lambda: self._set_strip_open(False))
+        hrow.addWidget(btn_hide)
+        rv.addLayout(hrow)
         self.list = QtWidgets.QListWidget()
         self.list.setStyleSheet("font-family: monospace;")
         self.list.currentRowChanged.connect(self._row_changed)
         # Clicking the row that is ALREADY selected changes no row, so it would
         # not re-seek; itemClicked covers "take me back to the start of this one".
         self.list.itemClicked.connect(lambda _it: self._goto_selected())
-        self.list.setMinimumHeight(60)
         rv.addWidget(self.list, 1)
-        rh.addWidget(listbox, 2)
 
-        # Editor: the short fields in a column, notes beside them filling the
-        # height -- stacked, the notes box would get almost none of this strip.
         self.editor = QtWidgets.QGroupBox("Selected section")
-        eh = QtWidgets.QHBoxLayout(self.editor)
-        fbox = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(fbox)
-        form.setContentsMargins(0, 0, 0, 0)
+        form = QtWidgets.QFormLayout(self.editor)
         self.ed_title = QtWidgets.QLineEdit()
         self.ed_title.setPlaceholderText("title")
         self.ed_title.textEdited.connect(self._edited)
@@ -551,23 +581,24 @@ class BagTab(QtWidgets.QWidget):
         self.ed_notes = QtWidgets.QPlainTextEdit()
         self.ed_notes.setPlaceholderText("notes")
         self.ed_notes.textChanged.connect(self._notes_changed)
-        self.ed_notes.setMinimumHeight(40)
+        form.addRow("Notes", self.ed_notes)
         self.btn_del = QtWidgets.QPushButton("Delete section")
         self.btn_del.setStyleSheet(f"color: {C_BAD};")
         self.btn_del.clicked.connect(self._delete_section)
         form.addRow("", self.btn_del)
-        eh.addWidget(fbox, 2)
-        eh.addWidget(self.ed_notes, 3)
-        rh.addWidget(self.editor, 3)
+        rv.addWidget(self.editor, 2)
         split.addWidget(right)
         self.strip = right
         split.setStretchFactor(0, 1)      # window resizes go to the video
         split.setStretchFactor(1, 0)
-        sizes = self.state.get("bag_split")
+        # Own key: "bag_split" held the sizes of the short-lived vertical layout,
+        # which would be nonsense applied to this one.
+        self.state.pop("bag_split", None)
+        sizes = self.state.get("bag_split_h")
         split.setSizes(sizes if isinstance(sizes, list) and len(sizes) == 2
-                       else [10000, 150])   # strip at its minimum, video the rest
+                       else [1100, 420])
         split.splitterMoved.connect(
-            lambda *_: self.state.__setitem__("bag_split", split.sizes()))
+            lambda *_: self.state.__setitem__("bag_split_h", split.sizes()))
 
         self.status = QtWidgets.QLabel()
         self.status.setStyleSheet(f"color: {C_MUTED}; padding: 2px 10px;")
@@ -586,10 +617,7 @@ class BagTab(QtWidgets.QWidget):
         self._update_marks()
         self._fill_editor(None)
         self._set_media_enabled(False)
-        # setChecked fires toggled only on a CHANGE, so apply once explicitly.
-        open_ = bool(self.state.get("bag_sections_open", True))
-        self.btn_strip.setChecked(open_)
-        self._set_strip_open(open_)
+        self._set_strip_open(bool(self.state.get("bag_sections_open", True)))
 
     # -- picker
     def _current_name(self):
@@ -795,8 +823,12 @@ class BagTab(QtWidgets.QWidget):
         self._save()
         self._rebuild_list(select=sec, seek=False)
         # Straight into naming it: the default title is a placeholder, so the
-        # strip has to be open for that.
-        self.btn_strip.setChecked(True)
+        # panel has to be open for that.
+        self._set_strip_open(True)
+        # Deferred: focus set in the same tick the panel is re-shown is lost.
+        QtCore.QTimer.singleShot(0, self._focus_title)
+
+    def _focus_title(self):
         self.ed_title.setFocus()
         self.ed_title.selectAll()
 
@@ -836,16 +868,15 @@ class BagTab(QtWidgets.QWidget):
         self._update_strip_btn()
 
     def _set_strip_open(self, open_):
-        """Hide/show the sections strip.  Hidden, a QSplitter gives its height
+        """Hide/show the sections panel.  Hidden, the QSplitter gives its width
         to the video; shown again, it comes back at the size it had."""
         self.strip.setVisible(open_)
+        self.btn_show.setVisible(not open_)
         self.state["bag_sections_open"] = bool(open_)
         self._update_strip_btn()
 
     def _update_strip_btn(self):
-        n = len(self.sections)
-        arrow = "▾" if self.btn_strip.isChecked() else "▸"
-        self.btn_strip.setText(f"Sections ({n}) {arrow}")
+        self.btn_show.setText(f"Sections ({len(self.sections)})")
 
     def _selected(self):
         r = self.list.currentRow()
