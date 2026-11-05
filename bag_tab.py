@@ -2,7 +2,7 @@
 """bag_tab.py -- the browser's Bags tab: play a day's bag video and bookmark it.
 
 A "bag" here is one folder under `Log Analysis/Bags/bag analysis/`, holding the
-combined camera + data-panel MP4 that `Bags/make_bag_video/make_bag_video.sh`
+combined camera + data-panel MP4 that `bag_video/make_bag_video.sh` (in this repo)
 renders from that day's ROS 2 bags.  The tab plays it and lets you drop
 BOOKMARKS -- a point in time with a title and notes -- which list on the right;
 selecting one parks the video, PAUSED, on that bookmark's frame.
@@ -38,7 +38,8 @@ __all__ = ["BagTab", "scan_bags", "script_env", "bookmarks_path_for",
            "load_bookmarks", "save_bookmarks", "fmt_time"]
 
 ANALYSIS_DIR = "bag analysis"
-SCRIPT_REL = os.path.join("make_bag_video", "make_bag_video.sh")
+# The renderer lives beside this file; it is handed the bags root, so it no longer has to sit inside it.
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bag_video", "make_bag_video.sh")
 PREFERRED_VIDEO = "grazer10_all_bags_combined.mp4"
 BOOKMARKS_SUFFIX = "_bookmarks.json"
 DEFAULT_FPS = 10.0            # make_bag_video renders a fixed 10 fps grid
@@ -985,7 +986,7 @@ class BagTab(QtWidgets.QWidget):
         if not 0 <= i < len(self.entries):
             return
         e = self.entries[i]
-        script = os.path.join(self.bags_root, SCRIPT_REL)
+        script = SCRIPT
         if not os.path.isfile(script):
             QtWidgets.QMessageBox.warning(self, "Make video", f"Not found:\n{script}")
             return
@@ -1000,7 +1001,7 @@ class BagTab(QtWidgets.QWidget):
         self.busy.show()
         self.btn_make.setEnabled(False)
         self.view.clear(f"rendering {e['name']}… (see the console)")
-        self._proc.start("bash", [script, e["date"]])
+        self._proc.start("bash", [script, e["date"], self.bags_root])
 
     def _proc_output(self):
         data = bytes(self._proc.readAllStandardOutput()).decode(errors="replace")

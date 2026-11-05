@@ -438,7 +438,7 @@ including the real failsafe cause) followed by each plot on its own page.
 ### Bag videos (the Bags tab)
 
 The third tab plays the companion's ROS 2 bag videos, the combined camera +
-data-panel MP4 that `Log Analysis/Bags/make_bag_video/make_bag_video.sh` renders
+data-panel MP4 that `bag_video/make_bag_video.sh` (this repo) renders
 per day, and lets you drop **bookmarks**: a point in time with a title and notes.
 
 - **Picker** lists every folder in `Bags/bag analysis/` that holds an MP4
@@ -483,6 +483,25 @@ shows which bag and UTC time each frame is. Frames are painted by hand from a
 `QAbstractVideoSurface` rather than a `QVideoWidget`, because under WSLg (the
 Windows Subsystem for Linux GUI) the widget draws through an overlay that
 `grab()` can't see, which made it untestable.
+
+
+#### Rendering a video: `bag_video/`
+
+`bag_video/make_bag_video.sh <date> [bags root]` (bags root defaults to
+`$BAGS_ROOT`, else `~/jacobAtGar/Log Analysis/Bags`) renders
+`<bags root>/<date>/grazer10_*` into `<bags root>/bag analysis/<date>/`. Two stages, both on the
+**system** `python3`: `overlay_data.py` pulls the series out of the bags with the pure-python
+`rosbags` package (vendored into the gitignored `bag_video/pylib/`, installed on first run), and
+`combine_bags.py` decodes the hires camera with ROS 2 Jazzy's `rosbag2_py` and writes the MP4.
+Bags without `metadata.yaml` (never closed, or half-copied) are skipped.
+
+On the camera image, top left: **Steering** (`Tag` green -> yellow -> red as the marker ages toward
+the controller's 5 s limit; `GPS`; `none` with the reason -- nav stack down, task ended, idle task;
+`PX4/pilot` outside OFFBOARD) over a table of where the camera and the rover's GPS each put the tag,
+forward / left-right of the drone in metres. The tag's three fractal levels are reprojected from the
+tracker's pose (green = whole and readable, so usable for the pose); the box down the middle is the
+controller's "centred" pixel band (green / red for the last tag pixel in / out of it, fading to grey
+as it ages). Every nav stack crash in the logs is added as a "Nav stack crash n" bookmark.
 
 ### Other modes
 
