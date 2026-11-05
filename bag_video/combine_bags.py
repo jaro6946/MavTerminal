@@ -120,11 +120,8 @@ def draw_tag(img, v, t):
     c = tuple(int(round(k)) for k in c.reshape(2))
     col = GREEN if live else GREY
     cv2.drawMarker(img, c, col, cv2.MARKER_CROSS, 22, 2 if live else 1)
-    # same units as the top-left table (fwd / L-R from the drone, m) -- this is the raw detection, the table's
-    # Camera row is that detection carried forward to the current frame, so they can differ by a few tenths
-    b = np.radians(g['bearing'])
-    lat = g['horiz'] * np.sin(b)
-    lbl = f"{g['horiz'] * np.cos(b):+.1f} fwd  {abs(lat):.1f}{'L' if lat >= 0 else 'R'}"
+    side = 'L' if g['bearing'] >= 0 else 'R'
+    lbl = f"{g['horiz']:.1f} m  {abs(g['bearing']):.0f} deg {side}"
     lbl += '' if live else f"  ({age:.1f}s old)"
     h = TAG_SIZE / 2
     top, _ = cv2.projectPoints(np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float), rv, tv, K, Dist)
