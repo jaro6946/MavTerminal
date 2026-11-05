@@ -435,6 +435,46 @@ page (duration, armed spans, peak temperature, which height source was fused and
 how much of the flight, the `EKF2_*` settings, and the full `ulog_diag` output
 including the real failsafe cause) followed by each plot on its own page.
 
+### Bag videos (the Bags tab)
+
+The third tab plays the companion's ROS 2 bag videos, the combined camera +
+data-panel MP4 that `Log Analysis/Bags/make_bag_video/make_bag_video.sh` renders
+per day, and lets you mark **sections**: time ranges with a title and notes.
+
+- **Picker** lists every folder in `Bags/bag analysis/` that holds an MP4
+  (`2026_11_04`, or a day range such as `2026_06_20-23`), plus any
+  `Bags/<date>` folder with bags that no video covers yet, shown grey as
+  "no video yet". For those, **Make video** runs `make_bag_video.sh <date>`
+  with the venv stripped from its environment (it needs the system `python3`
+  for ROS 2 Jazzy) and streams the output into the console.
+- **Transport**: Space or a click on the video plays and pauses; `,` and `.`
+  step one frame (100 ms at the script's 10 fps); there are ±5 s buttons, a
+  speed menu, and a scrubber that jumps to wherever you click.
+- **Marking**: `[` marks the start and `]` marks the end; **+ Add section**
+  makes the section (with no end mark, the end is the current position) and
+  puts the cursor in the title field. The marks and every section are drawn on
+  the scrubber.
+- **Sections** list on the right in time order. Selecting one parks the video
+  **paused on its first frame**, ready to play. Clicking the selected row again
+  re-parks it. The editor below the list renames it, edits its notes, moves
+  either edge to the playhead (or parks on it with **go**), and deletes it.
+
+Sections save automatically (edits are debounced 0.6 s, and pending edits are
+written on switching or closing) to a sidecar beside the video,
+`<video stem>_sections.json`:
+
+```json
+{"video": "grazer10_all_bags_combined.mp4",
+ "sections": [{"title": "Tag acquired", "start_s": 60.0, "end_s": 75.5,
+               "notes": "drone sees tag at 6.9 m"}]}
+```
+
+Times are seconds into the **video**, not bag or UTC time; the frame header
+shows which bag and UTC time each frame is. Frames are painted by hand from a
+`QAbstractVideoSurface` rather than a `QVideoWidget`, because under WSLg (the
+Windows Subsystem for Linux GUI) the widget draws through an overlay that
+`grab()` can't see, which made it untestable.
+
 ### Other modes
 
 ```bash
