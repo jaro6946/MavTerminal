@@ -123,12 +123,11 @@ def draw_tag(img, v, t):
     side = 'L' if g['bearing'] >= 0 else 'R'
     lbl = f"{g['horiz']:.1f} m  {abs(g['bearing']):.0f} deg {side}"
     lbl += '' if live else f"  ({age:.1f}s old)"
-    h = TAG_SIZE / 2
-    top, _ = cv2.projectPoints(np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float), rv, tv, K, Dist)
-    top = top.reshape(-1, 2)
-    x0, y0 = int(np.clip(top[:, 0].min(), 0, W - 300)), int(top[:, 1].min()) - 10
-    cv2.putText(img, lbl, (x0, max(y0, 20)), FONT, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(img, lbl, (x0, max(y0, 20)), FONT, 0.7, col, 2, cv2.LINE_AA)
+    # distance + bearing of the detection, centred at the top of the camera image (black outline, no box)
+    (tw, th), _ = cv2.getTextSize(lbl, FONT, 0.9, 2)
+    x0 = (W - tw) // 2
+    cv2.putText(img, lbl, (x0, 18 + th), FONT, 0.9, (0, 0, 0), 5, cv2.LINE_AA)
+    cv2.putText(img, lbl, (x0, 18 + th), FONT, 0.9, col, 2, cv2.LINE_AA)
 
 
 def _interp(ts, xs, t):
