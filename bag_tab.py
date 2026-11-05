@@ -43,8 +43,17 @@ PREFERRED_VIDEO = "grazer10_all_bags_combined.mp4"
 BOOKMARKS_SUFFIX = "_bookmarks.json"
 DEFAULT_FPS = 10.0            # make_bag_video renders a fixed 10 fps grid
 
-C_BOOKMARK = "#2a78d6"        # a bookmark tick on the scrubber
-C_BOOKMARK_SEL = "#0b4fa8"    # the selected one
+C_BOOKMARK_SEL = "#0b4fa8"    # side-tab label
+
+# Bookmark colours, by NAME in the sidecar (readable, and a palette tweak here
+# recolours old files).  Blue is the default; an unknown name falls back to it.
+BOOKMARK_COLORS = {"blue": "#2a78d6", "red": "#d62f2f", "orange": "#e08a00",
+                   "green": "#1e9e5a", "purple": "#8a3fb5", "grey": "#8c8c85"}
+DEFAULT_COLOR = "blue"
+
+
+def color_hex(name):
+    return BOOKMARK_COLORS.get(name, BOOKMARK_COLORS[DEFAULT_COLOR])
 
 _DATE_RE = re.compile(r"^(\d{4})_(\d{2})_(\d{2})$")
 # An analysis folder covers one date, or a day range within a month:
@@ -147,7 +156,9 @@ def load_bookmarks(video):
         try:
             out.append({"title": str(b.get("title", "")),
                         "t_s": float(b["t_s"]),
-                        "notes": str(b.get("notes", ""))})
+                        "notes": str(b.get("notes", "")),
+                        "color": (b.get("color") if b.get("color") in BOOKMARK_COLORS
+                                  else DEFAULT_COLOR)})
         except (KeyError, TypeError, ValueError):
             continue
     out.sort(key=lambda b: b["t_s"])
@@ -160,7 +171,8 @@ def save_bookmarks(video, bookmarks):
     tmp = path + ".tmp"
     data = {"video": os.path.basename(video),
             "bookmarks": [{"title": b["title"], "t_s": round(b["t_s"], 3),
-                           "notes": b["notes"]}
+                           "notes": b["notes"],
+                           "color": b.get("color", DEFAULT_COLOR)}
                           for b in sorted(bookmarks, key=lambda b: b["t_s"])]}
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
@@ -281,7 +293,7 @@ class BookmarkSlider(QtWidgets.QSlider):
 
     def __init__(self, parent=None):
         super().__init__(QtCore.Qt.Horizontal, parent)
-        self.ticks = []           # [ms]
+        self.ticks = []           # [(ms, hex colour)]
         self.selected = -1
         self.setMinimumHeight(28)
 
@@ -324,11 +336,14 @@ class BookmarkSlider(QtWidgets.QSlider):
         p.setPen(QtCore.Qt.NoPen)
         # An upward triangle under the groove, its point at the bookmark time.
         y0 = self.height() - 1
-        for i, ms in enumerate(self.ticks):
+        # Selection is shown by size and a dark outline, not by colour -- the
+        # colour belongs to the bookmark.
+        for i, (ms, col) in enumerate(self.ticks):
             x = self._x(ms, g)
             sel = i == self.selected
-            w, h = (6, 9) if sel else (4, 7)
-            p.setBrush(QtGui.QColor(C_BOOKMARK_SEL if sel else C_BOOKMARK))
+            w, h = (6, 10) if sel else (4, 7)
+            p.setPen(QtGui.QPen(QtGui.QColor("#202020"), 1.2) if sel else QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor(col))
             p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(x, y0 - h),
                                            QtCore.QPointF(x - w, y0),
                                            QtCore.QPointF(x + w, y0)]))
@@ -555,6 +570,27 @@ class BagTab(QtWidgets.QWidget):
         b.clicked.connect(self._set_time)
         row.addWidget(b)
         form.addRow("Time", row)
+        crow = QtWidgets.QHBoxLayout()
+        crow.setSpacing(4)
+        self.color_group = QtWidgets.QButtonGroup(self)
+        self.color_group.setExclusive(True)
+        self.color_btns = {}
+        for name, hexc in BOOKMARK_COLORS.items():
+            cb = QtWidgets.QToolButton()
+            cb.setCheckable(True)
+            cb.setToolTip(name)
+            cb.setFixedSize(26, 22)
+            # checked = thick dark ring, so the current colour reads at a glance
+            cb.setStyleSheet(
+                f"QToolButton {{ background: {hexc}; border: 2px solid #ffffff;"
+                f" border-radius: 4px; }}"
+                f"QToolButton:checked {{ border: 3px solid #202020; }}")
+            cb.clicked.connect(lambda _=False, n=name: self._set_color(n))
+            self.color_group.addButton(cb)
+            self.color_btns[name] = cb
+            crow.addWidget(cb)
+        crow.addStretch(1)
+        form.addRow("Color", crow)
         self.ed_notes = QtWidgets.QPlainTextEdit()
         self.ed_notes.setPlaceholderText("notes")
         self.ed_notes.textChanged.connect(self._notes_changed)
@@ -765,7 +801,7 @@ class BagTab(QtWidgets.QWidget):
         if not self.video:
             return
         bm = {"title": f"Bookmark {len(self.bookmarks) + 1}",
-              "t_s": self._pos_s(), "notes": ""}
+              "t_s": self._pos_s(), "notes": "", "color": DEFAULT_COLOR}
         self.bookmarks.append(bm)
         self._save()
         self._rebuild_list(select=bm, seek=False)
@@ -790,6 +826,7 @@ class BagTab(QtWidgets.QWidget):
         self.list.clear()
         for b in self.bookmarks:
             it = QtWidgets.QListWidgetItem(self._row_text(b))
+            it.setIcon(self._swatch(b.get("color")))
             if b["notes"].strip():
                 it.setToolTip(b["notes"])
             self.list.addItem(it)
@@ -802,7 +839,8 @@ class BagTab(QtWidgets.QWidget):
         self._update_ticks()
 
     def _update_ticks(self):
-        self.slider.ticks = [int(b["t_s"] * 1000) for b in self.bookmarks]
+        self.slider.ticks = [(int(b["t_s"] * 1000), color_hex(b.get("color")))
+                             for b in self.bookmarks]
         self.slider.selected = self.list.currentRow()
         self.slider.update()
         self._update_strip_btn()
@@ -845,6 +883,8 @@ class BagTab(QtWidgets.QWidget):
         self.ed_title.blockSignals(False)
         self.ed_notes.blockSignals(False)
         self.ed_time.setText(fmt_time(bm["t_s"]) if bm else "—")
+        btn = self.color_btns[bm.get("color", DEFAULT_COLOR) if bm else DEFAULT_COLOR]
+        btn.setChecked(True)
 
     def _refresh_row(self):
         r = self.list.currentRow()
@@ -853,7 +893,35 @@ class BagTab(QtWidgets.QWidget):
             return
         it = self.list.item(r)
         it.setText(self._row_text(bm))
+        it.setIcon(self._swatch(bm.get("color")))
         it.setToolTip(bm["notes"] if bm["notes"].strip() else "")
+
+    _swatch_cache = {}
+
+    def _swatch(self, name):
+        """A small filled circle in the bookmark's colour, for its list row."""
+        hexc = color_hex(name)
+        icon = self._swatch_cache.get(hexc)
+        if icon is None:
+            pm = QtGui.QPixmap(14, 14)
+            pm.fill(QtCore.Qt.transparent)
+            p = QtGui.QPainter(pm)
+            p.setRenderHint(QtGui.QPainter.Antialiasing)
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor(hexc))
+            p.drawEllipse(1, 1, 12, 12)
+            p.end()
+            icon = self._swatch_cache[hexc] = QtGui.QIcon(pm)
+        return icon
+
+    def _set_color(self, name):
+        bm = self._selected()
+        if bm is None:
+            return
+        bm["color"] = name
+        self._refresh_row()
+        self._update_ticks()
+        self._save()
 
     def _edited(self, _text=None):
         bm = self._selected()

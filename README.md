@@ -456,11 +456,13 @@ per day, and lets you drop **bookmarks**: a point in time with a title and notes
   position is remembered.
 - **+ Add bookmark** (on the transport row) bookmarks the current position and
   puts the cursor in its title. Every bookmark is a triangle under the
-  scrubber; the selected one is larger and darker.
+  scrubber in its own colour; the selected one is larger, with a dark outline.
 - **Bookmarks** list in time order on a panel to the right of the video.
   Selecting one parks the video **paused on its frame**, ready to play.
   Clicking the selected row again re-parks it. The editor below the list
-  renames it, edits its notes, moves it to the playhead, and deletes it.
+  renames it, sets its **colour** (blue, the default, red, orange, green,
+  purple, grey; shown as a dot in the list and on the scrubber), edits its
+  notes, moves it to the playhead, and deletes it.
 - The panel's **Hide ▸** button collapses it, giving the video the full
   width; the vertical **◂ Bookmarks (n)** tab left on the right edge brings it
   back. Adding a bookmark reopens it; the open/closed state and the divider
@@ -473,7 +475,7 @@ written on switching or closing) to a sidecar beside the video,
 ```json
 {"video": "grazer10_all_bags_combined.mp4",
  "bookmarks": [{"title": "Tag acquired", "t_s": 60.0,
-                "notes": "drone sees tag at 6.9 m"}]}
+                "notes": "drone sees tag at 6.9 m", "color": "green"}]}
 ```
 
 Times are seconds into the **video**, not bag or UTC time; the frame header
