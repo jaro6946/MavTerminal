@@ -38,7 +38,7 @@ import ulog_faults
 import ulog_plots
 from log_tags import (TAGS_SUFFIX, TagBar, TagFilter, board_facts, merge_tags,
                       tags_for, tags_path_for)
-from bag_tab import BagTab
+from bag_tab import BagTab, collections_under
 from qt_common import NotesBox, PlotCanvas
 from report_tab import ReportTab
 from ulog_cache import (LogCache, MeasuredULog, corruption_of, parse_ulog,
@@ -892,7 +892,7 @@ class Browser(QtWidgets.QMainWindow):
         # Bag videos (the companion's ROS 2 bags rendered by make_bag_video.sh)
         # and the time sections marked on them.  Independent of the ULog library.
         root = self._log_analysis_root()
-        self.bag_tab = BagTab(os.path.join(root, "Bags") if root else os.getcwd(),
+        self.bag_tab = BagTab(collections_under(root) if root else os.getcwd(),
                               self._log, state=self.state)
         self.tabs.addTab(self.bag_tab, "Bags")
 

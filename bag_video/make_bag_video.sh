@@ -4,7 +4,7 @@
 #
 #   bag_video/make_bag_video.sh 2026_11_04 ["<bags root>"]
 #
-# <bags root> defaults to $BAGS_ROOT, else ~/jacobAtGar/Log Analysis/Bags.
+# <bags root> defaults to $BAGS_ROOT, else ~/jacobAtGar/Log Analysis/Landing Test Bags.
 # Reads   <bags root>/<date>/grazer10_*            (bags without metadata.yaml are skipped)
 # Writes  <bags root>/bag analysis/<date>/grazer10_all_bags_combined.mp4
 #         ..._logs.txt         every log line, untruncated
@@ -17,7 +17,7 @@
 set -euo pipefail
 DATE="${1:?usage: $0 <date folder, e.g. 2026_11_04> [bags root]}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BAGS="${2:-${BAGS_ROOT:-$HOME/jacobAtGar/Log Analysis/Bags}}"
+BAGS="${2:-${BAGS_ROOT:-$HOME/jacobAtGar/Log Analysis/Landing Test Bags}}"
 OUT="$BAGS/bag analysis/$DATE"
 [ -d "$BAGS/$DATE" ] || { echo "no bag folder: $BAGS/$DATE" >&2; exit 2; }
 

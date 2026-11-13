@@ -15,6 +15,12 @@ A date folder under `Bags/` that has bags but no video yet is listed too, with
 a "Make video" button that runs make_bag_video.sh and streams its output into
 the console.
 
+Several bag FOLDERS ("collections") can be browsed, picked with the "folder:"
+combo; each has the same <date>/<bag>/ + `bag analysis/<date>/` layout
+(BAG_COLLECTIONS).  Make video is per collection: the renderer is built around
+grazer10's hires camera, so collections without camera bags (the SE3 controller
+tests, /fmu topics only) list their bags but cannot render.
+
 Why frames are painted by hand instead of with QVideoWidget: under WSLg the
 widget renders through a native overlay that `grab()` cannot see (a screenshot
 of it is solid black), so it could not be checked headlessly.  A
@@ -34,10 +40,18 @@ from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets
 
 from ulog_common import C_BAD, C_MUTED
 
-__all__ = ["BagTab", "scan_bags", "script_env", "bookmarks_path_for",
+__all__ = ["BagTab", "BAG_COLLECTIONS", "collections_under", "scan_bags", "script_env", "bookmarks_path_for",
            "load_bookmarks", "save_bookmarks", "fmt_time"]
 
 ANALYSIS_DIR = "bag analysis"
+# (label, folder under Log Analysis, make_bag_video can render it?).  The first
+# is the default.  "Bags" was renamed "Landing Test Bags" on 2026-11-13.
+BAG_COLLECTIONS = [
+    ("Landing Test Bags", "Landing Test Bags", True),     # grazer10 camera + landing
+    ("SE3 Controller Bags", "SE3 Controller Bags", False),  # grazer17 /fmu only, no camera
+]
+NO_VIDEO_TIP = ("make_bag_video.sh renders grazer10's hires camera; this folder's "
+                "bags carry no camera topic")
 # The renderer lives beside this file; it is handed the bags root, so it no longer has to sit inside it.
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bag_video", "make_bag_video.sh")
 PREFERRED_VIDEO = "grazer10_all_bags_combined.mp4"
@@ -139,6 +153,12 @@ def scan_bags(bags_root):
                             "date": name, "n_bags": n})
     out.sort(key=lambda e: e["name"])
     return out
+
+
+def collections_under(log_analysis_root):
+    """BAG_COLLECTIONS resolved under a Log Analysis root: [(label, path, can_make)]."""
+    return [(label, os.path.join(log_analysis_root, sub), can)
+            for label, sub, can in BAG_COLLECTIONS]
 
 
 def bookmarks_path_for(video):
@@ -387,11 +407,22 @@ class SideTab(QtWidgets.QPushButton):
 class BagTab(QtWidgets.QWidget):
     """Bag picker + video player + bookmark list.  See the module docstring."""
 
-    def __init__(self, bags_root, log, state=None, parent=None):
+    def __init__(self, collections, log, state=None, parent=None):
+        """collections: [(label, root, can_make_video)], or one root path."""
         super().__init__(parent)
-        self.bags_root = bags_root
+        if isinstance(collections, str):
+            collections = [(os.path.basename(collections) or collections, collections, True)]
+        self.collections = list(collections)
+        labels = [c[0] for c in self.collections]
+        last = self.state_get(state, "bag_collection")
+        self._coll = labels.index(last) if last in labels else 0
+        self.bags_root = self.collections[self._coll][1]
         self._log = log
         self.state = state if state is not None else {}
+        # Pre-collections state kept one "bag_last" (it was the Landing folder).
+        if "bag_last" in self.state:
+            self.state.setdefault("bag_last:" + self.collections[0][0],
+                                  self.state.pop("bag_last"))
         self.entries = []
         self.video = None             # path of the loaded MP4
         self.bookmarks = []
@@ -420,7 +451,34 @@ class BagTab(QtWidgets.QWidget):
 
         self._build_ui()
         self.surface.frame.connect(self.view.set_frame)
-        self.refresh(select=self.state.get("bag_last"))
+        self.refresh(select=self.state.get(self._last_key()))
+
+    @staticmethod
+    def state_get(state, key):
+        return (state or {}).get(key)
+
+    def _last_key(self):
+        return "bag_last:" + self.collections[self._coll][0]
+
+    def _can_make(self):
+        return bool(self.collections[self._coll][2])
+
+    def _collection_picked(self, idx):
+        if not 0 <= idx < len(self.collections) or idx == self._coll:
+            return
+        self._flush()
+        self._coll = idx
+        self.bags_root = self.collections[idx][1]
+        self.state["bag_collection"] = self.collections[idx][0]
+        self.video = None             # force a reload even if names collide
+        self.btn_make.setToolTip(self._make_tip())
+        self.refresh(select=self.state.get(self._last_key()))
+
+    def _make_tip(self):
+        if not self._can_make():
+            return NO_VIDEO_TIP
+        return ("Run make_bag_video.sh for this date (minutes; output streams to the "
+                "console below)")
 
     # -- construction
     def _build_ui(self):
@@ -431,6 +489,16 @@ class BagTab(QtWidgets.QWidget):
         bar = QtWidgets.QWidget()
         bh = QtWidgets.QHBoxLayout(bar)
         bh.setContentsMargins(10, 6, 10, 6)
+        bh.addWidget(QtWidgets.QLabel("folder:"))
+        self.coll_picker = QtWidgets.QComboBox()
+        for label, root, _can in self.collections:
+            self.coll_picker.addItem(label)
+            self.coll_picker.setItemData(self.coll_picker.count() - 1, root,
+                                         QtCore.Qt.ToolTipRole)
+        self.coll_picker.setCurrentIndex(self._coll)
+        self.coll_picker.activated.connect(self._collection_picked)
+        bh.addWidget(self.coll_picker)
+        bh.addSpacing(8)
         bh.addWidget(QtWidgets.QLabel("bag:"))
         self.picker = QtWidgets.QComboBox()
         self.picker.setStyleSheet("font-family: monospace;")
@@ -442,9 +510,7 @@ class BagTab(QtWidgets.QWidget):
         b.clicked.connect(lambda: self.refresh(select=self._current_name()))
         bh.addWidget(b)
         self.btn_make = QtWidgets.QPushButton("Make video")
-        self.btn_make.setToolTip(
-            "Run make_bag_video.sh for this date (minutes; output streams to the "
-            "console below)")
+        self.btn_make.setToolTip(self._make_tip())
         self.btn_make.setEnabled(False)
         self.btn_make.clicked.connect(self._make_video)
         bh.addWidget(self.btn_make)
@@ -648,13 +714,15 @@ class BagTab(QtWidgets.QWidget):
                 extra = f"{n} bookmark{'s' if n != 1 else ''}" if n else ""
                 txt = f"{e['name']:<16} {e['n_bags']:>2} bags   video   {extra}"
             else:
-                txt = f"{e['name']:<16} {e['n_bags']:>2} bags   no video yet"
+                txt = (f"{e['name']:<16} {e['n_bags']:>2} bags   "
+                       + ("no video yet" if self._can_make() else "bags only (no camera)"))
             self.picker.addItem(txt)
             if not e["video"]:
                 self.picker.setItemData(self.picker.count() - 1,
                                         QtGui.QColor(C_MUTED), QtCore.Qt.ForegroundRole)
         if not self.entries:
             self.view.clear(f"no bags under {self.bags_root}")
+            self._load_video({"name": "", "video": None, "n_bags": 0}, quiet=True)
             return
         names = [e["name"] for e in self.entries]
         idx = names.index(select) if select in names else len(names) - 1
@@ -668,7 +736,7 @@ class BagTab(QtWidgets.QWidget):
         if not 0 <= idx < len(self.entries):
             return
         e = self.entries[idx]
-        self.state["bag_last"] = e["name"]
+        self.state[self._last_key()] = e["name"]
         self._update_make_btn()
         if e["video"] == self.video and self.video:
             return
@@ -679,18 +747,25 @@ class BagTab(QtWidgets.QWidget):
         i = self.picker.currentIndex()
         e = self.entries[i] if 0 <= i < len(self.entries) else None
         self.btn_make.setEnabled(bool(e and not e["video"] and e["date"]
-                                      and self._proc is None))
+                                      and self._proc is None and self._can_make()))
+        # A render refreshes the folder it started in: no switching mid-run.
+        self.coll_picker.setEnabled(self._proc is None)
 
     # -- media
-    def _load_video(self, e):
+    def _load_video(self, e, quiet=False):
         self.player.stop()
         if not e["video"]:
             self.video = None
             self.bookmarks = []
             self._rebuild_list()
             self.player.setMedia(QtMultimedia.QMediaContent())
-            self.view.clear(f"{e['name']}: {e['n_bags']} bags, no video yet.\n\n"
-                            "Make video renders it with make_bag_video.sh.")
+            if not quiet:
+                hint = ("Make video renders it with make_bag_video.sh."
+                        if self._can_make() else
+                        "No video for this folder: " + NO_VIDEO_TIP + ".\n"
+                        "Bags are in " + os.path.join(self.bags_root, e["name"]))
+                self.view.clear(f"{e['name']}: {e['n_bags']} bags, no video yet.\n\n"
+                                + hint)
             self._set_media_enabled(False)
             self.status.setText("")
             return
@@ -1000,6 +1075,7 @@ class BagTab(QtWidgets.QWidget):
         self._log(f"[bags] make_bag_video.sh {e['date']} …")
         self.busy.show()
         self.btn_make.setEnabled(False)
+        self.coll_picker.setEnabled(False)
         self.view.clear(f"rendering {e['name']}… (see the console)")
         self._proc.start("bash", [script, e["date"], self.bags_root])
 
@@ -1012,6 +1088,7 @@ class BagTab(QtWidgets.QWidget):
     def _proc_done(self, name, code):
         self._proc = None
         self.busy.hide()
+        self.coll_picker.setEnabled(True)
         self._log(f"[bags] make_bag_video.sh finished, exit {code}")
         self.refresh(select=name)
         if code != 0:
