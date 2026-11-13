@@ -99,8 +99,13 @@ AXIS_COL = {"E": "#2a78d6", "N": "#d2691e", "U": "#4a3aa7",
 C_SE3 = "#e08a00"             # orange: SE3 flying (direct thrust/torque)
 C_PX4_OFFB = "#2a78d6"        # blue: offboard, but PX4's own position loop
 C_HOVER = "#1e9e5a"
-C_ARMED_SPAN = "#8a3fb5"      # purple: armed (red is reserved for RECOVERY)
-LEGEND_X = 1.085              # legend column, in axes fractions right of the plot
+C_ARMED_SPAN = "#8a3fb5"
+C_SE3_DIS = "#f2c27a"         # light orange: SE3 commanding a DISARMED vehicle
+C_PX4_OFFB_DIS = "#9cc3ee"    # light blue: PX4 offboard position, disarmed
+C_IDLE = "#cfcfca"            # light grey: disarmed
+C_PX4_OWN = "#5f6b7a"         # slate: PX4 flying in its own mode (Land, Hold...)      # purple: armed (red is reserved for RECOVERY)
+LEGEND_X = 1.085
+OFFB_STALE_S = 0.5            # no companion offboard msg for this long = not flying it              # legend column, in axes fractions right of the plot
 MOTOR_COL = ["#2a78d6", "#d2691e", "#1e9e5a", "#8a3fb5"]
 
 
@@ -568,11 +573,39 @@ def who_flies(sess):
     if cm is None:
         return []
     st = sess.topics.get("vehicle_status")
+    # PX4's flags alone are not "who flies": after the SES004 kill-switch disarm
+    # PX4 went BACK to Offboard (disarmed), keeping the companion's last
+    # thrust+torque flags 5 s after the node had yielded and gone silent --
+    # read as "SE3 flying".  SE3/offboard need armed + a live companion stream.
+    hb = np.sort(np.asarray(sess.rates.get("/fmu/in/offboard_control_mode", []), float))
+
+    def _companion_live(t):
+        i = np.searchsorted(hb, t, side="right")
+        return i > 0 and t - hb[i - 1] <= OFFB_STALE_S
+
+    def _mode(k):
+        if st is not None and len(st["t"]):
+            j = min(np.searchsorted(st["t"], cm["t"][k]), len(st["t"]) - 1)
+            return nav_state_name(st["nav_state"][j])
+        return "?"
+
     labels = []
     for k in range(len(cm["t"])):
         offb = bool(cm.get("flag_control_offboard_enabled", [0])[k])
         att = bool(cm.get("flag_control_attitude_enabled", [1])[k])
-        if offb and not att:
+        armed = bool(cm.get("flag_armed", [1])[k])
+        live = offb and _companion_live(cm["t"][k])
+        if not armed:
+            # Disarmed cards (Mission 1) still show WHO IS COMMANDING, lighter.
+            if live and not att:
+                labels.append(("se3_dis", "SE3 commanding (disarmed)"))
+            elif live:
+                labels.append(("px4offb_dis", "PX4 offboard position (disarmed)"))
+            else:
+                labels.append(("idle", "disarmed (PX4 %s)" % _mode(k)))
+        elif offb and not live:
+            labels.append(("px4", "PX4 Offboard, companion SILENT"))
+        elif offb and not att:
             labels.append(("se3", "SE3 (thrust+torque)"))
         elif offb:
             labels.append(("px4offb", "PX4 offboard position"))
@@ -590,7 +623,7 @@ def handoffs(sess):
     """[(t, 'PX4→SE3' | 'SE3→PX4')] every change into or out of SE3 control."""
     out, prev = [], None
     for a, _b, kind, _lab in who_flies(sess):
-        is_se3 = kind == "se3"
+        is_se3 = kind in ("se3", "se3_dis")
         if prev is not None and is_se3 != prev:
             out.append((a, "PX4→SE3" if is_se3 else "SE3→PX4"))
         prev = is_se3
@@ -682,7 +715,7 @@ def _rows(ax, rows, t_end):
 
 def _shade_se3(ax, flies):
     for a, b, kind, _ in flies:
-        if kind == "se3":
+        if kind in ("se3", "se3_dis"):
             ax.axvspan(a, b, color=C_SE3, alpha=0.07, lw=0, zorder=0)
 
 
@@ -712,7 +745,9 @@ def _draw_strip(ax, sess, flies, t_end):
             a, b = it[0], it[1]
             if label == "who flies":
                 kind, text = it[2], it[3]
-                c = {"se3": C_SE3, "px4offb": C_PX4_OFFB}.get(kind, C_ARMED)
+                c = {"se3": C_SE3, "px4offb": C_PX4_OFFB, "idle": C_IDLE,
+                     "se3_dis": C_SE3_DIS, "px4offb_dis": C_PX4_OFFB_DIS
+                     }.get(kind, C_PX4_OWN)
             elif label.startswith("SE3 step"):
                 text = it[2]
                 c = C_BAD if "RECOVERY" in text else C_SE3
@@ -741,6 +776,10 @@ def _draw_strip(ax, sess, flies, t_end):
     ax.legend(handles=[Patch(color=C_PX4_OFFB, label="PX4 flying (offboard position)"),
                        Patch(color=C_SE3, label="SE3 flying (thrust + torque)"),
                        Patch(color=C_BAD, label="SE3 RECOVERY"),
+                       Patch(color=C_PX4_OFFB_DIS, label="PX4 offboard position, disarmed"),
+                       Patch(color=C_SE3_DIS, label="SE3 commanding, disarmed"),
+                       Patch(color=C_PX4_OWN, label="PX4 own mode (named in bar)"),
+                       Patch(color=C_IDLE, label="disarmed"),
                        Patch(color=C_ARMED_SPAN, label="armed"),
                        Patch(color=C_ARMED, label="landed (PX4 land detector)")],
               loc="upper left", bbox_to_anchor=(LEGEND_X, 1.0), borderaxespad=0.0,
