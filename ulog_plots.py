@@ -28,6 +28,7 @@ import ulog_link
 import ulog_localz
 import ulog_path
 import ulog_atrest
+import ulog_attitude
 from ulog_common import PlotCtx  # re-exported: callers build one and pass it on
 
 __all__ = ["PlotSpec", "PLOTS", "PlotCtx", "all_topics", "by_key"]
@@ -143,6 +144,18 @@ PLOTS = [
               "frame that survives an EKF handover",
         # Fallback only: build_path sets fig._page_height.
         height=860,
+    ),
+    PlotSpec(
+        # Under the path, above the commands: how the vehicle was oriented.
+        key="attitude",
+        title="Attitude: roll / pitch / yaw / tilt",
+        topics=ulog_attitude.ATTITUDE_TOPICS,
+        build=ulog_attitude.build_attitude,
+        blurb="roll, pitch and unwrapped yaw against PX4's attitude setpoint, "
+              "and tilt from vertical with 30/60 deg lines -- shaded by armed "
+              "and OFFBOARD, with the companion SE3's direct thrust+torque "
+              "spans (no PX4 setpoint exists there) hatched and labelled",
+        height=1000,
     ),
     PlotSpec(
         # Directly under the path: "what was it asked to do along that track".

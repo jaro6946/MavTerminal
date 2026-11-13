@@ -38,6 +38,7 @@ import sys
 
 from PyQt5 import QtCore, QtGui, QtMultimedia, QtWidgets
 
+from se3_dash import SE3Dashboard
 from ulog_common import C_BAD, C_MUTED
 
 __all__ = ["BagTab", "BAG_COLLECTIONS", "collections_under", "scan_bags", "script_env", "bookmarks_path_for",
@@ -50,6 +51,9 @@ BAG_COLLECTIONS = [
     ("Landing Test Bags", "Landing Test Bags", True),     # grazer10 camera + landing
     ("SE3 Controller Bags", "SE3 Controller Bags", False),  # grazer17 /fmu only, no camera
 ]
+# Collections whose bags are SE3 companion sessions (/fmu topics + node
+# trace): these get the session dashboard under the video (se3_dash.py).
+DASHBOARD_COLLECTIONS = {"SE3 Controller Bags"}
 NO_VIDEO_TIP = ("make_bag_video.sh renders grazer10's hires camera; this folder's "
                 "bags carry no camera topic")
 # The renderer lives beside this file; it is handed the bags root, so it no longer has to sit inside it.
@@ -463,6 +467,25 @@ class BagTab(QtWidgets.QWidget):
     def _can_make(self):
         return bool(self.collections[self._coll][2])
 
+    def _has_dash(self):
+        return self.collections[self._coll][0] in DASHBOARD_COLLECTIONS
+
+    def _sync_dash(self, e=None):
+        """Show the dashboard for SE3 collections, pointed at e's date folder."""
+        on = self._has_dash()
+        self.dash.setVisible(on)
+        if not on:
+            return
+        if not self.vsplit.property("sized"):
+            sizes = self.state.get("bag_vsplit")
+            self.vsplit.setSizes(sizes if isinstance(sizes, list) and len(sizes) == 2
+                                 else [220, 900])     # no video yet: plots get the room
+            self.vsplit.setProperty("sized", True)
+        if e is not None:
+            self.dash.set_folder(os.path.join(self.bags_root, e.get("date") or e["name"]))
+        else:
+            self.dash.set_folder(None)
+
     def _collection_picked(self, idx):
         if not 0 <= idx < len(self.collections) or idx == self._coll:
             return
@@ -538,7 +561,21 @@ class BagTab(QtWidgets.QWidget):
         self.btn_show.setToolTip("Show the bookmarks panel")
         self.btn_show.clicked.connect(lambda: self._set_strip_open(True))
         body.addWidget(self.btn_show)
-        v.addLayout(body, 1)
+        # Video (+ bookmarks) on TOP, the SE3 session dashboard under it: the
+        # video player stays where it is for camera bags; the dashboard only
+        # shows for collections in DASHBOARD_COLLECTIONS.
+        top = QtWidgets.QWidget()
+        top.setLayout(body)
+        self.vsplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.vsplit.setChildrenCollapsible(False)
+        self.vsplit.addWidget(top)
+        self.dash = SE3Dashboard(self._log, state=self.state)
+        self.vsplit.addWidget(self.dash)
+        self.vsplit.setStretchFactor(0, 0)
+        self.vsplit.setStretchFactor(1, 1)
+        self.vsplit.splitterMoved.connect(
+            lambda *_: self.state.__setitem__("bag_vsplit", self.vsplit.sizes()))
+        v.addWidget(self.vsplit, 1)
         self.split = split
 
         # left: video + transport
@@ -723,6 +760,7 @@ class BagTab(QtWidgets.QWidget):
         if not self.entries:
             self.view.clear(f"no bags under {self.bags_root}")
             self._load_video({"name": "", "video": None, "n_bags": 0}, quiet=True)
+            self._sync_dash(None)
             return
         names = [e["name"] for e in self.entries]
         idx = names.index(select) if select in names else len(names) - 1
@@ -731,6 +769,7 @@ class BagTab(QtWidgets.QWidget):
             self._picked(idx)
         else:
             self._update_make_btn()
+            self._sync_dash(self.entries[idx])
 
     def _picked(self, idx):
         if not 0 <= idx < len(self.entries):
@@ -738,6 +777,7 @@ class BagTab(QtWidgets.QWidget):
         e = self.entries[idx]
         self.state[self._last_key()] = e["name"]
         self._update_make_btn()
+        self._sync_dash(e)
         if e["video"] == self.video and self.video:
             return
         self._flush()
@@ -1099,6 +1139,7 @@ class BagTab(QtWidgets.QWidget):
     def stop(self):
         """Called from the window's closeEvent."""
         self._flush()
+        self.dash.stop()
         self.player.stop()
         if self._proc is not None:
             self._proc.kill()
