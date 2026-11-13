@@ -636,7 +636,7 @@ def handoffs(sess):
 
 # (key, title, height units).  The figure stacks them in this order.
 PANELS = [
-    ("strip", "phase", 1.5),
+    ("strip", "phase", 2.2),
     ("pos", "1  Position: actual vs SE3 reference", 2.4),
     ("drift", "2  Ground drift (odometry from first sample) + heading", 2.4),
     ("att_rp", "3  Roll / pitch: actual vs SE3 command", 2.2),
@@ -810,17 +810,18 @@ def _draw_strip(ax, sess, flies, t_end):
             ax.text(tm, n - 0.45, " " + mission_short(m.get("name")), fontsize=7,
                     color=C_INK, va="bottom", ha="left", clip_on=False)
     from matplotlib.patches import Patch
-    ax.legend(handles=[Patch(color=C_PX4_OFFB, label="PX4 flying (offboard position)"),
-                       Patch(color=C_SE3, label="SE3 flying (thrust + torque)"),
+    ax.legend(handles=[Patch(color=C_PX4_OFFB, label="PX4 offboard"),
+                       Patch(color=C_PX4_OFFB_DIS, label="  …disarmed"),
+                       Patch(color=C_SE3, label="SE3 flying"),
+                       Patch(color=C_SE3_DIS, label="  …disarmed"),
                        Patch(color=C_BAD, label="SE3 RECOVERY"),
-                       Patch(color=C_PX4_OFFB_DIS, label="PX4 offboard position, disarmed"),
-                       Patch(color=C_SE3_DIS, label="SE3 commanding, disarmed"),
-                       Patch(color=C_PX4_OWN, label="PX4 own mode (named in bar)"),
-                       Patch(color=C_IDLE, label="disarmed"),
+                       Patch(color=C_PX4_OWN, label="PX4 own mode"),
+                       Patch(color=C_IDLE, label="disarmed, idle"),
                        Patch(color=C_ARMED_SPAN, label="armed"),
-                       Patch(color=C_ARMED, label="landed (PX4 land detector)")],
+                       Patch(color=C_ARMED, label="landed")],
               loc="upper left", bbox_to_anchor=(LEGEND_X, 1.0), borderaxespad=0.0,
-              fontsize=8.5, frameon=True, framealpha=0.95, borderpad=0.4)
+              ncol=2, columnspacing=0.8, handlelength=1.4,
+              fontsize=7.5, frameon=True, framealpha=0.95, borderpad=0.4)
     ax.set_yticks(range(n))
     ax.set_yticklabels([r[0] for r in reversed(rows)], fontsize=7)
     ax.set_ylim(-0.6, n - 0.4)
@@ -841,7 +842,7 @@ def build_dashboard(sess, window=None, panels=None, width_in=14.0):
     fig = Figure(figsize=(width_in, total * unit + 1.2), facecolor=C_SURFACE)
     top_in, bot_in = 0.95, 0.55
     gs = fig.add_gridspec(len(keys), 1, height_ratios=[h for _, _, h in keys],
-                          left=0.10, right=0.76, hspace=0.62,
+                          left=0.10, right=0.76, hspace=0.85,
                           top=1 - top_in / fig.get_figheight(),
                           bottom=bot_in / fig.get_figheight())
     axes, first = {}, None
@@ -887,12 +888,17 @@ def build_dashboard(sess, window=None, panels=None, width_in=14.0):
                 transform=a0.get_xaxis_transform(), ha="right", va="bottom",
                 fontsize=7, color=C_MUTED)
 
+    # Every panel carries its own time ticks AND unit (user, 2026-11-13): a
+    # panel is often read on its own, and "is this seconds?" must not need the
+    # bottom of the page.  Full title on the bottom panel only.
     last = axes[keys[-1][0]]
-    last.set_xlabel("time from bag start (s)   ·   orange shading = SE3 flying "
-                    "(offboard thrust + torque)", fontsize=8)
     for ax in axes.values():
-        if ax is not last:
-            ax.tick_params(labelbottom=False)
+        ax.tick_params(labelbottom=True)
+        if ax is last:
+            ax.set_xlabel("time from bag start (s)   ·   orange shading = SE3 flying "
+                          "(offboard thrust + torque)", fontsize=8)
+        else:
+            ax.set_xlabel("s", fontsize=7.5, color=C_MUTED, loc="right", labelpad=0)
     if window is not None:
         first.set_xlim(*window)
         for key, ax in axes.items():

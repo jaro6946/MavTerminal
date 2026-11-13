@@ -475,8 +475,10 @@ def style_time_axis(ax, label=True):
     x axis: a panel two rows up from the bottom is read on its own as often as
     it is read as part of the stack, and tracing a feature down four panels to
     find out when it happened is a worse cost than the row of numbers under each
-    one.  Only the bottom panel gets the axis title, which would otherwise be
-    repeated verbatim five times.
+    one.  Only the bottom panel gets the full axis title; every other panel
+    gets the bare UNIT ("min") at the right end of its axis, so a panel read
+    on its own still says what its numbers are (user, 2026-11-13: "the x axis
+    seconds or minutes should be listed on every graph").
     """
     ax.grid(True, color=C_GRID, lw=0.8, zorder=0)
     ax.set_axisbelow(True)
@@ -484,6 +486,8 @@ def style_time_axis(ax, label=True):
     ax.tick_params(axis="x", colors=C_MUTED, labelsize=8)
     if label:
         ax.set_xlabel("time since log start (minutes)", color=C_MUTED, fontsize=9)
+    else:
+        ax.set_xlabel("min", color=C_MUTED, fontsize=7.5, loc="right", labelpad=0)
 
 
 def draw_armed(ax, spans):
