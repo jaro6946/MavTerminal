@@ -145,6 +145,13 @@ class SE3Dashboard(QtWidgets.QWidget):
             self.view_pick.addItem(f"Handoff {k}: {lab} @ {t:.1f} s",
                                    (t - ZOOM_HALF_S, t + ZOOM_HALF_S))
         tr = self.sess.trace
+        if tr is None:
+            # No trace: the PC-log step timeline still shows a recovery.
+            rec = [a for a, _b, lab in P.pc_steps(self.sess, P.who_flies(self.sess))
+                   if "RECOVERY" in lab]
+            if rec:
+                self.view_pick.addItem(f"SE3 RECOVERY entered @ {rec[0]:.1f} s (±1 s)",
+                                       (rec[0] - ZOOM_HALF_S, rec[0] + ZOOM_HALF_S))
         if tr is not None:
             # Also offer the moment the node entered recovery, if it did.
             rec = [i for i, p in enumerate(tr["phase"]) if "RECOVERY" in p]

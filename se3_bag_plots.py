@@ -724,12 +724,48 @@ def _bool_spans(t, v):
     return _spans(t, np.nan_to_num(v) > 0.5)
 
 
+def pc_steps(sess, flies):
+    """Step timeline for a bag WITHOUT a trace, from logs/steps_pc.jsonl (the
+    node's '-> STEP' lines as the PC monitor logged them: PC clock, 1 s
+    resolution).  Aligned by matching the first SE3 step to the first span
+    where SE3 commands in the bag.  [(t0, t1, step)], or [] if unalignable."""
+    try:
+        with open(os.path.join(sess.path, "logs", "steps_pc.jsonl")) as f:
+            ev = [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError):
+        return []
+    def sec(e):
+        h, m, s_ = map(int, e["pc_time"].split(":"))
+        return h * 3600 + m * 60 + s_
+    first_pc = next((sec(e) for e in ev if "SE3" in e["step"]), None)
+    first_bag = next((a for a, _b, k, _l in flies if k in ("se3", "se3_dis")), None)
+    if first_pc is None or first_bag is None:
+        return []
+    off = first_bag - first_pc
+    out = []
+    for i, e in enumerate(ev):
+        if e["step"] == "NODE_STOPPED":
+            break
+        a = sec(e) + off
+        b = min(sec(ev[i + 1]) + off if i + 1 < len(ev) else sess.duration_s,
+                sess.duration_s)
+        if e["step"] == "YIELDED":
+            out.append((a, max(b, a + 0.3), "YIELDED (node silent)"))
+        elif b > a:
+            out.append((a, b, e["step"]))
+    return out
+
+
 def _draw_strip(ax, sess, flies, t_end):
     rows = []
     tr = sess.trace
     if tr is not None:
         segs = _segments(tr["t"], list(tr["phase"]), max_gap=0.5)
         rows.append(("SE3 step (trace)", segs, None))
+    else:
+        segs = pc_steps(sess, flies)
+        if segs:
+            rows.append(("SE3 step (PC log ±1 s)", segs, None))
     rows.append(("who flies", flies, None))
     st = sess.topics.get("vehicle_status")
     armed = (_spans(st["t"], np.asarray(st["arming_state"], float) == 2)
@@ -750,7 +786,8 @@ def _draw_strip(ax, sess, flies, t_end):
                      }.get(kind, C_PX4_OWN)
             elif label.startswith("SE3 step"):
                 text = it[2]
-                c = C_BAD if "RECOVERY" in text else C_SE3
+                c = (C_BAD if "RECOVERY" in text else
+                     C_IDLE if "YIELDED" in text else C_SE3)
             else:
                 text, c = "", color
             ax.broken_barh([(a, b - a)], (y - 0.4, 0.8), facecolors=c,
