@@ -97,6 +97,8 @@ AXIS_COL = {"E": "#2a78d6", "N": "#d2691e", "U": "#4a3aa7",
 C_SE3 = "#e08a00"             # orange: SE3 flying (direct thrust/torque)
 C_PX4_OFFB = "#2a78d6"        # blue: offboard, but PX4's own position loop
 C_HOVER = "#1e9e5a"
+C_ARMED_SPAN = "#8a3fb5"      # purple: armed (red is reserved for RECOVERY)
+LEGEND_X = 1.085              # legend column, in axes fractions right of the plot
 MOTOR_COL = ["#2a78d6", "#d2691e", "#1e9e5a", "#8a3fb5"]
 
 
@@ -601,7 +603,7 @@ def _draw_strip(ax, sess, flies, t_end):
     st = sess.topics.get("vehicle_status")
     armed = (_spans(st["t"], np.asarray(st["arming_state"], float) == 2)
              if st is not None else [])
-    rows.append(("armed", armed, C_BAD))
+    rows.append(("armed", armed, C_ARMED_SPAN))
     ld = sess.topics.get("vehicle_land_detected")
     rows.append(("landed", _bool_spans(ld["t"], ld["landed"]) if ld else [], C_ARMED))
 
@@ -626,6 +628,14 @@ def _draw_strip(ax, sess, flies, t_end):
     if tr is None:
         ax.text(0.995, 0.97, sess.trace_note, transform=ax.transAxes, ha="right",
                 va="top", fontsize=7, color=C_MUTED)
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color=C_PX4_OFFB, label="PX4 flying (offboard position)"),
+                       Patch(color=C_SE3, label="SE3 flying (thrust + torque)"),
+                       Patch(color=C_BAD, label="SE3 RECOVERY"),
+                       Patch(color=C_ARMED_SPAN, label="armed"),
+                       Patch(color=C_ARMED, label="landed (PX4 land detector)")],
+              loc="upper left", bbox_to_anchor=(LEGEND_X, 1.0), borderaxespad=0.0,
+              fontsize=8.5, frameon=True, framealpha=0.95, borderpad=0.4)
     ax.set_yticks(range(n))
     ax.set_yticklabels([r[0] for r in reversed(rows)], fontsize=7)
     ax.set_ylim(-0.6, n - 0.4)
@@ -646,7 +656,7 @@ def build_dashboard(sess, window=None, panels=None, width_in=14.0):
     fig = Figure(figsize=(width_in, total * unit + 1.2), facecolor=C_SURFACE)
     top_in, bot_in = 0.95, 0.55
     gs = fig.add_gridspec(len(keys), 1, height_ratios=[h for _, _, h in keys],
-                          left=0.115, right=0.90, hspace=0.62,
+                          left=0.10, right=0.76, hspace=0.62,
                           top=1 - top_in / fig.get_figheight(),
                           bottom=bot_in / fig.get_figheight())
     axes, first = {}, None
@@ -1061,5 +1071,11 @@ def _legend(ax, ncol=4, extra=None):
         h2, l2 = extra.get_legend_handles_labels()
         h, l = h + h2, l + l2
     if h:
-        ax.legend(h, l, loc="upper right", fontsize=7, ncol=ncol, frameon=True,
-                  framealpha=0.85, borderpad=0.3, handlelength=1.8)
+        # Outside the plot, in the right margin (past any twin y axis), one
+        # entry per line: inside, at 7 pt, they sat on the data and read as
+        # "no legend" (user, 2026-11-13).  ncol is kept for call compatibility.
+        leg = ax.legend(h, l, loc="upper left", bbox_to_anchor=(LEGEND_X, 1.0),
+                        borderaxespad=0.0, fontsize=8.5, ncol=1, frameon=True,
+                        framealpha=0.95, borderpad=0.4, handlelength=2.2)
+        for ln in leg.get_lines():          # thin data lines -> swatches read as grey
+            ln.set_linewidth(2.6)
