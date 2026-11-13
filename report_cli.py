@@ -34,6 +34,7 @@ from report_model import (ALIGNMENTS, Report, list_reports, reports_dir)
 from report_render import (STAT_COLS, _percent_scale, assign_axes,
                            build_figure, fit_value_axes, fmt_stat, graph_topics,
                            gather_series, scatter_points, short_ref, stats_of,
+                           xy_rows,
                            window_of)
 from ulog_cache import parse_ulog
 from ulog_common import C_INK, VARY, field_inventory, parse_ref
@@ -236,7 +237,8 @@ def cmd_render(args):
             page = (PAGE[0], PAGE[1] * getattr(g, "height", 1.0))
             fig, ax, axr, lines = build_figure(g, series, problems,
                                                figsize=page, auto=auto)
-            scatter = getattr(g, "kind", "series") == "scatter"
+            kind = getattr(g, "kind", "series")
+            scatter = kind != "series"      # scatter and xy: x is not a clock
             if not g.xlim and not scatter:
                 # A scatter's x axis is a measured quantity, not a clock, and
                 # build_figure has already fitted it to the points.
@@ -249,7 +251,9 @@ def cmd_render(args):
             pages += 1
 
             xlim = None if scatter else (g.xlim or window_of(series))
-            if scatter:
+            if kind == "xy":
+                rows = xy_rows(g, series)
+            elif scatter:
                 rows = _scatter_rows(g, series)
             else:
                 rows = [f"{'log':<26} {'channel':<34} " +

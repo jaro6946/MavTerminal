@@ -34,7 +34,7 @@ __all__ = ["SERIES_COLORS", "LOG_STYLES", "STAT_COLS", "DRAW_PX",
            "auto_axis", "assign_axes", "build_figure", "fit_value_axes",
            "window_of", "plot_y", "log_date", "LANE_ON", "LANE_FRAC",
            "scatter_points", "spearman", "axis_label", "log_epoch",
-           "graph_topics"]
+           "graph_topics", "xy_curves", "xy_rows"]
 
 # Channel colours.  A categorical set -- these encode identity, not magnitude, so
 # they are chosen to stay apart at one-pixel line width and to survive the two
@@ -711,6 +711,179 @@ def _scatter_caption(fig, ax, text, qx, qy, diam):
     return best
 
 
+# --- xy: channel 1 as the x axis -------------------------------------------
+
+XY_BINS = 24                # x bins across the range all logs share
+XY_MIN_PER_BIN = 5          # fewer samples than this and a median is anecdote
+XY_PAIR_S = 0.25            # max time between an x and a y sample to pair them
+
+
+def _pair(sx, sy):
+    """(x, y) for every sample of `sy` that has an `sx` sample within XY_PAIR_S.
+
+    Nearest-in-time, not interpolated: x here is usually a step signal (motor
+    output) and y a heading, and interpolating either across a gap would invent
+    samples that were never measured.  Channels computed on one clock -- the
+    liftoff channels are -- pair exactly."""
+    tx, x = sx["t"], sx["y"]
+    ty, y = sy["t"], sy["y"]
+    if tx.size == 0 or ty.size == 0:
+        return np.array([]), np.array([])
+    i = np.clip(np.searchsorted(tx, ty), 1, tx.size - 1)
+    i = np.where(np.abs(tx[i - 1] - ty) <= np.abs(tx[i] - ty), i - 1, i)
+    ok = (np.abs(tx[i] - ty) <= XY_PAIR_S / 60.0) & np.isfinite(y) & np.isfinite(x[i])
+    return x[i][ok], y[ok]
+
+
+XY_TOP_PCT = 99.0           # x range ends here, not at the single largest sample
+
+
+def xy_range(curves):
+    """(lo, hi) of x across these curves: the minimum to the XY_TOP_PCT-th
+    percentile.  One momentary output spike to 1650 on a log that otherwise
+    tops out at 1300 would give a fifth of the axis -- and of the bins -- to
+    nothing."""
+    allx = np.concatenate([c["x"] for c in curves])
+    lo = float(np.min(allx))
+    hi = float(np.percentile(allx, XY_TOP_PCT))
+    return lo, (hi if hi > lo else lo + 1.0)
+
+
+def xy_curves(graph, series):
+    """[{log, ref, date, epoch, li, yi, x, y, bx, by, bn}] for an xy graph.
+
+    One entry per (log, y channel): the paired raw samples (x, y) and the
+    binned median curve (bx = bin centres, by = medians, bn = counts; bins
+    under XY_MIN_PER_BIN are NaN).  Bins span the x range of EVERY log, so the
+    curves share their x positions and can be compared bin for bin.  Logs are
+    in date order, oldest first, like the scatter."""
+    if len(graph.fields) < 2:
+        return []
+    xr = graph.fields[0]
+    by_log = {}
+    for s in series:
+        by_log.setdefault(s["log"], {})[s["ref"]] = s
+    order = sorted(by_log, key=lambda n: (next(iter(by_log[n].values()))
+                                          .get("epoch", float("inf")), n))
+    raw = []
+    for li, name in enumerate(order):
+        d = by_log[name]
+        sx = d.get(xr)
+        if sx is None:
+            continue
+        for yi, yr in enumerate(graph.fields[1:]):
+            sy = d.get(yr)
+            if sy is None:
+                continue
+            x, y = _pair(sx, sy)
+            if x.size:
+                raw.append({"log": name, "ref": yr, "date": sx.get("date", ""),
+                            "li": li, "yi": yi, "x": x, "y": y})
+    if not raw:
+        return []
+    lo, hi = xy_range(raw)
+    edges = np.linspace(lo, hi, XY_BINS + 1)
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    for r in raw:
+        # The few samples past the top edge join the last bin rather than
+        # being dropped: they are real, just rare.
+        k = np.clip(np.digitize(r["x"], edges) - 1, 0, XY_BINS - 1)
+        by = np.full(XY_BINS, np.nan)
+        bn = np.bincount(k, minlength=XY_BINS)
+        for b in np.nonzero(bn >= XY_MIN_PER_BIN)[0]:
+            by[b] = float(np.median(r["y"][k == b]))
+        r.update(bx=centres, by=by, bn=bn)
+    return raw
+
+
+def _xy_figure(graph, series, fig, ax):
+    """Draw the xy form; returns legend handles.
+
+    Colour = LOG and line style = CHANNEL, always: the point of this kind is a
+    log's channels read as one pair against the same x, so a log's curves
+    share a colour and the second channel listed after x is dashed.  The raw
+    samples go underneath as a faint cloud in the same colour, so a median
+    resting on a handful of points does not look like a law."""
+    curves = xy_curves(graph, series)
+    handles = []
+    if len(graph.fields) < 2:
+        return handles
+    for c in curves:
+        col = series_color(c["li"])
+        ax.plot(c["x"], c["y"], ls="none", marker="o", ms=1.6, alpha=0.18,
+                color=col, mew=0, zorder=1, rasterized=True)
+    for c in curves:
+        col = series_color(c["li"])
+        ax.plot(c["bx"], c["by"], color=col, ls=log_style(c["yi"]), lw=1.9,
+                marker="o", ms=3.2, zorder=3)
+    seen = []
+    for c in curves:
+        if c["log"] in seen:
+            continue
+        seen.append(c["log"])
+        stem = os.path.splitext(c["log"])[0]
+        if len(stem) > 34:
+            stem = stem[:33] + "…"
+        handles.append(Line2D([], [], color=series_color(c["li"]), lw=2,
+                              label=stem + (f" ({c['date']})" if c["date"] else "")))
+    for yi, yr in enumerate(graph.fields[1:]):
+        handles.append(Line2D([], [], color=C_MUTED, lw=1.8, ls=log_style(yi),
+                              label=short_ref(yr)))
+    ax.set_xlabel(axis_label([graph.fields[0]], "left"), fontsize=9, color=C_MUTED)
+    ax.set_ylabel(axis_label(graph.fields[1:], "left"), fontsize=9, color=C_MUTED)
+    ax.axhline(0, color=C_GRID, lw=1.0, zorder=0)
+    if curves:
+        # Fit y to the MEDIAN curves, not to the cloud: one wild sample would
+        # otherwise flatten every curve on the panel.  The cloud may run off
+        # the frame; it is context, the curves are the finding.
+        ys = np.concatenate([c["by"][np.isfinite(c["by"])] for c in curves])
+        if ys.size:
+            lo, hi = float(ys.min()), float(ys.max())
+            m = max((hi - lo) * 0.15, 1.0)
+            ax.set_ylim(lo - m, hi + m)
+        lo, hi = xy_range(curves)
+        pad = 0.03 * (hi - lo)
+        ax.set_xlim(lo - pad, hi + pad)
+        ax.text(0.015, 0.97,
+                f"lines: median per x bin ({XY_BINS} bins, bins with under "
+                f"{XY_MIN_PER_BIN} samples left out)   ·   dots: every sample",
+                transform=ax.transAxes, ha="left", va="top", fontsize=8,
+                color=C_MUTED, zorder=5)
+    return handles
+
+
+def xy_rows(graph, series):
+    """Statistics page for an xy graph: each curve's value at low and high x.
+
+    "Low" and "high" are the bottom and top quarter of the shared x range, so
+    the last column is how much the channel moved as x rose -- the number the
+    picture is about."""
+    if len(graph.fields) < 2:
+        return ["(an xy graph needs an x channel and at least one more)"]
+    curves = xy_curves(graph, series)
+    if not curves:
+        return ["(no paired samples)"]
+    lo, hi = xy_range(curves)
+    q1, q3 = lo + 0.25 * (hi - lo), lo + 0.75 * (hi - lo)
+    rows = [f"x = {short_ref(graph.fields[0])}, range {fmt_stat(lo)} – "
+            f"{fmt_stat(hi)} (to the {XY_TOP_PCT:g}th percentile)",
+            f"low x = below {fmt_stat(q1)}, high x = above {fmt_stat(q3)};  "
+            f"medians of the raw samples",
+            "",
+            f"{'log':<40} {'date':<8} {'channel':<26} {'n':>6} "
+            f"{'y at low x':>11} {'y at high x':>12} {'change':>9}",
+            "-" * 116]
+    for c in curves:
+        a, b = c["y"][c["x"] < q1], c["y"][c["x"] > q3]
+        ya = float(np.median(a)) if a.size else None
+        yb = float(np.median(b)) if b.size else None
+        ch = (yb - ya) if (ya is not None and yb is not None) else None
+        rows.append(f"{os.path.splitext(c['log'])[0][:39]:<40} {c['date'] or '':<8} "
+                    f"{short_ref(c['ref'])[:25]:<26} {c['x'].size:>6} "
+                    f"{fmt_stat(ya):>11} {fmt_stat(yb):>12} {fmt_stat(ch):>9}")
+    return rows
+
+
 def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
                  auto=None):
     """The graph, exactly as both the tab and the exporter draw it.
@@ -774,6 +947,27 @@ def build_figure(graph, series, problems=(), figsize=(13.0, 4.3), dpi=100,
         # Last: both calls above move the axes, and the markers are kept apart
         # in PIXELS, so they can only be placed once the frame stops moving.
         _scatter_markers(fig, ax, state)
+        return fig, ax, None, []
+
+    if getattr(graph, "kind", "series") == "xy":
+        # No time axis either.  lines=[] for the same reason as the scatter:
+        # nothing for the window-fitting machinery to re-decimate or refit.
+        handles = _xy_figure(graph, series, fig, ax)
+        ax.set_title(graph.title or "untitled graph", loc="left", fontsize=11,
+                     color=C_INK)
+        ax.grid(True, color=C_GRID, lw=0.6)
+        if handles:
+            leg = ax.legend(handles=handles, loc="lower left",
+                            bbox_to_anchor=(0.055, 0.012),
+                            bbox_transform=fig.transFigure,
+                            ncol=max(2, min(4, (len(handles) + 2) // 3)),
+                            fontsize=8, frameon=False, handlelength=2.6,
+                            columnspacing=1.4)
+            leg.set_in_layout(False)
+            _fit_legend(fig, ax)
+        note = "; ".join(list(problems)[:3])
+        if note:
+            _problem_note(fig, note)
         return fig, ax, None, []
 
     lines = []

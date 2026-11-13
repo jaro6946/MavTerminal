@@ -31,6 +31,13 @@ Refs look like normal ones so nothing else has to learn a new syntax:
     mag[k].failed_over              1 while the estimator is NOT being fed
                                     magnetometer #k (the voter's "MAG #k
                                     failed" decision, as a channel)
+    liftoff[0].esc_output           mean motor output, inside a window around
+                                    every spin-up from the ground (NaN outside)
+    liftoff[0].compass_change       compass heading change since just before
+                                    the spin-up, degrees, same windows
+    liftoff[0].gyro_change          integrated yaw rate over the same windows,
+                                    degrees -- what the vehicle REALLY turned
+    liftoff[0].residual             compass_change - gyro_change, degrees
     heading[0].published_vs_gsf     |published heading - GSF heading|, degrees
     heading[0].compass_vs_gsf       |compass heading - GSF heading|, degrees,
                                     level flight only
@@ -55,7 +62,7 @@ from ulog_accel import preflight_bias_fail
 __all__ = ["derived_field", "is_derived", "DERIVED_REFS",
            "DERIVED_UNITS", "derived_units", "derived_inputs"]
 
-DERIVED_TOPICS = ("preflight", "imu", "dds", "mag", "heading", "gps")
+DERIVED_TOPICS = ("preflight", "imu", "dds", "mag", "heading", "gps", "liftoff")
 
 _EMPTY = (np.array([]), np.array([]))
 
@@ -433,7 +440,148 @@ def _get(ulog, name, inst):
                  if d.name == name and d.multi_id == inst), None)
 
 
+# --- liftoff: does the compass turn when the motors spool up? ----------------
+#
+# The magnetometer sits on the flight-controller board, a few centimetres from
+# the power wiring.  When the motors go from idle to flight power, the current
+# in that wiring makes a magnetic field of its own, which adds to Earth's at the
+# sensor -- and the compass heading swings although the vehicle has not turned.
+#
+# The witness is the gyro.  Integrated over a few seconds it measures how far
+# the vehicle REALLY turned, and a gyro cannot see a magnetic field.  So for
+# every spin-up from the ground the window carries three channels on one clock:
+#
+#   liftoff[0].esc_output      mean of the four motor outputs (actuator_outputs)
+#   liftoff[0].compass_change  tilt-compensated compass heading, change since
+#                              before the motors started, degrees
+#   liftoff[0].gyro_change     yaw-rate integral over the same window, degrees
+#   liftoff[0].residual        compass_change - gyro_change: the compass
+#                              movement that rotation does not explain
+#
+# Plotted against esc_output (an "xy" graph), the two heading channels lie on
+# top of each other while the compass is honest and part company as the output
+# rises if it is not.  Both are zeroed on the same pre-spin-up stretch, so any
+# real turning shows in both and only the interference shows in one.
+#
+# Windows run LIFTOFF_PRE before each spin-up to LIFTOFF_POST after it: long
+# enough to reach flight power, short enough that integrated gyro bias is
+# negligible (a 0.1 deg/s residual is under 1 degree over the window).
+# Samples tilted past LIFTOFF_TILT are NaN: tilt compensation degrades there.
+
+LIFTOFF_PRE = 2.0 / 60.0        # minutes before the spin-up
+# Six seconds: the spool-up to flight power lands 3-5 s after the motors
+# start on these flights, and the vehicle starts its own deliberate yawing
+# from about 6 s -- real turns that both channels then carry, which buries
+# the comparison the window is for.
+LIFTOFF_POST = 6.0 / 60.0       # minutes after it
+LIFTOFF_REF = 1.5 / 60.0        # the zero = median over the last 1.5 s before it
+LIFTOFF_TILT = 20.0             # deg
+
+
+def _liftoff_windows(ulog):
+    """{'t', 'esc', 'compass', 'gyro', 'residual'} on the compass's own clock, every
+    spin-up window concatenated with one NaN between windows.  Cached on the
+    ULog object: the three channels share one computation."""
+    cached = getattr(ulog, "_liftoff_cache", None)
+    if cached is not None:
+        return cached
+    from ulog_heading import _attitude, mag_heading
+    out = {k: np.array([]) for k in ("t", "esc", "compass", "gyro", "residual")}
+    try:
+        a = _get(ulog, "actuator_outputs", 0)
+        av = _get(ulog, "vehicle_angular_velocity", 0)
+        ld = _get(ulog, "vehicle_land_detected", 0)
+        if a is None or av is None or ld is None:
+            raise LookupError
+        ta = _minutes(ulog, a)
+        esc = np.mean([np.asarray(a.data[f"output[{i}]"], float)
+                       for i in range(4)], axis=0)
+        tl = _minutes(ulog, ld)
+        landed = np.asarray(ld.data["landed"], float)
+        tm, mag, _true, tilt = mag_heading(ulog)
+        tq, roll, pitch, _yaw = _attitude(ulog)
+        if tm.size == 0 or tq.size == 0:
+            raise LookupError
+
+        # Yaw rate from body rates.  The Euler kinematics, not the body z
+        # rate alone: in NED, d(yaw)/dt = (q sin(roll) + r cos(roll)) / cos(pitch).
+        # vehicle_angular_velocity is the bias-corrected rate at 50 Hz;
+        # sensor_gyro is logged at 1 Hz on these boards, far too coarse to
+        # integrate.
+        tw = _minutes(ulog, av)
+        q = np.asarray(av.data["xyz[1]"], float)
+        r = np.asarray(av.data["xyz[2]"], float)
+        ph = np.interp(tw, tq, roll)
+        th = np.interp(tw, tq, pitch)
+        yaw_rate = np.degrees((q * np.sin(ph) + r * np.cos(ph)) / np.cos(th))
+
+        on = esc > 1.0
+        ups = ta[1:][on[1:] & ~on[:-1]]
+        ts, es, cs, gs = [], [], [], []
+        for t0 in ups:
+            # From the ground only: a motor restart in the air is not a liftoff.
+            if _step_at([t0], tl, landed, 0.0)[0] < 0.5:
+                continue
+            m = (tm >= t0 - LIFTOFF_PRE) & (tm <= t0 + LIFTOFF_POST)
+            if m.sum() < 20:
+                continue
+            t = tm[m]
+            c = np.degrees(np.unwrap(np.radians(mag[m])))
+            mw = (tw >= t0 - LIFTOFF_PRE) & (tw <= t0 + LIFTOFF_POST)
+            if mw.sum() < 20:
+                continue
+            # Trapezoidal integral of yaw rate, in DEGREES (time is in minutes).
+            twm, yr = tw[mw], yaw_rate[mw]
+            g = np.concatenate(([0.0], np.cumsum(
+                0.5 * (yr[1:] + yr[:-1]) * np.diff(twm) * 60.0)))
+            g = np.interp(t, twm, g)
+            ref = (t >= t0 - LIFTOFF_REF) & (t < t0)
+            if ref.sum() < 3:
+                continue
+            c = c - np.median(c[ref])
+            g = g - np.median(g[ref])
+            bad = tilt[m] > LIFTOFF_TILT
+            c[bad] = np.nan
+            g[bad] = np.nan
+            ts.append(t)
+            es.append(_step_at(t, ta, esc, 0.0))
+            cs.append(c)
+            gs.append(g)
+        if ts:
+            t = np.concatenate(ts)
+            out = {"t": t}
+            # residual = compass - gyro, sample by sample: the part of the
+            # compass's movement that rotation does not explain.
+            rs = [c - g for c, g in zip(cs, gs)]
+            for k, v in (("esc", es), ("compass", cs), ("gyro", gs),
+                         ("residual", rs)):
+                # The same gap-breaking NaN for all three keeps them on one
+                # clock, sample for sample.
+                _t, out[k] = _break_gaps(t, np.concatenate(v))
+            out["t"] = _t
+    except (LookupError, KeyError, ValueError):
+        pass
+    try:
+        ulog._liftoff_cache = out
+    except AttributeError:
+        pass
+    return out
+
+
+def _liftoff(key):
+    def fn(ulog, inst):
+        w = _liftoff_windows(ulog)
+        if w["t"].size == 0:
+            return _EMPTY
+        return w["t"], w[key]
+    return fn
+
+
 _REGISTRY = {
+    ("liftoff", "esc_output"): _liftoff("esc"),
+    ("liftoff", "compass_change"): _liftoff("compass"),
+    ("liftoff", "gyro_change"): _liftoff("gyro"),
+    ("liftoff", "residual"): _liftoff("residual"),
     ("preflight", "accel_bias_fail"): _accel_bias_fail,
     ("imu", "accel_error_rate"): _accel_error_rate,
     ("dds", "offboard_rate"): _offboard_rate,
@@ -453,6 +601,10 @@ DERIVED_REFS = tuple(f"{topic}[i].{name}" for topic, name in _REGISTRY)
 # rate axis with no units on it is genuinely ambiguous (per second? per
 # minute?).
 DERIVED_UNITS = {
+    ("liftoff", "esc_output"): "mean motor output",
+    ("liftoff", "compass_change"): "deg",
+    ("liftoff", "gyro_change"): "deg",
+    ("liftoff", "residual"): "deg",
     ("preflight", "accel_bias_fail"): "0/1",
     ("imu", "accel_error_rate"): "errors/min",
     ("dds", "offboard_rate"): "Hz",
@@ -470,6 +622,9 @@ DERIVED_UNITS = {
 # a 7 GB WSL out of memory.  None = not enumerated (the heading and mag
 # channels reach into plot modules) -- the caller must then parse everything.
 DERIVED_INPUTS = {
+    "liftoff": ("actuator_outputs", "vehicle_angular_velocity",
+                "vehicle_land_detected", "vehicle_attitude",
+                "vehicle_magnetometer"),
     "preflight": ("estimator_sensor_bias",),
     "imu": ("sensor_accel",),
     "dds": ("offboard_control_mode",),

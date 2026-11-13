@@ -47,8 +47,15 @@ DEFAULT_COLOR_BY = "channel"
 # which is the only way to show a relationship that exists ACROSS logs rather
 # than within one.  A dose-response is exactly that shape: the quantity on each
 # axis is a property of the whole log, and time is not on the picture at all.
+#
+# "xy" is the within-log version of scatter: channel 1 becomes the X AXIS and
+# every other channel is drawn against it sample by sample (paired on time),
+# as a binned median curve per log over a faint cloud of the raw samples.  It
+# answers "what does Y do as X rises" -- motor output against heading change,
+# say -- where time is only the thing that pairs the samples up.
 KINDS = {"series": "channels against time",
-         "scatter": "one point per log: mean of channel 1 vs mean of channel 2"}
+         "scatter": "one point per log: mean of channel 1 vs mean of channel 2",
+         "xy": "channel 1 on the x axis, the others against it, per sample"}
 DEFAULT_KIND = "series"
 
 # Per-graph vertical room, as a multiple of whatever the caller's standard plot

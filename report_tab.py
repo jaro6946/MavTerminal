@@ -661,6 +661,8 @@ class GraphCard(QtWidgets.QFrame):
 
     # -- zoom follow-through
     def _xlim_changed(self, lo, hi):
+        if getattr(self.graph, "kind", "series") != "series":
+            return                  # x is not a clock there; see _view_changed
         self.graph.xlim = (float(lo), float(hi))
         self.changed.emit()
 
@@ -672,8 +674,8 @@ class GraphCard(QtWidgets.QFrame):
         the plot gets emptier the closer you look."""
         if self._ax is None:
             return
-        if getattr(self.graph, "kind", "series") == "scatter":
-            # A scatter has no time axis and no lines to re-decimate, and its
+        if getattr(self.graph, "kind", "series") != "series":
+            # A scatter (or xy) has no time axis and no lines to re-decimate, and its
             # x limits are a fit to the points -- saving them as `xlim` would
             # mark the report modified for a pan that means nothing.
             return
@@ -714,7 +716,11 @@ class GraphCard(QtWidgets.QFrame):
         self.stats.setFixedHeight(max(h, 40))
 
     def update_stats(self):
-        xlim = self._ax.get_xlim() if self._ax is not None else None
+        # Only a series graph's x axis is TIME.  A scatter's or xy graph's is a
+        # measured quantity, and using its limits as a time window made most of
+        # the rows read 0 samples.
+        xlim = (self._ax.get_xlim() if self._ax is not None
+                and getattr(self.graph, "kind", "series") == "series" else None)
         self.stats.setRowCount(len(self._full))
         for r, s in enumerate(self._full):
             st = stats_of(s["t"], s["y"], xlim)
