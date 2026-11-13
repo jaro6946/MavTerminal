@@ -92,11 +92,17 @@ class SE3Dashboard(QtWidgets.QWidget):
         self.folder = folder
         self.bag_pick.clear()
         bags = P.list_bags(folder) if folder and os.path.isdir(folder) else []
+        ses = (P.session_numbers(os.path.dirname(os.path.abspath(folder)))
+               if bags else {})
         for b in bags:
             name = os.path.basename(b)
             has_trace = os.path.isfile(os.path.join(b, "logs", "se3_trace.csv"))
-            self.bag_pick.addItem(f"{name.replace('FLIGHT_', '')}"
-                                  f"{'   + trace' if has_trace else ''}", b)
+            self.bag_pick.addItem(
+                f"{ses.get(name, '------')}  {P.session_label_time(name):<16} "
+                f"{P.missions_text(P.read_missions(b)):<14}"
+                f"{'  + trace' if has_trace else ''}", b)
+            self.bag_pick.setItemData(self.bag_pick.count() - 1, name,
+                                      QtCore.Qt.ToolTipRole)
         if not bags:
             self._clear_canvas()
             self.view_pick.clear()
@@ -185,7 +191,8 @@ class SE3Dashboard(QtWidgets.QWidget):
         self.tb_holder.addWidget(self.toolbar)
         self.canvas.draw_idle()
         s = self.sess
-        bits = [f"{s.name}", f"{s.duration_s:.1f} s"]
+        bits = [s.ses, P.session_label_time(s.name),
+                P.missions_text(s.missions, short=False), f"{s.duration_s:.1f} s"]
         if s.truncated:
             bits.append("recorder was killed: bag read to its last complete chunk")
         bits.append(s.align or s.trace_note)

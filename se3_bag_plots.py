@@ -66,6 +66,8 @@ wire encoding.
 """
 import csv
 import dataclasses
+import datetime
+import json
 import glob
 import os
 import re
@@ -222,10 +224,103 @@ class BagSession:
     topics: dict            # short name -> {"t": s, field: array}
     rates: dict             # full topic -> array of receive times (s)
     trace: dict = None      # column -> array, "t" in s; None if no trace
+    ses: str = ""           # permanent session number, e.g. "SES007"
+    missions: list = None   # [{name, wall, pc_time, ...}] from logs/missions.jsonl
     trace_note: str = ""
     align: str = ""         # alignment check, for the header
     node_log: str = ""
     hover_n: float = HOVER_THRUST_N
+
+
+# --- session numbers + missions ----------------------------------------------
+# A permanent three-digit handle per session ("SES007"), like logGraph's MTL
+# numbers for logs: assigned once, in time order, stored in <collection>/
+# sessions.json, never renumbered (deleting a bag leaves a gap).
+SES_PREFIX = "SES"
+SES_REGISTRY = "sessions.json"
+_STAMP_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})$")
+
+
+def session_when(name):
+    """'FLIGHT_x_2026-11-11_11-53-57' -> datetime (PC clock at Connect), or None."""
+    m = _STAMP_RE.search(name)
+    return datetime.datetime(*map(int, m.groups())) if m else None
+
+
+def session_label_time(name):
+    w = session_when(name)
+    return w.strftime("%b %d %H:%M:%S").replace(" 0", " ") if w else name
+
+
+def session_numbers(collection_root):
+    """{bag folder name: 'SES001', ...} for every bag under collection_root,
+    assigning the next numbers to new bags (time order) and saving."""
+    path = os.path.join(collection_root, SES_REGISTRY)
+    try:
+        with open(path) as f:
+            reg = json.load(f)
+    except (OSError, ValueError):
+        reg = {}
+    nums = dict(reg.get("sessions", {}))
+    bags = [os.path.basename(d) for d in glob.glob(os.path.join(collection_root, "*", "*"))
+            if os.path.isdir(d) and glob.glob(os.path.join(d, "*.mcap"))]
+    new = sorted((b for b in bags if b not in nums),
+                 key=lambda b: (session_when(b) or datetime.datetime.max, b))
+    if new:
+        nxt = max(nums.values(), default=0) + 1
+        for b in new:
+            nums[b] = nxt
+            nxt += 1
+        try:
+            with open(path + ".tmp", "w") as f:
+                json.dump({"prefix": SES_PREFIX, "sessions": nums}, f, indent=1,
+                          sort_keys=True)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass                      # read-only folder: numbers still shown
+    return {b: "%s%03d" % (SES_PREFIX, n) for b, n in nums.items()}
+
+
+def read_missions(bag_dir):
+    """Missions this session ran: logs/missions.jsonl (node-written, or
+    backfilled from the PC run folder), else node.log's 'step mission' lines."""
+    out = []
+    try:
+        with open(os.path.join(bag_dir, "logs", "missions.jsonl")) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        pass
+        return out
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(bag_dir, "logs", "node.log")) as f:
+            for line in f:
+                m = re.search(r"(?:step mission|mission_spec) '([^']*)'", line)
+                if m:
+                    out.append({"name": m.group(1), "wall": None,
+                                "source": "node.log"})
+    except OSError:
+        pass
+    return out
+
+
+def mission_short(name):
+    """'Startup Mission 2a: SE3 0.5 s ...' -> 'Mission 2a'."""
+    m = re.match(r"(?:Startup )?(Mission \S+?):", name or "")
+    return m.group(1) if m else (name or "?")
+
+
+def missions_text(missions, short=True):
+    if not missions:
+        return "no mission run"
+    names = [mission_short(m.get("name")) if short else m.get("name", "?")
+             for m in missions]
+    return ", ".join(names)
 
 
 def list_bags(date_folder):
@@ -289,6 +384,9 @@ def load_session(bag_dir):
                       truncated=truncated, topics=topics, rates=rates)
     _attach_trace(sess)
     _read_node_log(sess)
+    sess.missions = read_missions(bag_dir)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(bag_dir)))
+    sess.ses = session_numbers(root).get(sess.name, "")
     return sess
 
 
@@ -628,6 +726,17 @@ def _draw_strip(ax, sess, flies, t_end):
     if tr is None:
         ax.text(0.995, 0.97, sess.trace_note, transform=ax.transAxes, ha="right",
                 va="top", fontsize=7, color=C_MUTED)
+    # Mission uploads with a box-clock time (node-written missions.jsonl; the
+    # backfilled ones only have the PC's time and are named in the title).
+    for m in sess.missions or []:
+        w = m.get("wall")
+        if w is None:
+            continue
+        tm = float(w) - sess.t0_ns / 1e9
+        if -1.0 <= tm <= t_end + 1.0:
+            ax.axvline(tm, color=C_INK, lw=1.2, ls=":", zorder=5)
+            ax.text(tm, n - 0.45, " " + mission_short(m.get("name")), fontsize=7,
+                    color=C_INK, va="bottom", ha="left", clip_on=False)
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(color=C_PX4_OFFB, label="PX4 flying (offboard position)"),
                        Patch(color=C_SE3, label="SE3 flying (thrust + torque)"),
@@ -676,7 +785,10 @@ def build_dashboard(sess, window=None, panels=None, width_in=14.0):
     hdr = (f"{sess.name}   ·   {sess.duration_s:.1f} s"
            + ("   ·   recorder killed: read up to the last complete chunk"
               if sess.truncated else ""))
-    fig.text(0.115, 1 - 0.30 / fig.get_figheight(), "SE3 session", fontsize=13,
+    title = "   ·   ".join(b for b in (
+        sess.ses or "SE3 session", session_label_time(sess.name),
+        missions_text(sess.missions, short=False)) if b)
+    fig.text(0.115, 1 - 0.30 / fig.get_figheight(), title, fontsize=13,
              fontweight="bold", color=C_INK)
     fig.text(0.115, 1 - 0.52 / fig.get_figheight(), hdr, fontsize=8, color=C_MUTED)
     fig.text(0.115, 1 - 0.70 / fig.get_figheight(), sess.align or sess.trace_note,

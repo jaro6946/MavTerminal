@@ -753,6 +753,9 @@ class BagTab(QtWidgets.QWidget):
             else:
                 txt = (f"{e['name']:<16} {e['n_bags']:>2} bags   "
                        + ("no video yet" if self._can_make() else "bags only (no camera)"))
+            rng = self._ses_range(e)
+            if rng:
+                txt += "   " + rng
             self.picker.addItem(txt)
             if not e["video"]:
                 self.picker.setItemData(self.picker.count() - 1,
@@ -770,6 +773,23 @@ class BagTab(QtWidgets.QWidget):
         else:
             self._update_make_btn()
             self._sync_dash(self.entries[idx])
+
+    def _ses_range(self, e):
+        """'SES005-SES007' for a date row of a collection that has a session
+        registry (se3_bag_plots.session_numbers); '' otherwise."""
+        if not e.get("date") or not os.path.isfile(os.path.join(self.bags_root,
+                                                                "sessions.json")):
+            return ""
+        try:
+            import se3_bag_plots as P
+            nums = P.session_numbers(self.bags_root)
+            here = sorted(nums[n] for n in os.listdir(os.path.join(self.bags_root, e["date"]))
+                          if n in nums)
+        except Exception:
+            return ""
+        if not here:
+            return ""
+        return here[0] if len(here) == 1 else f"{here[0]}–{here[-1]}"
 
     def _picked(self, idx):
         if not 0 <= idx < len(self.entries):
